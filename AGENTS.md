@@ -1,0 +1,88 @@
+# AGENTS.md
+
+Guidance for AI coding agents working in this repository.
+
+## What this is
+
+A tree-walking interpreter for a Kotlin-syntax scripting language, written
+in Rust, with no compilation/bytecode step. See `README.md` for the
+feature list and `src/` for the pipeline (`lexer.rs` -> `parser.rs` ->
+`ast.rs` -> `interpreter.rs`). Read `README.md`'s "Project layout" table
+before making changes — it's short and saves re-deriving the module map.
+
+## Build / test / run
+
+```sh
+cargo build                 # dev build
+cargo test                  # unit tests (lexer/parser/interpreter) + tests/run_examples.rs
+cargo run -- script.ksl     # run a script (binary is named `ksl`)
+cargo build --release --target x86_64-unknown-linux-musl   # static release binary
+```
+
+Always run `cargo test` after a change to `src/`. If you touch lexer,
+parser, or interpreter semantics, add or update a test in that module's
+`#[cfg(test)] mod tests` block rather than only relying on the example
+scripts — the unit tests pin down structural details (AST shape, token
+sequence) that the end-to-end examples don't check.
+
+## Conventions specific to this codebase
+
+- **No parser-generator dependency.** The lexer and parser are hand-written
+  (see the plan history / commit log for why `pest` was dropped). Don't
+  reintroduce a grammar-file-based parser.
+- **`Span` on every `Expr`/`Stmt`.** Runtime errors need a source location.
+  When adding a new `ExprKind`/`StmtKind` variant, thread a real `Span`
+  through it (from the token that starts the construct), not
+  `Span::default()`. `Span::default()` is currently only used in
+  `stdlib.rs` native functions, which don't receive a call-site span — if
+  you need accurate spans in stdlib error messages, that's a real gap to
+  fix by extending `NativeFn`'s signature, not something to imitate
+  elsewhere.
+- **Int arithmetic wraps**, matching Kotlin's `Int` overflow semantics —
+  use `wrapping_add`/`wrapping_sub`/`wrapping_mul`/`wrapping_neg`, never
+  bare `+`/`-`/`*` on `i64` values in `interpreter.rs`. Integer division
+  and remainder by zero are runtime errors (`checked_div`/`checked_rem`),
+  not panics.
+- **Control flow is threaded through `Result<_, Flow>`.** `return`,
+  `break`, and `continue` are `Err(Flow::Return/Break/Continue)`, unwound
+  with `?`. Loops catch `Break`/`Continue`; function calls catch `Return`.
+  Don't add a side-channel (thread-local, panic/catch_unwind, etc.) for
+  this — extend `Flow` instead if a new non-local transfer is needed.
+- **Closures capture the environment at definition time.** `FunctionValue`
+  stores the `Env` alive when the function/lambda literal was evaluated;
+  calling it creates `closure.child()`, never the caller's env. Preserve
+  this when touching `call_function`.
+- **No `.` member-call syntax.** Stdlib functions are plain calls
+  (`length(s)`, not `s.length()`) — there's no `ExprKind` for member
+  access yet. If you add one, it's a real grammar/AST addition, not a
+  small tweak (needs a postfix-parsing change in `parser.rs` and a new
+  `ExprKind` + `eval_expr` arm).
+- **Values are `Rc`-based, not `Arc`.** This interpreter is single-threaded
+  by design; don't introduce `Send`/`Sync`/threading to `Value`,
+  `Env`, or `Interpreter`.
+
+## Adding a feature checklist
+
+1. Token(s) in `token.rs` if new syntax is needed (`TokenKind` + lexing in
+   `lexer.rs`).
+2. AST node(s) in `ast.rs`.
+3. Parsing in `parser.rs`, at the correct precedence level if it's an
+   operator (see the precedence table in `README.md`/plan history —
+   loosest-to-tightest: `||`, `&&`, `==`/`!=`, comparisons, `..`, `+`/`-`,
+   `*`/`/`/`%`, unary, postfix call).
+4. Evaluation in `interpreter.rs`.
+5. Unit test(s) colocated in the relevant module.
+6. If it's a user-visible language feature (not an internal refactor),
+   consider adding or extending a script under `tests/examples/` (`.ksl`
+   extension) with a matching `.out` fixture — generate the `.out` by
+   actually running the script through the built binary
+   (`cargo run -- tests/examples/foo.ksl`), don't hand-compute output for
+   anything involving floating-point formatting (Rust's `f64` `Display`
+   differs from Kotlin's — e.g. `2.0` prints as `2`, not `2.0`).
+
+## Explicitly out of scope (don't add without being asked)
+
+Classes/objects, inheritance, generics, null-safety operators, rich
+collection literals beyond `listOf`, `try`/`catch`, coroutines, extension
+functions, packages/imports. These were deliberately deferred — see
+`README.md`.

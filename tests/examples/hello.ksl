@@ -1,0 +1,6 @@
+#!/usr/bin/env ksl
+// Basic variables, arithmetic and string templates.
+val name = "World"
+var count = 3
+println("Hello, $name!")
+println("count = $count, doubled = ${count * 2}")

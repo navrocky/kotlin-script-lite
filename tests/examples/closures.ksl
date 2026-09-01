@@ -1,0 +1,24 @@
+// Lambdas as values, closures capturing an outer var, implicit `it`.
+fun makeCounter(): Int {
+    var count = 0
+    fun increment(): Int {
+        count = count + 1
+        return count
+    }
+    increment()
+    increment()
+    return increment()
+}
+
+fun apply(f, x: Int): Int = f(x)
+
+val double = { x -> x * 2 }
+val addOne = { it + 1 }
+
+println(makeCounter())
+println(apply(double, 21))
+println(apply(addOne, 41))
+println(max(3, 7))
+println(min(3.5, 2))
+println(abs(-5))
+println(uppercase("kotlin"))

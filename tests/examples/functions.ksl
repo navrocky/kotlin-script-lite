@@ -1,0 +1,18 @@
+// Functions: expression bodies, block bodies, default & named params, recursion.
+fun square(x: Int): Int = x * x
+
+fun greet(name: String, greeting: String = "Hello"): String {
+    return "$greeting, $name!"
+}
+
+fun factorial(n: Int): Int {
+    if (n <= 1) {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+println(square(6))
+println(greet("Kotlin"))
+println(greet(greeting = "Hi", name = "Rust"))
+println(factorial(5))
