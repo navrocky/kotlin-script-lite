@@ -6,27 +6,14 @@ bytecode — scripts are lexed, parsed into an AST, and evaluated directly.
 Builds to a single, fully static Linux binary named `ksl`. Script files use
 the `.ksl` extension.
 
-## Language features (MVP)
+## Documentation
 
-- `val` / `var` declarations, with optional `: Type` annotations
-- Arithmetic, comparison and logical expressions with standard precedence
-- String templates: `"hello $name"` and `"sum = ${a + b}"`, including nesting
-- `if` / `when` / blocks as **expressions** (they produce a value), as well
-  as statements
-- `while`, and `for (x in <range or list>)`, with `break` / `continue`
-- Functions with default parameter values and named arguments at call sites
-- Lambdas / closures as first-class values, including implicit `it` for
-  single-argument lambdas (`{ it * 2 }`)
-- A small standard library: `println`, `print`, `listOf`, `length`,
-  `uppercase`, `lowercase`, `trim`, `abs`, `sqrt`, `max`, `min`
+- [`docs/syntax.md`](docs/syntax.md) — supported language syntax
+  (variables, operators, control flow, functions, lambdas, and what's
+  deliberately out of scope)
+- [`docs/stdlib.md`](docs/stdlib.md) — built-in functions
 
-Explicitly out of scope for now: classes/objects, inheritance, generics,
-null-safety operators (`?`, `?.`, `?:`, `!!`), rich collection literals,
-`try`/`catch`, coroutines, extension functions, packages/imports, and `.`
-method-call syntax (stdlib functions are called directly, e.g. `length(s)`
-rather than `s.length`).
-
-See `tests/examples/*.ksl` for runnable sample scripts.
+See also `tests/examples/*.ksl` for runnable sample scripts.
 
 ## Building
 
@@ -67,7 +54,6 @@ A script can also be made directly executable with a shebang:
 println("hi")
 ```
 
-
 ## Testing
 
 ```sh
@@ -97,3 +83,4 @@ This runs:
 | `src/lib.rs` | `run_source()` — the single entry point used by both the CLI and tests |
 | `src/main.rs` | Thin CLI wrapper |
 | `tests/examples/` | End-to-end `.ksl` scripts + expected `.out` output |
+| `docs/` | Syntax and stdlib reference documentation |

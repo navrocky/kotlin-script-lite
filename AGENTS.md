@@ -5,10 +5,11 @@ Guidance for AI coding agents working in this repository.
 ## What this is
 
 A tree-walking interpreter for a Kotlin-syntax scripting language, written
-in Rust, with no compilation/bytecode step. See `README.md` for the
-feature list and `src/` for the pipeline (`lexer.rs` -> `parser.rs` ->
-`ast.rs` -> `interpreter.rs`). Read `README.md`'s "Project layout" table
-before making changes — it's short and saves re-deriving the module map.
+in Rust, with no compilation/bytecode step. See `docs/syntax.md` and
+`docs/stdlib.md` for the language/stdlib reference, and `src/` for the
+pipeline (`lexer.rs` -> `parser.rs` -> `ast.rs` -> `interpreter.rs`). Read
+`README.md`'s "Project layout" table before making changes — it's short
+and saves re-deriving the module map.
 
 ## Build / test / run
 
@@ -67,9 +68,9 @@ sequence) that the end-to-end examples don't check.
    `lexer.rs`).
 2. AST node(s) in `ast.rs`.
 3. Parsing in `parser.rs`, at the correct precedence level if it's an
-   operator (see the precedence table in `README.md`/plan history —
-   loosest-to-tightest: `||`, `&&`, `==`/`!=`, comparisons, `..`, `+`/`-`,
-   `*`/`/`/`%`, unary, postfix call).
+   operator (see the precedence table in `docs/syntax.md` — loosest-to-
+   tightest: `||`, `&&`, `==`/`!=`, comparisons, `..`, `+`/`-`, `*`/`/`/`%`,
+   unary, postfix call).
 4. Evaluation in `interpreter.rs`.
 5. Unit test(s) colocated in the relevant module.
 6. If it's a user-visible language feature (not an internal refactor),
@@ -85,4 +86,4 @@ sequence) that the end-to-end examples don't check.
 Classes/objects, inheritance, generics, null-safety operators, rich
 collection literals beyond `listOf`, `try`/`catch`, coroutines, extension
 functions, packages/imports. These were deliberately deferred — see
-`README.md`.
+`docs/syntax.md`.
