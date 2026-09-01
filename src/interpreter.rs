@@ -478,13 +478,14 @@ fn type_err(op: &str, l: &Value, r: &Value, span: Span) -> Result<Value, Flow> {
 mod tests {
     fn run(src: &str) -> String {
         let mut out = Vec::new();
-        crate::run_source(src, &mut out).unwrap_or_else(|e| panic!("script failed: {e}\nsource:\n{src}"));
+        crate::run_source(src, &mut out, std::path::Path::new("."), None)
+            .unwrap_or_else(|e| panic!("script failed: {e}\nsource:\n{src}"));
         String::from_utf8(out).unwrap()
     }
 
     fn run_err(src: &str) -> String {
         let mut out = Vec::new();
-        match crate::run_source(src, &mut out) {
+        match crate::run_source(src, &mut out, std::path::Path::new("."), None) {
             Ok(()) => panic!("expected script to fail:\n{src}"),
             Err(e) => e.to_string(),
         }

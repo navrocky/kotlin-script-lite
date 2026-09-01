@@ -79,8 +79,9 @@ This runs:
 | `src/environment.rs` | Lexical scope chain (`Env`), backs closures |
 | `src/interpreter.rs` | Tree-walking evaluator |
 | `src/stdlib.rs` | Built-in global functions |
+| `src/importer.rs` | Resolves and runs `@file:Import(...)` local file imports |
 | `src/error.rs` | `ParseError` / `RuntimeError` / `Flow` (control transfer) / `InterpError` |
-| `src/lib.rs` | `run_source()` — the single entry point used by both the CLI and tests |
+| `src/lib.rs` | `run_source()` — the single entry point used by both the CLI and tests; resolves imports before running the script itself |
 | `src/main.rs` | Thin CLI wrapper |
 | `tests/examples/` | End-to-end `.ksl` scripts + expected `.out` output |
 | `docs/` | Syntax and stdlib reference documentation |

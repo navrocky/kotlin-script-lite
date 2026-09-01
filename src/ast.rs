@@ -1,6 +1,21 @@
 use crate::error::Span;
 
 #[derive(Debug, Clone)]
+pub struct ImportDecl {
+    pub path: String,
+    pub span: Span,
+}
+
+/// The result of parsing a whole file: its `@file:Import(...)` declarations
+/// (all appearing before any other statement) plus its own top-level
+/// statements.
+#[derive(Debug, Clone)]
+pub struct Program {
+    pub imports: Vec<ImportDecl>,
+    pub stmts: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,

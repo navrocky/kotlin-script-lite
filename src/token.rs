@@ -41,6 +41,7 @@ pub enum TokenKind {
     Colon,
     Dot,
     Semicolon,
+    At,
 
     // Operators
     Assign,

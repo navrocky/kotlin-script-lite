@@ -300,6 +300,7 @@ impl<'a> Lexer<'a> {
             ',' => TokenKind::Comma,
             ':' => TokenKind::Colon,
             ';' => TokenKind::Semicolon,
+            '@' => TokenKind::At,
             '.' => {
                 if self.peek() == Some('.') {
                     self.advance();
@@ -507,6 +508,25 @@ mod tests {
                 TokenKind::Assign,
                 TokenKind::Bool(true),
                 TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn at_token_lexes() {
+        assert_eq!(
+            kinds("@file:Import(\"x\")"),
+            vec![
+                TokenKind::At,
+                TokenKind::Ident("file".into()),
+                TokenKind::Colon,
+                TokenKind::Ident("Import".into()),
+                TokenKind::LParen,
+                TokenKind::StringStart,
+                TokenKind::StringText("x".into()),
+                TokenKind::StringEnd,
+                TokenKind::RParen,
+                TokenKind::Eof,
             ]
         );
     }

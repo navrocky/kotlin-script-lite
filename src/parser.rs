@@ -2,7 +2,7 @@ use crate::ast::*;
 use crate::error::{ParseError, Span};
 use crate::token::{Token, TokenKind};
 
-pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, ParseError> {
+pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
     let mut p = Parser { tokens, pos: 0 };
     p.parse_program()
 }
@@ -89,14 +89,82 @@ impl<'a> Parser<'a> {
 
     // ---- program / statements ----
 
-    fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
+    fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let imports = self.parse_imports()?;
         let mut stmts = Vec::new();
         self.skip_separators();
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
             self.skip_separators();
         }
-        Ok(stmts)
+        Ok(Program { imports, stmts })
+    }
+
+    /// Consumes a leading run of `@file:Import(...)` declarations. Stops at
+    /// the first non-`@` token, so any `@` appearing later in the file is
+    /// left for `parse_stmt`/`parse_primary` to reject as an unexpected
+    /// token — file annotations are only legal before any other statement.
+    fn parse_imports(&mut self) -> Result<Vec<ImportDecl>, ParseError> {
+        let mut imports = Vec::new();
+        self.skip_separators();
+        while matches!(self.peek_kind(), TokenKind::At) {
+            imports.push(self.parse_file_import()?);
+            self.skip_separators();
+        }
+        Ok(imports)
+    }
+
+    fn parse_file_import(&mut self) -> Result<ImportDecl, ParseError> {
+        let span = self.span();
+        self.expect(TokenKind::At, "'@'")?;
+        let head = self.expect_ident()?;
+        if head != "file" {
+            return Err(self.err(format!("expected 'file' after '@', found '{head}'")));
+        }
+        self.expect(TokenKind::Colon, "':'")?;
+        let name = self.expect_ident()?;
+        if name != "Import" {
+            return Err(self.err(format!(
+                "unknown file annotation '@file:{name}' (only 'Import' is supported)"
+            )));
+        }
+        self.expect(TokenKind::LParen, "'('")?;
+        let path = self.parse_plain_string_literal()?;
+        self.expect(TokenKind::RParen, "')'")?;
+        Ok(ImportDecl { path, span })
+    }
+
+    /// A `"..."` string literal with no interpolation — used for import
+    /// paths, which must be known without evaluating any expression.
+    fn parse_plain_string_literal(&mut self) -> Result<String, ParseError> {
+        let start = self.span();
+        self.expect(TokenKind::StringStart, "'\"'")?;
+        let mut s = String::new();
+        loop {
+            match self.peek_kind().clone() {
+                TokenKind::StringText(text) => {
+                    self.advance();
+                    s.push_str(&text);
+                }
+                TokenKind::StringEnd => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::StringInterpText(_) | TokenKind::TemplateExprStart => {
+                    return Err(self.err(
+                        "import path must be a plain string literal (no interpolation)",
+                    ));
+                }
+                other => return Err(self.err(format!("unexpected token in string: {other:?}"))),
+            }
+        }
+        if s.is_empty() {
+            return Err(ParseError {
+                message: "import path must not be empty".into(),
+                span: start,
+            });
+        }
+        Ok(s)
     }
 
     fn parse_stmts_until_rbrace(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -704,7 +772,12 @@ mod tests {
 
     fn parse_src(src: &str) -> Vec<Stmt> {
         let tokens = tokenize(src).unwrap();
-        parse(&tokens).unwrap()
+        parse(&tokens).unwrap().stmts
+    }
+
+    fn parse_err(src: &str) -> ParseError {
+        let tokens = tokenize(src).unwrap();
+        parse(&tokens).unwrap_err()
     }
 
     #[test]
@@ -810,5 +883,48 @@ mod tests {
             },
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_import_parses() {
+        let tokens = tokenize("@file:Import(\"utils.ksl\")\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.imports.len(), 1);
+        assert_eq!(program.imports[0].path, "utils.ksl");
+        assert_eq!(program.stmts.len(), 1);
+    }
+
+    #[test]
+    fn file_import_multiple() {
+        let tokens =
+            tokenize("@file:Import(\"a.ksl\")\n@file:Import(\"b.ksl\")\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.imports.len(), 2);
+        assert_eq!(program.imports[0].path, "a.ksl");
+        assert_eq!(program.imports[1].path, "b.ksl");
+    }
+
+    #[test]
+    fn file_import_unknown_annotation_errors() {
+        let err = parse_err("@file:Bar(\"x.ksl\")");
+        assert!(err.message.contains("unknown file annotation"), "{}", err.message);
+    }
+
+    #[test]
+    fn file_import_bad_head_errors() {
+        let err = parse_err("@notfile:Import(\"x.ksl\")");
+        assert!(err.message.contains("expected 'file'"), "{}", err.message);
+    }
+
+    #[test]
+    fn file_import_interpolated_path_errors() {
+        let err = parse_err("@file:Import(\"$name.ksl\")");
+        assert!(err.message.contains("plain string literal"), "{}", err.message);
+    }
+
+    #[test]
+    fn file_import_after_statement_errors() {
+        let err = parse_err("println(1)\n@file:Import(\"x.ksl\")");
+        assert!(err.message.contains("unexpected") || err.message.contains("At"), "{}", err.message);
     }
 }

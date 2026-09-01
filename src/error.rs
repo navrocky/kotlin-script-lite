@@ -1,5 +1,6 @@
 use crate::value::Value;
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
@@ -59,6 +60,12 @@ impl From<RuntimeError> for Flow {
 pub enum InterpError {
     Parse(ParseError),
     Runtime(RuntimeError),
+    /// Wraps an error that occurred while reading/parsing/running a file
+    /// pulled in via `@file:Import(...)`, naming which file it came from.
+    /// `Span` has no file field, so this is how import errors stay
+    /// attributable without threading a file identity through every
+    /// token/AST construction site.
+    InFile { file: PathBuf, source: Box<InterpError> },
 }
 
 impl fmt::Display for InterpError {
@@ -66,6 +73,9 @@ impl fmt::Display for InterpError {
         match self {
             InterpError::Parse(e) => write!(f, "parse error: {} at {}", e.message, e.span),
             InterpError::Runtime(e) => write!(f, "runtime error: {} at {}", e.message, e.span),
+            InterpError::InFile { file, source } => {
+                write!(f, "in imported file '{}': {source}", file.display())
+            }
         }
     }
 }

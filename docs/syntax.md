@@ -200,10 +200,36 @@ A lambda captures the environment that was active where it was written
 trailing-lambda call syntax (`list.map { ... }`) — lambdas are passed and
 invoked like any other value: `f(x)`.
 
+## Imports
+
+```kotlin
+@file:Import("helpers/greeter.ksl")
+
+println(greet("World"))
+```
+
+`@file:Import("path.ksl")` loads another local `.ksl` file and runs its
+top-level code — its `fun`/`val` declarations become available to the
+importing script, as if the imported file's contents ran first in the same
+global scope. There is no per-file namespacing: everything still shares one
+flat global scope, same as a single-file script (see "Not supported" below).
+
+- File annotations must appear before any other statement, at the very top
+  of the file. Only `Import` is recognized (`@file:Import(...)`) — any other
+  `@file:...` form, or an `@` anywhere else, is a parse error.
+- The import path must be a plain string literal — no `${...}` templates.
+- A relative path resolves against the *importing file's own* directory,
+  not the top-level script's directory. Absolute paths are used as-is.
+- The same file imported multiple times (directly or transitively) only
+  runs once. An import cycle is a runtime error naming the cycle.
+- Only local files are supported right now — `@file:Import("https://...")`
+  is a clear "not yet supported" error rather than a working network fetch.
+
 ## Not supported
 
 Deliberately out of scope for now: classes/objects, inheritance,
 generics, null-safety operators (`?`, `?.`, `?:`, `!!`), list/map
-literals, `try`/`catch`, coroutines, extension functions,
-packages/imports, and `.` member-call syntax (stdlib functions are called
+literals, `try`/`catch`, coroutines, extension functions, Kotlin-style
+`package`/`import` namespacing (dotted qualified names, per-file scoping),
+network imports, and `.` member-call syntax (stdlib functions are called
 directly, e.g. `length(s)` rather than `s.length()`).

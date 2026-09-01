@@ -1,0 +1,3 @@
+@file:Import("imports/greeter.ksl")
+
+println(greet("World"))

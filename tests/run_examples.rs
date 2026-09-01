@@ -24,7 +24,8 @@ fn examples_match_expected_output() {
             .unwrap_or_else(|e| panic!("missing fixture {}: {e}", expected_path.display()));
 
         let mut out = Vec::new();
-        let result = kotlin_script_lite::run_source(&source, &mut out);
+        let base_dir = script_path.parent().unwrap();
+        let result = kotlin_script_lite::run_source(&source, &mut out, base_dir, Some(&script_path));
         let actual = String::from_utf8(out).unwrap();
 
         let name = script_path.file_name().unwrap().to_string_lossy().to_string();

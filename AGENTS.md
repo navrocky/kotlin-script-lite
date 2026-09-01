@@ -85,5 +85,9 @@ sequence) that the end-to-end examples don't check.
 
 Classes/objects, inheritance, generics, null-safety operators, rich
 collection literals beyond `listOf`, `try`/`catch`, coroutines, extension
-functions, packages/imports. These were deliberately deferred — see
-`docs/syntax.md`.
+functions, network imports, and Kotlin-style `package`/`import`
+namespacing (dotted qualified names, per-file scoping so a short name can
+stand in for a fully-qualified one). These were deliberately deferred —
+see `docs/syntax.md`. Local file imports (`@file:Import("path.ksl")`,
+loading another file's top-level code into the same shared global scope)
+*are* supported — see `docs/syntax.md#imports` and `src/importer.rs`.
