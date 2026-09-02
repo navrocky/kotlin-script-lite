@@ -107,8 +107,12 @@ see below) *are* supported, as is `package`/`import` namespacing
 `resolve_qualified` in `src/interpreter.rs`. Network imports remain
 unsupported (`@file:Import("https://...")` is a clear error).
 
-**Known gap:** `ksl-lsp`'s `resolver.rs` (hover/goto-def/completion) is
-single-file only and has no notion of packages — a package-qualified
-name (`a.b.c`) or a name brought in via `import` is invisible to it, same
-limitation it already has for `@file:Import`. Making it package/import-aware
-is real follow-up work, not something to casually bolt on.
+`ksl_core::resolver` (used for hover/goto-def/completion) stays
+single-file, same limitation it has for `@file:Import` — it doesn't try to
+resolve `a.b.c` itself. Cross-file resolution for package-qualified names
+lives entirely in `ksl-lsp`'s own `package_index` module instead, which
+walks a document's `@file:Import` graph read-only to index every
+`package`-declaring file it finds (mirroring `importer.rs`'s own path
+resolution, via the now-`pub` `resolve_path`/`is_url`). Keep this layering
+if extending it further — `resolver.rs` shouldn't grow filesystem access
+or multi-file state.
