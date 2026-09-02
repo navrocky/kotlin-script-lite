@@ -1,16 +1,18 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, Diagnostic, InitializeParams, InitializeResult, InitializedParams,
-    MessageType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    DidSaveTextDocumentParams, Diagnostic, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    MessageType, OneOf, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
     ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
+use crate::analysis::{self, Analysis};
 use crate::diagnostics::parse_diagnostics;
 use crate::document_store::DocumentStore;
 use crate::runtime_diagnostics::{run_diagnostics, RuntimeDiagnostics};
@@ -43,6 +45,24 @@ impl Backend {
     async fn publish_parse_diagnostics(&self, uri: Url, text: &str) {
         let diags = parse_diagnostics(text);
         self.publish(uri, diags).await;
+    }
+
+    /// If `text` parses, caches it as `uri`'s new "last good" tree — what
+    /// hover/goto-definition fall back to while the buffer doesn't parse.
+    fn update_last_good_tree(&self, uri: &Url, text: &str) {
+        if let Ok(program) = ksl_core::parse_only(text) {
+            self.docs.write().unwrap().set_last_good(uri, Arc::new(program));
+        }
+    }
+
+    /// Builds hover/goto-definition analysis for `uri` from its current
+    /// text, falling back to its last good tree if the current text
+    /// doesn't parse. `None` only if the document isn't open or neither
+    /// the current text nor any fallback parses.
+    fn analysis_for(&self, uri: &Url) -> Option<Analysis> {
+        let docs = self.docs.read().unwrap();
+        let doc = docs.get(uri)?;
+        analysis::analyze(&doc.text, doc.last_good.clone())
     }
 
     /// Runs the script for runtime diagnostics, but only if it actually
@@ -97,6 +117,8 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                     SemanticTokensOptions {
                         legend: SemanticTokensLegend {
@@ -128,6 +150,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
         self.docs.write().unwrap().open(uri.clone(), text.clone());
+        self.update_last_good_tree(&uri, &text);
         self.publish_parse_diagnostics(uri, &text).await;
     }
 
@@ -140,6 +163,7 @@ impl LanguageServer for Backend {
             None => return,
         };
         self.docs.write().unwrap().update(&uri, text.clone());
+        self.update_last_good_tree(&uri, &text);
         self.publish_parse_diagnostics(uri, &text).await;
     }
 
@@ -170,5 +194,22 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         Ok(semantic_tokens(&text).map(SemanticTokensResult::Tokens))
+    }
+
+    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(analysis) = self.analysis_for(&uri) else { return Ok(None) };
+        Ok(crate::hover::hover(&analysis, position))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(analysis) = self.analysis_for(&uri) else { return Ok(None) };
+        Ok(crate::goto_definition::goto_definition(&analysis, &uri, position))
     }
 }

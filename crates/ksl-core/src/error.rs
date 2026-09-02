@@ -25,6 +25,36 @@ impl Span {
     pub fn with_end(line: u32, col: u32, end_line: u32, end_col: u32) -> Self {
         Span { line, col, end_line, end_col }
     }
+
+    /// True if the 1-based `(line, col)` position falls within this span
+    /// — used to match a cursor position against a token/scope span.
+    pub fn contains_line_col(&self, line: u32, col: u32) -> bool {
+        if line < self.line || line > self.end_line {
+            return false;
+        }
+        if line == self.line && col < self.col {
+            return false;
+        }
+        if line == self.end_line && col >= self.end_col {
+            return false;
+        }
+        true
+    }
+
+    /// The smallest span covering both `self` and `other`.
+    pub fn merge(&self, other: &Span) -> Span {
+        let (line, col) = if (self.line, self.col) <= (other.line, other.col) {
+            (self.line, self.col)
+        } else {
+            (other.line, other.col)
+        };
+        let (end_line, end_col) = if (self.end_line, self.end_col) >= (other.end_line, other.end_col) {
+            (self.end_line, self.end_col)
+        } else {
+            (other.end_line, other.end_col)
+        };
+        Span { line, col, end_line, end_col }
+    }
 }
 
 impl fmt::Display for Span {

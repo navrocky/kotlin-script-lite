@@ -1,6 +1,9 @@
+mod analysis;
 mod backend;
 mod diagnostics;
 mod document_store;
+mod goto_definition;
+mod hover;
 mod runtime_diagnostics;
 mod semantic_tokens;
 

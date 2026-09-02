@@ -106,6 +106,9 @@ pub struct Arg {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
+    /// Span of just the parameter name (not its type hint or default),
+    /// used for hover/goto-definition.
+    pub name_span: Span,
     pub type_hint: Option<String>,
     pub default: Option<Expr>,
 }
@@ -142,6 +145,8 @@ pub enum StmtKind {
     ExprStmt(Expr),
     ValDecl {
         name: String,
+        /// Span of just the declared name, used for hover/goto-definition.
+        name_span: Span,
         type_hint: Option<String>,
         mutable: bool,
         init: Expr,
@@ -153,6 +158,8 @@ pub enum StmtKind {
     },
     FunDecl {
         name: String,
+        /// Span of just the function name, used for hover/goto-definition.
+        name_span: Span,
         params: Vec<Param>,
         body: FunBody,
     },
@@ -162,6 +169,8 @@ pub enum StmtKind {
     },
     For {
         var_name: String,
+        /// Span of just the loop variable name, used for hover/goto-definition.
+        var_name_span: Span,
         iterable: Expr,
         body: Vec<Stmt>,
     },

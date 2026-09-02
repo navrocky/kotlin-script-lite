@@ -18,13 +18,12 @@ pub fn new_diagnostic(range: Range, message: impl Into<String>) -> Diagnostic {
     diag
 }
 
-/// `Span` is 1-based (`line`/`col`); LSP `Position` is 0-based. `Span` is
-/// currently a single point, so the range degenerates to one character —
-/// enough to place a squiggle; real end positions land in a later milestone.
+/// `Span` is 1-based (`line`/`col`); LSP `Position` is 0-based.
 pub fn span_to_range(span: Span) -> Range {
-    let line = span.line.saturating_sub(1);
-    let col = span.col.saturating_sub(1);
-    Range::new(Position::new(line, col), Position::new(line, col + 1))
+    Range::new(
+        Position::new(span.line.saturating_sub(1), span.col.saturating_sub(1)),
+        Position::new(span.end_line.saturating_sub(1), span.end_col.saturating_sub(1)),
+    )
 }
 
 #[cfg(test)]

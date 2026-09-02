@@ -57,6 +57,7 @@ impl<'a> Interpreter<'a> {
                 type_hint,
                 mutable,
                 init,
+                ..
             } => {
                 let v = self.eval_expr(init, env)?;
                 if let Some(hint) = type_hint {
@@ -92,7 +93,7 @@ impl<'a> Interpreter<'a> {
                     }
                 })
             }
-            StmtKind::FunDecl { name, params, body } => {
+            StmtKind::FunDecl { name, params, body, .. } => {
                 let f = Value::Function(Rc::new(FunctionValue {
                     name: Some(name.clone()),
                     params: params.clone(),
@@ -118,6 +119,7 @@ impl<'a> Interpreter<'a> {
                 var_name,
                 iterable,
                 body,
+                ..
             } => {
                 let it = self.eval_expr(iterable, env)?;
                 let items = iterate(it, stmt.span)?;

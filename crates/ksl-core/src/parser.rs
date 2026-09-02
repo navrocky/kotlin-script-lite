@@ -78,10 +78,18 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_ident(&mut self) -> Result<String, ParseError> {
+        Ok(self.expect_ident_spanned()?.0)
+    }
+
+    /// Like `expect_ident`, but also returns the identifier token's own
+    /// span (not the caller's `self.span()` at some other position) — used
+    /// where the exact name span matters for hover/goto-definition.
+    fn expect_ident_spanned(&mut self) -> Result<(String, Span), ParseError> {
+        let span = self.span();
         match self.peek_kind().clone() {
             TokenKind::Ident(name) => {
                 self.advance();
-                Ok(name)
+                Ok((name, span))
             }
             other => Err(self.err(format!("expected identifier, found {other:?}"))),
         }
@@ -229,7 +237,7 @@ impl<'a> Parser<'a> {
         let span = self.span();
         let mutable = matches!(self.peek_kind(), TokenKind::Var);
         self.advance(); // val/var
-        let name = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident_spanned()?;
         let type_hint = if self.matches(&TokenKind::Colon) {
             Some(self.expect_ident()?)
         } else {
@@ -240,6 +248,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::new(
             StmtKind::ValDecl {
                 name,
+                name_span,
                 type_hint,
                 mutable,
                 init,
@@ -252,7 +261,7 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         self.expect(TokenKind::LParen, "'('")?;
         while !matches!(self.peek_kind(), TokenKind::RParen) {
-            let name = self.expect_ident()?;
+            let (name, name_span) = self.expect_ident_spanned()?;
             let type_hint = if self.matches(&TokenKind::Colon) {
                 Some(self.expect_ident()?)
             } else {
@@ -265,6 +274,7 @@ impl<'a> Parser<'a> {
             };
             params.push(Param {
                 name,
+                name_span,
                 type_hint,
                 default,
             });
@@ -279,7 +289,7 @@ impl<'a> Parser<'a> {
     fn parse_fun_decl(&mut self) -> Result<Stmt, ParseError> {
         let span = self.span();
         self.advance(); // fun
-        let name = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident_spanned()?;
         let params = self.parse_params()?;
         if self.matches(&TokenKind::Colon) {
             self.expect_ident()?; // return type, parsed but not checked in the MVP
@@ -289,7 +299,7 @@ impl<'a> Parser<'a> {
         } else {
             FunBody::Block(self.parse_block_stmts()?)
         };
-        Ok(Stmt::new(StmtKind::FunDecl { name, params, body }, span))
+        Ok(Stmt::new(StmtKind::FunDecl { name, name_span, params, body }, span))
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
@@ -306,7 +316,7 @@ impl<'a> Parser<'a> {
         let span = self.span();
         self.advance(); // for
         self.expect(TokenKind::LParen, "'('")?;
-        let var_name = self.expect_ident()?;
+        let (var_name, var_name_span) = self.expect_ident_spanned()?;
         self.expect(TokenKind::In, "'in'")?;
         let iterable = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
@@ -314,6 +324,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::new(
             StmtKind::For {
                 var_name,
+                var_name_span,
                 iterable,
                 body,
             },
@@ -647,11 +658,13 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let mut params = Vec::new();
         loop {
+            let name_span = self.span();
             match self.peek_kind().clone() {
                 TokenKind::Ident(name) => {
                     self.advance();
                     params.push(Param {
                         name,
+                        name_span,
                         type_hint: None,
                         default: None,
                     });
@@ -830,7 +843,7 @@ mod tests {
     fn val_decl_and_fun_decl_with_defaults() {
         let stmts = parse_src("fun add(a: Int, b: Int = 10): Int = a + b");
         match &stmts[0].kind {
-            StmtKind::FunDecl { name, params, body } => {
+            StmtKind::FunDecl { name, params, body, .. } => {
                 assert_eq!(name, "add");
                 assert_eq!(params.len(), 2);
                 assert!(params[1].default.is_some());
