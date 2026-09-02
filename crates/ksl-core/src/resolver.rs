@@ -5,14 +5,24 @@
 //! "what does this name refer to" and "what's declared here" without
 //! running the script.
 //!
-//! `@file:Import`ed files are not indexed — this is single-file only, so a
-//! name actually declared in an imported file is left silently unresolved
-//! rather than flagged as undefined (indistinguishable, from here, from a
-//! genuine typo). Stdlib functions like `println` are a separate case:
-//! never declared in the AST at all (they're registered directly into the
-//! runtime `Env` by `stdlib::populate_globals`), so a use that doesn't
-//! resolve in scope is checked against `stdlib::STDLIB_SIGNATURES` before
-//! being flagged as an undefined-name diagnostic.
+//! `@file:Import`ed/`package`-declaring files are not indexed — this is
+//! single-file only, so a name actually declared elsewhere is never found
+//! by the scope-chain walk in `resolve_name`. Three different cases fall
+//! out of that, each handled differently before a name is flagged as
+//! undefined (see `resolve_name`):
+//! - Stdlib functions like `println` are never declared in the AST at all
+//!   (they're registered directly into the runtime `Env` by
+//!   `stdlib::populate_globals`), so they're checked against
+//!   `stdlib::STDLIB_SIGNATURES` instead.
+//! - A name brought in by this file's own `import a.b.c` is known
+//!   precisely — `resolve` reads `Program::imports_use` up front — so it's
+//!   never flagged.
+//! - A name that could only have come from a plain `@file:Import` (an
+//!   *unknown* set of names from a file this resolver never reads) can't
+//!   be told apart from a genuine typo, so `resolve_name` suppresses the
+//!   diagnostic for *any* unresolved name, file-wide, whenever the file has
+//!   at least one `@file:Import` — a real loss of precision, but better
+//!   than flagging ordinary, correct multi-file code as broken.
 
 use std::collections::{HashMap, HashSet};
 
@@ -150,6 +160,8 @@ pub fn resolve(program: &Program) -> ResolveResult {
     let mut r = Resolver {
         table: SymbolTable { scopes: Vec::new(), symbols: Vec::new(), occurrences: Vec::new() },
         diagnostics: Vec::new(),
+        imported_names: program.imports_use.iter().map(|u| u.path.last().unwrap().clone()).collect(),
+        has_file_imports: !program.imports.is_empty(),
     };
     let global = r.push_scope(None, 0, FILE_SPAN);
     r.walk_stmts(&program.stmts, global, FILE_END);
@@ -159,6 +171,22 @@ pub fn resolve(program: &Program) -> ResolveResult {
 struct Resolver {
     table: SymbolTable,
     diagnostics: Vec<RuntimeError>,
+    /// Bare names brought in by this file's own `import a.b.c` (the last
+    /// segment of each path) — never flagged as undefined, since exactly
+    /// which names these introduce is known precisely (unlike plain
+    /// `@file:Import`, see `has_file_imports`).
+    imported_names: HashSet<String>,
+    /// True if this file has any `@file:Import(...)` at all. Unlike
+    /// `import`, `@file:Import` dumps an *unknown* set of names into scope
+    /// (every top-level `fun`/`val` of a file this resolver never reads —
+    /// see the module doc comment), so there's no way to tell a name it
+    /// legitimately provides from a real typo. Blanket-suppresses the
+    /// undefined-name diagnostic file-wide rather than risk false
+    /// positives on every multi-file script — a real loss of precision
+    /// (a genuine typo of a name unrelated to any import also goes
+    /// unflagged), but a undefined-name check that's wrong on ordinary,
+    /// correct multi-file code is worse than one that's merely incomplete.
+    has_file_imports: bool,
 }
 
 impl Resolver {
@@ -230,9 +258,10 @@ impl Resolver {
             }
             cur = self.table.scopes[s].parent;
         }
-        if !crate::stdlib::is_known(name) {
-            self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
+        if crate::stdlib::is_known(name) || self.imported_names.contains(name) || self.has_file_imports {
+            return;
         }
+        self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
     }
 
     /// `following` is the span of whatever comes next, textually, after
@@ -512,6 +541,40 @@ mod tests {
         assert_eq!(result.diagnostics.len(), 1);
         assert!(result.diagnostics[0].message.contains("nope"));
         assert!(result.table.symbol_at(1, 9).is_none());
+    }
+
+    #[test]
+    fn name_brought_in_by_import_is_not_flagged() {
+        // `square` is never declared in this file's own AST — it only
+        // exists via `import util.math.square` — so it must NOT be flagged,
+        // unlike a real typo (the bug this regression-tests: reported live
+        // after `package_basic.ksl` incorrectly flagged `square`).
+        let result = resolve_src("import util.math.square\nprintln(square(5))\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn unresolved_name_is_suppressed_file_wide_when_file_has_any_file_import() {
+        // `@file:Import` dumps an unknown set of names into scope (this
+        // resolver never reads the imported file) — there's no way to tell
+        // a name it legitimately provides from a genuine typo, so the
+        // undefined-name check is suppressed for the whole file rather than
+        // risk flagging correct code. This is the same bug the previous
+        // test covers, but for plain @file:Import (no explicit `import`)
+        // — the form that was already broken before package/import existed.
+        let result = resolve_src("@file:Import(\"greeter.ksl\")\nprintln(greet(\"World\"))\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn import_alone_does_not_suppress_other_genuine_typos() {
+        // Only @file:Import blanket-suppresses (its provided names are
+        // truly unknowable here); `import` alone only whitelists the
+        // specific name(s) it names, so an unrelated typo elsewhere in a
+        // file that uses only `import` (no @file:Import) is still flagged.
+        let result = resolve_src("import util.math.square\nprintln(totallyNotAThing)\n");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0].message.contains("totallyNotAThing"));
     }
 
     #[test]
