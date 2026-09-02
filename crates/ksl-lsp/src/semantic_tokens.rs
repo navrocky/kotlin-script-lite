@@ -8,18 +8,25 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NUMBER,
     SemanticTokenType::STRING,
     SemanticTokenType::OPERATOR,
+    SemanticTokenType::VARIABLE,
 ];
 
 const KEYWORD: u32 = 0;
 const NUMBER: u32 = 1;
 const STRING: u32 = 2;
 const OPERATOR: u32 = 3;
+const VARIABLE: u32 = 4;
 
 /// Classifies a token purely by its `TokenKind` — no scope/symbol
-/// resolution yet (that's a later milestone, and would let identifiers be
-/// classified as variable/function/parameter). Identifiers and punctuation
-/// like `( ) { } [ ] , : .` are left unclassified here and fall back to
-/// the TextMate grammar's (or the editor's default) styling.
+/// resolution yet (that's a later milestone, and would let bare
+/// identifiers, e.g. inside a `${...}` interpolation or outside a string
+/// entirely, be classified as variable/function/parameter). Identifiers
+/// and punctuation like `( ) { } [ ] , : .` are left unclassified here and
+/// fall back to the TextMate grammar's (or the editor's default) styling.
+///
+/// `StringInterpText` (the `$name` shorthand) is the one exception: unlike
+/// a bare `Ident`, its *only* possible meaning is "a variable reference",
+/// so it's classified as `VARIABLE` — no resolver needed to know that much.
 fn token_type_index(kind: &TokenKind) -> Option<u32> {
     use TokenKind::*;
     let idx = match kind {
@@ -28,7 +35,9 @@ fn token_type_index(kind: &TokenKind) -> Option<u32> {
 
         Int(_) | Double(_) => NUMBER,
 
-        StringStart | StringText(_) | StringInterpText(_) | StringEnd => STRING,
+        StringStart | StringText(_) | StringEnd => STRING,
+
+        StringInterpText(_) => VARIABLE,
 
         Assign | Eq | NotEq | Lt | Gt | LtEq | GtEq | AndAnd | OrOr | Not | Plus | Minus | Star
         | Slash | Percent | PlusAssign | MinusAssign | StarAssign | SlashAssign
@@ -138,5 +147,13 @@ mod tests {
     #[test]
     fn unterminated_string_yields_no_tokens_not_a_panic() {
         assert!(semantic_tokens("\"unterminated").is_none());
+    }
+
+    #[test]
+    fn dollar_shorthand_interpolation_is_classified_as_variable() {
+        let toks = tokens("\"hi $name!\"");
+        // StringStart, StringText("hi "), StringInterpText("name")(variable), StringText("!"), StringEnd
+        let kinds: Vec<u32> = toks.iter().map(|t| t.token_type).collect();
+        assert_eq!(kinds, vec![STRING, STRING, VARIABLE, STRING, STRING]);
     }
 }
