@@ -9,3 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 ksl-core = { path = "../ksl-core" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+tower-lsp = "0.20.0"

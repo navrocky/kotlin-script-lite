@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use crate::ast::{ImportDecl, Program, Stmt};
 use crate::error::{Flow, InterpError, RuntimeError, Span};
 use crate::interpreter::Interpreter;
-use crate::{lexer, parser};
 
 /// Recursively resolves and runs `@file:Import(...)` declarations against a
 /// shared `Interpreter`, before the importing file's own statements run.
@@ -138,8 +137,7 @@ impl Importer {
 }
 
 fn parse_program(src: &str) -> Result<Program, InterpError> {
-    let tokens = lexer::tokenize(src).map_err(InterpError::Parse)?;
-    parser::parse(&tokens).map_err(InterpError::Parse)
+    crate::parse_only(src).map_err(InterpError::Parse)
 }
 
 fn run_stmts(interp: &mut Interpreter, stmts: &[Stmt]) -> Result<(), InterpError> {

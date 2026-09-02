@@ -1,0 +1,52 @@
+{
+  "name": "ksl-vscode",
+  "displayName": "KSL Language Support",
+  "description": "Diagnostics and syntax highlighting for KSL (.ksl) scripts, backed by the ksl-lsp language server.",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:ksl"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "ksl",
+        "aliases": ["KSL", "ksl"],
+        "extensions": [".ksl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ksl",
+        "scopeName": "source.ksl",
+        "path": "./syntaxes/ksl.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "KSL",
+      "properties": {
+        "ksl.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the ksl-lsp binary. When empty, the extension looks for it next to this workspace's own target/debug or target/release build (useful when developing ksl itself)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

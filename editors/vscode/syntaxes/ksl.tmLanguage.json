@@ -1,0 +1,104 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "KSL",
+  "scopeName": "source.ksl",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#annotations" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#numbers" },
+    { "include": "#strings" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.ksl",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.ksl",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "annotations": {
+      "patterns": [
+        {
+          "name": "keyword.other.annotation.ksl",
+          "match": "@file:Import\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.ksl",
+          "match": "\\b(if|else|when|while|for|in|return|break|continue)\\b"
+        },
+        {
+          "name": "storage.type.ksl",
+          "match": "\\b(fun|val|var)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.ksl",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.ksl",
+          "match": "\\b\\d+(\\.\\d+)?([eE][+-]?\\d+)?\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.ksl",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.ksl",
+              "match": "\\\\[ntr\\\\\"$]"
+            },
+            {
+              "name": "meta.embedded.line.ksl",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "beginCaptures": {
+                "0": { "name": "punctuation.definition.template-expression.begin.ksl" }
+              },
+              "endCaptures": {
+                "0": { "name": "punctuation.definition.template-expression.end.ksl" }
+              },
+              "patterns": [{ "include": "$self" }]
+            },
+            {
+              "name": "variable.other.interpolated.ksl",
+              "match": "\\$[A-Za-z_][A-Za-z0-9_]*"
+            }
+          ]
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.ksl",
+          "match": "(==|!=|<=|>=|&&|\\|\\||\\+=|-=|\\*=|/=|%=|->|\\.\\.|[=<>!+\\-*/%])"
+        }
+      ]
+    }
+  }
+}

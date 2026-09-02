@@ -11,9 +11,19 @@ pub mod value;
 
 use std::path::Path;
 
-use error::InterpError;
+use error::{InterpError, ParseError};
 use importer::Importer;
 use interpreter::Interpreter;
+
+/// Lexes and parses `src` without resolving imports, executing anything, or
+/// touching the filesystem. Never panics, including on truncated/malformed
+/// input (unterminated strings, dangling `${`, trailing operators) — callers
+/// like an LSP invoke this on every keystroke, where the buffer is
+/// syntactically incomplete much of the time.
+pub fn parse_only(src: &str) -> Result<ast::Program, ParseError> {
+    let tokens = lexer::tokenize(src)?;
+    parser::parse(&tokens)
+}
 
 /// Parses and runs a whole script, writing anything it `println`s/`print`s
 /// to `out`. Resolves any `@file:Import(...)` declarations first
@@ -34,4 +44,38 @@ pub fn run_source(
 ) -> Result<(), InterpError> {
     let mut interp = Interpreter::new(out);
     Importer::new().run_top_level(src, base_dir, entry_path, &mut interp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_only;
+
+    /// `parse_only` is called on every keystroke by editor tooling, so the
+    /// buffer is syntactically incomplete much of the time (mid-statement,
+    /// mid-token, mid-string). It must return a `ParseError`, never panic.
+    #[test]
+    fn parse_only_never_panics_on_truncated_or_malformed_input() {
+        let inputs = [
+            "",
+            "\"unterminated",
+            "\"unterminated ${",
+            "\"unterminated ${ 1 + ",
+            "fun f(",
+            "fun f(x",
+            "fun f() {",
+            "val x =",
+            "val x = \"${",
+            "1 +",
+            "\\",
+            "\"\\",
+            "\"${}}}}}",
+            "if (",
+            "for (",
+            "@file:Import(",
+            "@file:",
+        ];
+        for src in inputs {
+            let _ = parse_only(src); // must not panic, Ok or Err both fine
+        }
+    }
 }
