@@ -5,6 +5,7 @@ mod diagnostics;
 mod document_store;
 mod goto_definition;
 mod hover;
+mod package_index;
 mod runtime_diagnostics;
 mod semantic_tokens;
 

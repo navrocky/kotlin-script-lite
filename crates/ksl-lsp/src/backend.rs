@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result as RpcResult;
@@ -56,14 +57,14 @@ impl Backend {
         }
     }
 
-    /// Builds hover/goto-definition analysis for `uri` from its current
-    /// text, falling back to its last good tree if the current text
-    /// doesn't parse. `None` only if the document isn't open or neither
-    /// the current text nor any fallback parses.
+    /// Builds hover/goto-definition/completion analysis for `uri` from its
+    /// current text, falling back to its last good tree if the current
+    /// text doesn't parse. `None` only if the document isn't open or
+    /// neither the current text nor any fallback parses.
     fn analysis_for(&self, uri: &Url) -> Option<Analysis> {
         let docs = self.docs.read().unwrap();
         let doc = docs.get(uri)?;
-        analysis::analyze(&doc.text, doc.last_good.clone())
+        analysis::analyze(&doc.text, doc.last_good.clone(), &uri_to_path(uri))
     }
 
     /// Runs the script for runtime diagnostics, but only if it actually
@@ -219,7 +220,23 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let Some(analysis) = self.analysis_for(&uri) else { return Ok(None) };
-        let items: Vec<CompletionItem> = crate::completion::completion(&analysis, position);
+        // `completion` also needs the raw text (to detect an in-progress
+        // `a.b.` prefix, which doesn't exist as an AST node until it's a
+        // complete qualified name — see `completion::dotted_prefix_before_cursor`),
+        // so it's fetched separately rather than threaded through `Analysis`.
+        let text = match self.docs.read().unwrap().get(&uri) {
+            Some(doc) => doc.text.clone(),
+            None => return Ok(None),
+        };
+        let items: Vec<CompletionItem> = crate::completion::completion(&analysis, &text, position);
         Ok(Some(CompletionResponse::Array(items)))
     }
+}
+
+/// `Url::to_file_path` only fails for a non-`file://` URI, which `ksl-lsp`
+/// never receives in practice (the client only ever opens real files) — the
+/// current directory is a harmless fallback rather than a case worth
+/// propagating as an error.
+fn uri_to_path(uri: &Url) -> PathBuf {
+    uri.to_file_path().unwrap_or_else(|_| PathBuf::from("."))
 }

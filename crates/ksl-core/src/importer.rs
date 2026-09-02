@@ -177,7 +177,11 @@ fn run_stmts_in(interp: &mut Interpreter, stmts: &[Stmt], env: &Env) -> Result<(
     }
 }
 
-fn resolve_path(base_dir: &Path, import_path: &str) -> PathBuf {
+/// Resolves an `@file:Import("...")` path against the importing file's own
+/// directory (absolute paths are used as-is) — the same rule `Importer`
+/// itself uses, exposed for callers that need to locate an import target
+/// without actually loading/running it (e.g. `ksl-lsp`'s `package_index`).
+pub fn resolve_path(base_dir: &Path, import_path: &str) -> PathBuf {
     let p = Path::new(import_path);
     if p.is_absolute() {
         p.to_path_buf()
@@ -186,7 +190,9 @@ fn resolve_path(base_dir: &Path, import_path: &str) -> PathBuf {
     }
 }
 
-fn is_url(path: &str) -> bool {
+/// True for an import path this crate treats as a (currently unsupported)
+/// network import rather than a local file.
+pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 

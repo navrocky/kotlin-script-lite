@@ -96,11 +96,35 @@ pub struct SymbolTable {
     /// occurrences of their own symbol, so hovering a declaration and
     /// hovering a use both go through `symbol_at`.
     occurrences: Vec<(Span, usize)>,
+    /// Every `a.b.c` qualified-name expression's span and path. This
+    /// resolver doesn't know what `a.b` resolves to (it's single-file, see
+    /// the module doc comment) — recording *where* one appears is as far
+    /// as it goes; resolving it against other files is a caller's job
+    /// (`ksl-lsp`'s `package_index` module does this for hover/goto-def).
+    qualified_refs: Vec<(Span, Vec<String>)>,
 }
 
 impl SymbolTable {
     pub fn symbol_at(&self, line: u32, col: u32) -> Option<&Symbol> {
         self.occurrence_at(line, col).map(|(_, s)| s)
+    }
+
+    /// The `a.b.c` qualified-name expression (if any) covering
+    /// `(line, col)`, with its full span and path segments.
+    pub fn qualified_ref_at(&self, line: u32, col: u32) -> Option<(Span, &[String])> {
+        self.qualified_refs
+            .iter()
+            .find(|(span, _)| span.contains_line_col(line, col))
+            .map(|(span, path)| (*span, path.as_slice()))
+    }
+
+    /// Every symbol declared directly at this file's top level (scope 0,
+    /// always the global scope — see `resolve`). Used by callers indexing
+    /// a `package`-declaring file's exports (`ksl-lsp`'s `package_index`);
+    /// unrelated to `symbols_in_scope`, which is scoped to a cursor
+    /// position within *this* file, not "what does this file export".
+    pub fn top_level_symbols(&self) -> impl Iterator<Item = &Symbol> {
+        self.scopes[0].names.values().map(|&idx| &self.symbols[idx])
     }
 
     /// Like `symbol_at`, but also returns the exact span of the occurrence
@@ -158,7 +182,12 @@ pub struct ResolveResult {
 
 pub fn resolve(program: &Program) -> ResolveResult {
     let mut r = Resolver {
-        table: SymbolTable { scopes: Vec::new(), symbols: Vec::new(), occurrences: Vec::new() },
+        table: SymbolTable {
+            scopes: Vec::new(),
+            symbols: Vec::new(),
+            occurrences: Vec::new(),
+            qualified_refs: Vec::new(),
+        },
         diagnostics: Vec::new(),
         imported_names: program.imports_use.iter().map(|u| u.path.last().unwrap().clone()).collect(),
         has_file_imports: !program.imports.is_empty(),
@@ -364,12 +393,15 @@ impl Resolver {
                 }
             }
             ExprKind::Name(name) => self.resolve_name(scope, name, expr.span),
-            // Package-qualified names (`a.b.c`) aren't resolved here — this
-            // resolver is single-file only (see the module doc comment) and
-            // has no notion of packages, the same limitation it already has
-            // for `@file:Import`. Left inert rather than flagged as
-            // undefined, since it isn't a typo.
-            ExprKind::QualifiedName(_) => {}
+            // Not resolved here — this resolver is single-file only (see
+            // the module doc comment) and has no notion of packages, the
+            // same limitation it already has for `@file:Import`. Never
+            // flagged as undefined (it isn't a typo), but its location is
+            // still recorded so a caller with cross-file knowledge (see
+            // `qualified_ref_at`) can resolve it itself.
+            ExprKind::QualifiedName(path) => {
+                self.table.qualified_refs.push((expr.span, path.clone()));
+            }
             ExprKind::Unary { expr: inner, .. } => self.walk_expr(inner, scope, following),
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs, scope, following);
@@ -575,6 +607,25 @@ mod tests {
         let result = resolve_src("import util.math.square\nprintln(totallyNotAThing)\n");
         assert_eq!(result.diagnostics.len(), 1);
         assert!(result.diagnostics[0].message.contains("totallyNotAThing"));
+    }
+
+    #[test]
+    fn qualified_ref_at_finds_a_qualified_name_expression() {
+        let result = resolve_src("util.math.square(5)\n");
+        let (span, path) = result.table.qualified_ref_at(1, 3).expect("should find the qualified ref");
+        assert_eq!(path, &["util".to_string(), "math".to_string(), "square".to_string()]);
+        assert_eq!(span.line, 1);
+        assert_eq!(span.col, 1);
+        // Not present outside the qualified-name expression's own span.
+        assert!(result.table.qualified_ref_at(1, 25).is_none());
+    }
+
+    #[test]
+    fn top_level_symbols_lists_only_the_files_own_top_level_declarations() {
+        let src = "val a = 1\nfun f(): Int {\n    val local = 2\n    return local\n}\n";
+        let result = resolve_src(src);
+        let names: HashSet<&str> = result.table.top_level_symbols().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, HashSet::from(["a", "f"]));
     }
 
     #[test]
