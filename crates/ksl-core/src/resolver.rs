@@ -335,6 +335,12 @@ impl Resolver {
                 }
             }
             ExprKind::Name(name) => self.resolve_name(scope, name, expr.span),
+            // Package-qualified names (`a.b.c`) aren't resolved here — this
+            // resolver is single-file only (see the module doc comment) and
+            // has no notion of packages, the same limitation it already has
+            // for `@file:Import`. Left inert rather than flagged as
+            // undefined, since it isn't a typo.
+            ExprKind::QualifiedName(_) => {}
             ExprKind::Unary { expr: inner, .. } => self.walk_expr(inner, scope, following),
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs, scope, following);

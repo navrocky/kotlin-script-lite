@@ -74,6 +74,14 @@ mod tests {
             "for (",
             "@file:Import(",
             "@file:",
+            "package",
+            "package a.",
+            "package a.b",
+            "import",
+            "import a.",
+            "import a",
+            "a.",
+            "a.b.",
         ];
         for src in inputs {
             let _ = parse_only(src); // must not panic, Ok or Err both fine

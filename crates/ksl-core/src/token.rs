@@ -29,6 +29,8 @@ pub enum TokenKind {
     Return,
     Break,
     Continue,
+    Package,
+    Import,
 
     // Punctuation
     LParen,

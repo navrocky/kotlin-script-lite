@@ -1,0 +1,5 @@
+@file:Import("imports/mathutil.ksl")
+import util.math.square
+
+println(square(5))
+println(util.math.square(6))

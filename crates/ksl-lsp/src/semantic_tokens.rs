@@ -31,7 +31,7 @@ fn token_type_index(kind: &TokenKind) -> Option<u32> {
     use TokenKind::*;
     let idx = match kind {
         Fun | Val | Var | If | Else | When | While | For | In | Return | Break | Continue
-        | Bool(_) => KEYWORD,
+        | Package | Import | Bool(_) => KEYWORD,
 
         Int(_) | Double(_) => NUMBER,
 

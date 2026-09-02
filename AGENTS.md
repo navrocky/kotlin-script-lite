@@ -94,10 +94,21 @@ sequence) that the end-to-end examples don't check.
 ## Explicitly out of scope (don't add without being asked)
 
 Classes/objects, inheritance, generics, null-safety operators, rich
-collection literals beyond `listOf`, `try`/`catch`, coroutines, extension
-functions, network imports, and Kotlin-style `package`/`import`
-namespacing (dotted qualified names, per-file scoping so a short name can
-stand in for a fully-qualified one). These were deliberately deferred —
-see `docs/syntax.md`. Local file imports (`@file:Import("path.ksl")`,
-loading another file's top-level code into the same shared global scope)
-*are* supported — see `docs/syntax.md#imports` and `src/importer.rs`.
+collection literals beyond `listOf`, `try`/`catch`, coroutines, and
+extension functions. These were deliberately deferred — see
+`docs/syntax.md`.
+
+Local file imports (`@file:Import("path.ksl")`, loading another file's
+top-level code into the shared global scope, or a package's own scope —
+see below) *are* supported, as is `package`/`import` namespacing
+(`package a.b`; `import a.b.c` aliasing a qualified name into bare scope;
+`a.b.c` qualified-name expressions work inline without `import`) — see
+`docs/syntax.md#imports`, `src/importer.rs`, `Interpreter::package_env`/
+`resolve_qualified` in `src/interpreter.rs`. Network imports remain
+unsupported (`@file:Import("https://...")` is a clear error).
+
+**Known gap:** `ksl-lsp`'s `resolver.rs` (hover/goto-def/completion) is
+single-file only and has no notion of packages — a package-qualified
+name (`a.b.c`) or a name brought in via `import` is invisible to it, same
+limitation it already has for `@file:Import`. Making it package/import-aware
+is real follow-up work, not something to casually bolt on.

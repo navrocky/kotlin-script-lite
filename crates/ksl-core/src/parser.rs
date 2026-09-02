@@ -98,28 +98,80 @@ impl<'a> Parser<'a> {
     // ---- program / statements ----
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
-        let imports = self.parse_imports()?;
+        let package = self.parse_package_decl()?;
+        let (imports, imports_use) = self.parse_imports()?;
         let mut stmts = Vec::new();
         self.skip_separators();
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
             self.skip_separators();
         }
-        Ok(Program { imports, stmts })
+        Ok(Program { package, imports, imports_use, stmts })
     }
 
-    /// Consumes a leading run of `@file:Import(...)` declarations. Stops at
-    /// the first non-`@` token, so any `@` appearing later in the file is
-    /// left for `parse_stmt`/`parse_primary` to reject as an unexpected
-    /// token — file annotations are only legal before any other statement.
-    fn parse_imports(&mut self) -> Result<Vec<ImportDecl>, ParseError> {
+    /// `package a.b`, optional and — if present — the very first thing in
+    /// the file (checked before any leading separator is skipped, same as
+    /// how the first `@`/`import` token is checked in `parse_imports`).
+    fn parse_package_decl(&mut self) -> Result<Option<PackageDecl>, ParseError> {
+        if !matches!(self.peek_kind(), TokenKind::Package) {
+            return Ok(None);
+        }
+        let span = self.span();
+        self.advance(); // 'package'
+        let (path, _) = self.parse_dotted_path()?;
+        Ok(Some(PackageDecl { path, span }))
+    }
+
+    /// Consumes a leading run of `@file:Import(...)` and `import a.b.c`
+    /// declarations, in any order. Stops at the first token that's neither,
+    /// so either form appearing later in the file is left for
+    /// `parse_stmt`/`parse_primary` to reject as unexpected — both are only
+    /// legal before any other statement.
+    fn parse_imports(&mut self) -> Result<(Vec<ImportDecl>, Vec<ImportUse>), ParseError> {
         let mut imports = Vec::new();
+        let mut imports_use = Vec::new();
         self.skip_separators();
-        while matches!(self.peek_kind(), TokenKind::At) {
-            imports.push(self.parse_file_import()?);
+        loop {
+            match self.peek_kind() {
+                TokenKind::At => imports.push(self.parse_file_import()?),
+                TokenKind::Import => imports_use.push(self.parse_import_use()?),
+                _ => break,
+            }
             self.skip_separators();
         }
-        Ok(imports)
+        Ok((imports, imports_use))
+    }
+
+    /// `import a.b.c` — brings the package-qualified name `a.b.c` into this
+    /// file's own unqualified scope. At least 2 segments are required (a
+    /// package name plus a member); `import c` alone has no package to
+    /// qualify it and is rejected.
+    fn parse_import_use(&mut self) -> Result<ImportUse, ParseError> {
+        let span = self.span();
+        self.advance(); // 'import'
+        let (path, path_span) = self.parse_dotted_path()?;
+        if path.len() < 2 {
+            return Err(ParseError {
+                message: "import path must be package-qualified, e.g. 'import a.b.c'".into(),
+                span: path_span,
+            });
+        }
+        Ok(ImportUse { path, span: span.merge(&path_span) })
+    }
+
+    /// `ident (. ident)*` — used by `package`/`import`, which (unlike the
+    /// expression-level qualified-name parsing in `parse_primary`) always
+    /// require a dotted path, never a bare single name.
+    fn parse_dotted_path(&mut self) -> Result<(Vec<String>, Span), ParseError> {
+        let (first, first_span) = self.expect_ident_spanned()?;
+        let mut path = vec![first];
+        let mut full_span = first_span;
+        while self.matches(&TokenKind::Dot) {
+            let (segment, segment_span) = self.expect_ident_spanned()?;
+            full_span = full_span.merge(&segment_span);
+            path.push(segment);
+        }
+        Ok((path, full_span))
     }
 
     fn parse_file_import(&mut self) -> Result<ImportDecl, ParseError> {
@@ -594,7 +646,18 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                Ok(Expr::new(ExprKind::Name(name), span))
+                if matches!(self.peek_kind(), TokenKind::Dot) {
+                    let mut path = vec![name];
+                    let mut full_span = span;
+                    while self.matches(&TokenKind::Dot) {
+                        let (segment, segment_span) = self.expect_ident_spanned()?;
+                        full_span = full_span.merge(&segment_span);
+                        path.push(segment);
+                    }
+                    Ok(Expr::new(ExprKind::QualifiedName(path), full_span))
+                } else {
+                    Ok(Expr::new(ExprKind::Name(name), span))
+                }
             }
             TokenKind::StringStart => self.parse_string_template(),
             TokenKind::LParen => {
@@ -939,5 +1002,77 @@ mod tests {
     fn file_import_after_statement_errors() {
         let err = parse_err("println(1)\n@file:Import(\"x.ksl\")");
         assert!(err.message.contains("unexpected") || err.message.contains("At"), "{}", err.message);
+    }
+
+    #[test]
+    fn package_decl_parses() {
+        let tokens = tokenize("package a.b.c\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.package.as_ref().unwrap().path, vec!["a", "b", "c"]);
+        assert_eq!(program.stmts.len(), 1);
+    }
+
+    #[test]
+    fn package_decl_is_optional() {
+        let program = parse(&tokenize("println(1)").unwrap()).unwrap();
+        assert!(program.package.is_none());
+    }
+
+    #[test]
+    fn package_decl_after_statement_errors() {
+        let err = parse_err("println(1)\npackage a.b");
+        assert!(err.message.contains("unexpected") || err.message.contains("Package"), "{}", err.message);
+    }
+
+    #[test]
+    fn import_use_parses_and_requires_a_qualified_path() {
+        let tokens = tokenize("import a.b.greet\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.imports_use.len(), 1);
+        assert_eq!(program.imports_use[0].path, vec!["a", "b", "greet"]);
+
+        let err = parse_err("import greet");
+        assert!(err.message.contains("package-qualified"), "{}", err.message);
+    }
+
+    #[test]
+    fn package_file_import_and_import_use_can_all_appear_together_in_any_order() {
+        let tokens = tokenize(
+            "package my.pkg\nimport a.b.greet\n@file:Import(\"utils.ksl\")\nimport c.d.helper\nprintln(1)",
+        )
+        .unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.package.as_ref().unwrap().path, vec!["my", "pkg"]);
+        assert_eq!(program.imports.len(), 1);
+        assert_eq!(program.imports_use.len(), 2);
+        assert_eq!(program.stmts.len(), 1);
+    }
+
+    #[test]
+    fn qualified_name_expression_parses() {
+        let stmts = parse_src("a.b.greet(1)");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Call { callee, .. } => {
+                    assert!(matches!(&callee.kind, ExprKind::QualifiedName(p) if p == &vec!["a".to_string(), "b".to_string(), "greet".to_string()]));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_name_without_dot_stays_a_plain_name() {
+        let stmts = parse_src("greet(1)");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Call { callee, .. } => {
+                    assert!(matches!(&callee.kind, ExprKind::Name(n) if n == "greet"));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

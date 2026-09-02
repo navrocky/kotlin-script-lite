@@ -1,17 +1,42 @@
 use crate::error::Span;
 
+/// `package a.b` — optional, must be the very first thing in a file if
+/// present. Namespaces the file's own top-level `fun`/`val`/`var`
+/// declarations under `path` (joined with `.`) instead of the flat global
+/// scope; see `Interpreter::package_env`.
+#[derive(Debug, Clone)]
+pub struct PackageDecl {
+    pub path: Vec<String>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
     pub path: String,
     pub span: Span,
 }
 
-/// The result of parsing a whole file: its `@file:Import(...)` declarations
-/// (all appearing before any other statement) plus its own top-level
-/// statements.
+/// `import a.b.c` — brings the package-qualified name `a.b.c` (package
+/// `a.b`, member `c`) into this file's own unqualified scope. `path` always
+/// has at least 2 segments; the last is the member name, everything before
+/// it is the package name. Orthogonal to `ImportDecl`/`@file:Import`, which
+/// loads a *file* by path — `import` only aliases a name that some already-
+/// loaded file's `package` declaration put there; it never loads anything
+/// by itself. See `Interpreter::resolve_qualified`.
+#[derive(Debug, Clone)]
+pub struct ImportUse {
+    pub path: Vec<String>,
+    pub span: Span,
+}
+
+/// The result of parsing a whole file: its optional `package` declaration,
+/// its `@file:Import(...)`/`import a.b.c` declarations (all appearing
+/// before any other statement), and its own top-level statements.
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub package: Option<PackageDecl>,
     pub imports: Vec<ImportDecl>,
+    pub imports_use: Vec<ImportUse>,
     pub stmts: Vec<Stmt>,
 }
 
@@ -34,6 +59,12 @@ pub enum ExprKind {
     BoolLit(bool),
     StringTemplate(Vec<StringPart>),
     Name(String),
+    /// `a.b.c` — a package-qualified reference (package `a.b`, member `c`;
+    /// the last segment is always the member, everything before it the
+    /// package name). Produced only when a bare name is followed by at
+    /// least one `.`; a plain `Name` is used otherwise. See
+    /// `Interpreter::resolve_qualified`.
+    QualifiedName(Vec<String>),
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,

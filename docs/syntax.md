@@ -211,8 +211,8 @@ println(greet("World"))
 `@file:Import("path.ksl")` loads another local `.ksl` file and runs its
 top-level code — its `fun`/`val` declarations become available to the
 importing script, as if the imported file's contents ran first in the same
-global scope. There is no per-file namespacing: everything still shares one
-flat global scope, same as a single-file script (see "Not supported" below).
+global scope (or, if the imported file declares a `package`, in that
+package's own scope — see below).
 
 - File annotations must appear before any other statement, at the very top
   of the file. Only `Import` is recognized (`@file:Import(...)`) — any other
@@ -225,11 +225,55 @@ flat global scope, same as a single-file script (see "Not supported" below).
 - Only local files are supported right now — `@file:Import("https://...")`
   is a clear "not yet supported" error rather than a working network fetch.
 
+### Packages
+
+A file can optionally declare a package as the very first thing in it:
+
+```kotlin
+package util.math
+
+fun square(x: Int): Int = x * x
+```
+
+A file with no `package` declaration behaves exactly as before: its
+top-level declarations land in one flat global scope, shared with every
+other package-less file (via `@file:Import`) and the entry script itself.
+
+A file *with* a `package` declaration namespaces its top-level declarations
+under that dotted name instead — invisible as bare names to code outside
+the package, but visible (as bare names) to any other file sharing the same
+`package`, the same way package-less files already share the global scope.
+
+Two ways to use something from another package, once the file declaring it
+has been `@file:Import`ed:
+
+```kotlin
+@file:Import("mathutil.ksl")   // declares `package util.math`
+
+println(util.math.square(5))   // qualified access, no import needed
+```
+
+```kotlin
+@file:Import("mathutil.ksl")
+import util.math.square        // brings `square` into this file's own scope
+
+println(square(5))
+```
+
+- `import a.b.c` (like `@file:Import`, only legal before any other
+  statement) never loads a file by itself — it only aliases a name that
+  some already-`@file:Import`ed file's `package` declaration put there.
+  Using it, or a bare `a.b.c` reference, before that file has actually been
+  imported is a runtime error (`unknown package 'a.b'`).
+- `a.b.c` qualified-name syntax (package `a.b`, member `c`) works in any
+  expression position without needing `import` first.
+
 ## Not supported
 
 Deliberately out of scope for now: classes/objects, inheritance,
 generics, null-safety operators (`?`, `?.`, `?:`, `!!`), list/map
-literals, `try`/`catch`, coroutines, extension functions, Kotlin-style
-`package`/`import` namespacing (dotted qualified names, per-file scoping),
-network imports, and `.` member-call syntax (stdlib functions are called
-directly, e.g. `length(s)` rather than `s.length()`).
+literals, `try`/`catch`, coroutines, extension functions, network imports,
+and `.` member-call syntax on *values* — stdlib functions are still called
+directly (`length(s)`, not `s.length()`). `.` in an expression only ever
+means a package-qualified name (`a.b.c`, see "Packages" above), never a
+method or field access on whatever `a` evaluates to.

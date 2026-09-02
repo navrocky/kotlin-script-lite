@@ -11,21 +11,63 @@ use crate::value::{FunctionValue, Value};
 pub struct Interpreter<'a> {
     pub globals: Env,
     pub out: &'a mut dyn std::io::Write,
+    /// A package's own `Env` (a direct child of `globals`, so package code
+    /// can see stdlib but not other packages' or the entry script's own
+    /// locals), keyed by its dotted name. Created lazily via `package_env`
+    /// — multiple files declaring the same `package` share one entry here,
+    /// so they see each other's top-level names the same way multiple
+    /// `@file:Import`ed files without a package already share one flat
+    /// `globals`. Never removed; a script only ever adds packages.
+    packages: HashMap<String, Env>,
 }
 
 impl<'a> Interpreter<'a> {
     pub fn new(out: &'a mut dyn std::io::Write) -> Self {
         let globals = Env::new();
         crate::stdlib::populate_globals(&globals);
-        Interpreter { globals, out }
+        Interpreter { globals, out, packages: HashMap::new() }
     }
 
     pub fn run(&mut self, stmts: &[Stmt]) -> Result<(), Flow> {
         let env = self.globals.clone();
+        self.run_in_env(stmts, &env)
+    }
+
+    /// Runs `stmts` against `env` directly — the general primitive `run`
+    /// and package-scoped execution (see `importer.rs`, which runs a
+    /// `package`-declaring file's top-level statements against
+    /// `package_env(name)` instead of `globals`) both build on.
+    pub fn run_in_env(&mut self, stmts: &[Stmt], env: &Env) -> Result<(), Flow> {
         for stmt in stmts {
-            self.exec_stmt(stmt, &env)?;
+            self.exec_stmt(stmt, env)?;
         }
         Ok(())
+    }
+
+    /// Gets or creates the `Env` that a `package name` declaration's own
+    /// top-level code runs in, and that a `name.member`/`import
+    /// name.member` reference resolves `member` against.
+    pub fn package_env(&mut self, name: &str) -> Env {
+        self.packages
+            .entry(name.to_string())
+            .or_insert_with(|| self.globals.child())
+            .clone()
+    }
+
+    /// Resolves a package-qualified path like `["a","b","greet"]` — package
+    /// `a.b`, member `greet` (the last segment is always the member, every
+    /// segment before it the package name) — to the value it names. Shared
+    /// by `ExprKind::QualifiedName` evaluation and `import a.b.greet`
+    /// processing in `importer.rs`.
+    pub fn resolve_qualified(&self, path: &[String], span: Span) -> Result<Value, RuntimeError> {
+        let (package, member) = path.split_at(path.len() - 1);
+        let package_name = package.join(".");
+        let package_env = self.packages.get(&package_name).ok_or_else(|| {
+            RuntimeError::new(format!("unknown package '{package_name}'"), span)
+        })?;
+        package_env
+            .get(&member[0])
+            .ok_or_else(|| RuntimeError::new(format!("undefined name '{}'", path.join(".")), span))
     }
 
     /// A block's value is the value of its last statement if that statement
@@ -168,6 +210,7 @@ impl<'a> Interpreter<'a> {
             ExprKind::Name(name) => env
                 .get(name)
                 .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span).into()),
+            ExprKind::QualifiedName(path) => self.resolve_qualified(path, expr.span).map_err(Into::into),
             ExprKind::Unary { op, expr: inner } => {
                 let v = self.eval_expr(inner, env)?;
                 match (op, &v) {
@@ -595,5 +638,51 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
             println(add(3, 4))
         "#;
         assert_eq!(run(src), "20\n7\n");
+    }
+
+    #[test]
+    fn package_qualified_name_calls_directly_without_import() {
+        // A single script declaring its own package can be a stand-in for
+        // "two files, same package" here: greet() lands in package_env
+        // ("a.b"), and a.b.greet(...) resolves it without any `import`.
+        let src = r#"
+            package a.b
+            fun greet(name: String): String = "Hi, $name"
+            println(a.b.greet("World"))
+        "#;
+        assert_eq!(run(src), "Hi, World\n");
+    }
+
+    // `import a.b.greet` (bringing a qualified name into bare scope) must
+    // appear as a leading declaration, before any regular statement in the
+    // importing file — same constraint as `@file:Import`. That means it
+    // can't be exercised in one self-contained script the way
+    // `package_qualified_name_calls_directly_without_import` above can:
+    // realistically it needs a *different*, already-`@file:Import`ed file
+    // to have populated the package first. See
+    // `importer::tests::import_use_brings_a_qualified_name_into_bare_scope`.
+
+    #[test]
+    fn unknown_package_is_a_runtime_error() {
+        let err = run_err("println(a.b.greet(\"x\"))");
+        assert!(err.contains("unknown package 'a.b'"), "{err}");
+    }
+
+    #[test]
+    fn unknown_member_of_a_known_package_is_a_runtime_error() {
+        let src = r#"
+            package a.b
+            fun greet(name: String): String = "Hi, $name"
+            println(a.b.nope())
+        "#;
+        let err = run_err(src);
+        assert!(err.contains("undefined name 'a.b.nope'"), "{err}");
+    }
+
+    #[test]
+    fn no_package_script_is_unaffected() {
+        // Full backward-compatibility check: a script with no `package`
+        // declaration behaves exactly as before this feature existed.
+        assert_eq!(run("fun greet(name: String): String = \"Hi, $name\"\nprintln(greet(\"World\"))"), "Hi, World\n");
     }
 }

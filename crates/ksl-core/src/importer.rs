@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ast::{ImportDecl, Program, Stmt};
+use crate::environment::Env;
 use crate::error::{Flow, InterpError, RuntimeError, Span};
 use crate::interpreter::Interpreter;
 
@@ -62,7 +63,7 @@ impl Importer {
         }
         result?;
 
-        run_stmts(interp, &program.stmts)
+        run_program(interp, &program)
     }
 
     fn run_imports(
@@ -126,7 +127,7 @@ impl Importer {
             .unwrap_or_else(|| PathBuf::from("."));
         let result: Result<(), InterpError> = (|| {
             self.run_imports(&program, &child_base_dir, interp)?;
-            run_stmts(interp, &program.stmts).map_err(|e| wrap(&canonical, e))
+            run_program(interp, &program).map_err(|e| wrap(&canonical, e))
         })();
         self.stack.pop();
         result?;
@@ -140,8 +141,32 @@ fn parse_program(src: &str) -> Result<Program, InterpError> {
     crate::parse_only(src).map_err(InterpError::Parse)
 }
 
-fn run_stmts(interp: &mut Interpreter, stmts: &[Stmt]) -> Result<(), InterpError> {
-    match interp.run(stmts) {
+/// Resolves `program`'s `import a.b.c` declarations (bringing each into
+/// `program`'s own target env — its `package_env` if it declares one, else
+/// `globals`) and then runs its top-level statements against that same env.
+/// Called for both the entry script and every `@file:Import`ed file, after
+/// all of *that* program's own `@file:Import`s have already run (so any
+/// package an `import` here draws from is guaranteed populated).
+fn run_program(interp: &mut Interpreter, program: &Program) -> Result<(), InterpError> {
+    let target_env = match &program.package {
+        Some(pkg) => interp.package_env(&pkg.path.join(".")),
+        None => interp.globals.clone(),
+    };
+
+    for use_ in &program.imports_use {
+        let value = interp
+            .resolve_qualified(&use_.path, use_.span)
+            .map_err(InterpError::Runtime)?;
+        // Checked by the parser (`parse_import_use`): at least 2 segments.
+        let member_name = use_.path.last().expect("import path has a member segment");
+        target_env.define(member_name, value, false);
+    }
+
+    run_stmts_in(interp, &program.stmts, &target_env)
+}
+
+fn run_stmts_in(interp: &mut Interpreter, stmts: &[Stmt], env: &Env) -> Result<(), InterpError> {
+    match interp.run_in_env(stmts, env) {
         Ok(()) => Ok(()),
         Err(Flow::Error(e)) => Err(InterpError::Runtime(e)),
         Err(Flow::Return(_)) => Ok(()),
@@ -291,5 +316,61 @@ mod tests {
 
         let err = run_in(&dir, "a.ksl").unwrap_err();
         assert!(err.to_string().contains("network imports are not yet supported"), "{}", err);
+    }
+
+    #[test]
+    fn import_use_brings_a_qualified_name_into_bare_scope() {
+        let dir = TempDir::new("import_use");
+        dir.write("pkg.ksl", "package a.b\nfun greet(name: String): String = \"Hi, $name\"\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport a.b.greet\nprintln(greet(\"World\"))\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "Hi, World\n");
+    }
+
+    #[test]
+    fn qualified_access_works_without_any_import_statement() {
+        let dir = TempDir::new("qualified_no_import");
+        dir.write("pkg.ksl", "package a.b\nfun greet(name: String): String = \"Hi, $name\"\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(a.b.greet(\"World\"))\n");
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "Hi, World\n");
+    }
+
+    #[test]
+    fn two_files_declaring_the_same_package_share_visibility() {
+        let dir = TempDir::new("same_package");
+        dir.write("p1.ksl", "package a.b\nfun helper(): Int = 41\n");
+        // p2.ksl calls helper() *unqualified* — same package_env as p1.ksl.
+        dir.write("p2.ksl", "package a.b\nfun main2(): Int = helper() + 1\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"p1.ksl\")\n@file:Import(\"p2.ksl\")\nimport a.b.main2\nprintln(main2())\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "42\n");
+    }
+
+    #[test]
+    fn file_with_no_package_is_unaffected_by_an_imported_files_package() {
+        let dir = TempDir::new("no_package_unaffected");
+        dir.write("pkg.ksl", "package a.b\nfun greet(name: String): String = \"Hi, $name\"\n");
+        // No package, no import a.b.greet — bare "greet" must NOT be visible
+        // here (it only landed in package_env("a.b"), not globals).
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(greet(\"World\"))\n");
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("undefined name 'greet'"), "{err}");
+    }
+
+    #[test]
+    fn import_of_an_unresolved_package_errors_cleanly() {
+        let dir = TempDir::new("import_unresolved");
+        dir.write("main.ksl", "import a.b.greet\nprintln(1)\n");
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("unknown package 'a.b'"), "{err}");
     }
 }

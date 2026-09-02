@@ -274,6 +274,8 @@ impl<'a> Lexer<'a> {
             "return" => TokenKind::Return,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
+            "package" => TokenKind::Package,
+            "import" => TokenKind::Import,
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
             _ => TokenKind::Ident(text),
