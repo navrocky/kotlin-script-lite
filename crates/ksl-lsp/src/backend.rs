@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
+    CompletionItem, CompletionOptions, CompletionParams, CompletionResponse,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, Diagnostic, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
@@ -13,7 +14,7 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer};
 
 use crate::analysis::{self, Analysis};
-use crate::diagnostics::parse_diagnostics;
+use crate::diagnostics::static_diagnostics;
 use crate::document_store::DocumentStore;
 use crate::runtime_diagnostics::{run_diagnostics, RuntimeDiagnostics};
 use crate::semantic_tokens::{semantic_tokens, TOKEN_TYPES};
@@ -42,8 +43,8 @@ impl Backend {
         self.client.publish_diagnostics(uri, diagnostics, None).await;
     }
 
-    async fn publish_parse_diagnostics(&self, uri: Url, text: &str) {
-        let diags = parse_diagnostics(text);
+    async fn publish_static_diagnostics(&self, uri: Url, text: &str) {
+        let diags = static_diagnostics(text);
         self.publish(uri, diags).await;
     }
 
@@ -67,7 +68,7 @@ impl Backend {
 
     /// Runs the script for runtime diagnostics, but only if it actually
     /// parses — a script that doesn't parse fails identically as a parse
-    /// error, which `publish_parse_diagnostics` already surfaced.
+    /// error, which `publish_static_diagnostics` already surfaced.
     async fn run_and_publish_runtime_diagnostics(&self, uri: Url, text: String) {
         if ksl_core::parse_only(&text).is_err() {
             self.clear_stale_runtime_target(&uri, None).await;
@@ -119,6 +120,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions::default()),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                     SemanticTokensOptions {
                         legend: SemanticTokensLegend {
@@ -151,7 +153,7 @@ impl LanguageServer for Backend {
         let text = params.text_document.text;
         self.docs.write().unwrap().open(uri.clone(), text.clone());
         self.update_last_good_tree(&uri, &text);
-        self.publish_parse_diagnostics(uri, &text).await;
+        self.publish_static_diagnostics(uri, &text).await;
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
@@ -164,7 +166,7 @@ impl LanguageServer for Backend {
         };
         self.docs.write().unwrap().update(&uri, text.clone());
         self.update_last_good_tree(&uri, &text);
-        self.publish_parse_diagnostics(uri, &text).await;
+        self.publish_static_diagnostics(uri, &text).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -173,7 +175,7 @@ impl LanguageServer for Backend {
             Some(doc) => doc.text.clone(),
             None => return,
         };
-        self.publish_parse_diagnostics(uri.clone(), &text).await;
+        self.publish_static_diagnostics(uri.clone(), &text).await;
         self.run_and_publish_runtime_diagnostics(uri, text).await;
     }
 
@@ -211,5 +213,13 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
         let Some(analysis) = self.analysis_for(&uri) else { return Ok(None) };
         Ok(crate::goto_definition::goto_definition(&analysis, &uri, position))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(analysis) = self.analysis_for(&uri) else { return Ok(None) };
+        let items: Vec<CompletionItem> = crate::completion::completion(&analysis, position);
+        Ok(Some(CompletionResponse::Array(items)))
     }
 }

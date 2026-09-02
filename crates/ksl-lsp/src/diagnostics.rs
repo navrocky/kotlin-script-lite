@@ -1,12 +1,20 @@
 use ksl_core::error::Span;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// Cheap, always-safe diagnostics: parse errors only, no execution, no file
-/// I/O. Safe to run on every `didChange`, including on syntactically
-/// incomplete (mid-typing) buffers.
-pub fn parse_diagnostics(text: &str) -> Vec<Diagnostic> {
+/// Cheap, always-safe diagnostics: parsing plus static resolver checks
+/// (undefined names, duplicate declarations — see `ksl_core::resolver`),
+/// no execution, no file I/O. Safe to run on every `didChange`, including
+/// on syntactically incomplete (mid-typing) buffers — if `text` doesn't
+/// parse, only the parse error is reported (resolver checks need a tree to
+/// run against, and reflect `text` itself, never a last-good fallback:
+/// that fallback is only for hover/goto-definition, see `analysis.rs`).
+pub fn static_diagnostics(text: &str) -> Vec<Diagnostic> {
     match ksl_core::parse_only(text) {
-        Ok(_) => Vec::new(),
+        Ok(program) => ksl_core::resolver::resolve(&program)
+            .diagnostics
+            .into_iter()
+            .map(|e| new_diagnostic(span_to_range(e.span), e.message))
+            .collect(),
         Err(e) => vec![new_diagnostic(span_to_range(e.span), e.message)],
     }
 }
@@ -32,12 +40,12 @@ mod tests {
 
     #[test]
     fn valid_script_has_no_diagnostics() {
-        assert!(parse_diagnostics("println(\"hi\")\n").is_empty());
+        assert!(static_diagnostics("println(\"hi\")\n").is_empty());
     }
 
     #[test]
     fn syntax_error_produces_one_diagnostic() {
-        let diags = parse_diagnostics("val x = \n");
+        let diags = static_diagnostics("val x = \n");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(diags[0].source.as_deref(), Some("ksl"));
@@ -47,8 +55,23 @@ mod tests {
     fn incomplete_buffer_mid_typing_still_produces_a_diagnostic_not_a_panic() {
         // Editors call this on every keystroke; a mid-typed buffer must
         // report an error, not panic.
-        let diags = parse_diagnostics("fun f(x: ");
+        let diags = static_diagnostics("fun f(x: ");
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn undefined_name_is_flagged_live_without_a_save() {
+        // The specific gap this closes: calling an undefined function used
+        // to only surface as a diagnostic on didSave (running the script);
+        // now the resolver catches it on didOpen/didChange too.
+        let diags = static_diagnostics("printlnn(\"hi\")\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("printlnn"));
+    }
+
+    #[test]
+    fn stdlib_calls_are_not_flagged_as_undefined() {
+        assert!(static_diagnostics("println(uppercase(\"hi\"))\n").is_empty());
     }
 
     #[test]

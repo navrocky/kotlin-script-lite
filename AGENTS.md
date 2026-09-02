@@ -86,6 +86,10 @@ sequence) that the end-to-end examples don't check.
    (`cargo run -- tests/examples/foo.ksl`), don't hand-compute output for
    anything involving floating-point formatting (Rust's `f64` `Display`
    differs from Kotlin's — e.g. `2.0` prints as `2`, not `2.0`).
+7. Adding a stdlib function (`stdlib.rs`'s `register` calls) also needs an
+   entry in `STDLIB_SIGNATURES` (same file) and `docs/stdlib.md` — skipping
+   the table entry means `ksl-lsp` won't offer it in hover/completion and
+   the resolver will flag calls to it as an undefined-name diagnostic.
 
 ## Explicitly out of scope (don't add without being asked)
 

@@ -5,11 +5,14 @@
 //! "what does this name refer to" and "what's declared here" without
 //! running the script.
 //!
-//! `@file:Import`ed files are not indexed — this is single-file only; a
-//! name that resolves to something declared in an imported file is simply
-//! left unresolved rather than reported as an error (stdlib functions like
-//! `println` are the common case of this: they're never declared anywhere
-//! in the AST at all).
+//! `@file:Import`ed files are not indexed — this is single-file only, so a
+//! name actually declared in an imported file is left silently unresolved
+//! rather than flagged as undefined (indistinguishable, from here, from a
+//! genuine typo). Stdlib functions like `println` are a separate case:
+//! never declared in the AST at all (they're registered directly into the
+//! runtime `Env` by `stdlib::populate_globals`), so a use that doesn't
+//! resolve in scope is checked against `stdlib::STDLIB_SIGNATURES` before
+//! being flagged as an undefined-name diagnostic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,22 +40,36 @@ pub struct Symbol {
     pub signature: String,
 }
 
+/// A `following` hint (see `Resolver::walk_stmt`) meaning "there's no
+/// concrete next sibling — extends to the end of the file." A scope's
+/// upper bound is taken from `following`'s *start* fields (see
+/// `Resolver::open_scope`: it's the position where the next construct
+/// begins), so this sentinel's own start fields sit at "infinity" rather
+/// than at the top of the file.
+const FILE_END: Span = Span { line: u32::MAX, col: u32::MAX, end_line: u32::MAX, end_col: u32::MAX };
+
+/// The global scope's own extent: the whole file.
+const FILE_SPAN: Span = Span { line: 1, col: 1, end_line: u32::MAX, end_col: u32::MAX };
+
 struct ScopeData {
     parent: Option<usize>,
     depth: u32,
-    /// Bounding box over every span (definitions, uses, and nested scopes)
-    /// encountered while walking this scope's contents. This is an
-    /// approximation of the scope's true source extent: since neither
-    /// `Stmt::span` nor `Expr::span` cover a whole construct (they anchor
-    /// its *start* only — see AGENTS.md's "Span on every Expr/Stmt"), there
-    /// is no existing span to read the real brace-to-brace extent from.
-    /// The bounding box is exact at its corners (every span merged in is a
-    /// real position) but can be tighter than the true scope on the inside
-    /// edges — e.g. an empty `while (true) {}` body has no bounding box at
-    /// all. Fine for `symbol_at` (unaffected) and good enough for
-    /// `symbols_in_scope`'s current use (not wired to any LSP feature
-    /// yet); revisit if that changes.
-    bounds: Option<Span>,
+    /// This scope's source extent — where a cursor position has to fall
+    /// for `symbols_in_scope` to consider this scope active. Set directly
+    /// at scope creation (see `Resolver::open_scope`) as "from this
+    /// construct's own start, up to wherever the next sibling construct
+    /// begins" (or end-of-file, if there is no next sibling) — necessary
+    /// because neither `Stmt::span` nor `Expr::span` cover a whole
+    /// construct (they anchor its *start* only, see AGENTS.md's "Span on
+    /// every Expr/Stmt"), so there's no direct way to read a real
+    /// brace-to-brace extent. Using the next sibling's start as the
+    /// boundary is deliberately generous on the inside edge (e.g. an empty
+    /// `while (true) { }` body's scope technically extends slightly past
+    /// its closing brace, into whatever follows the loop) — safe for
+    /// `symbols_in_scope`, whose worst case is an occasional over-broad
+    /// suggestion, never a missing one. `symbol_at` is unaffected either
+    /// way, since it matches on `occurrences`, not scope bounds.
+    bounds: Span,
     /// name -> index into `SymbolTable::symbols`. A later definition of the
     /// same name in the same scope overwrites the entry (shadowing within
     /// one scope is flagged as a diagnostic at definition time, see
@@ -118,7 +135,7 @@ impl SymbolTable {
         self.scopes
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.bounds.is_some_and(|b| b.contains_line_col(line, col)))
+            .filter(|(_, s)| s.bounds.contains_line_col(line, col))
             .max_by_key(|(_, s)| s.depth)
             .map(|(i, _)| i)
     }
@@ -134,8 +151,8 @@ pub fn resolve(program: &Program) -> ResolveResult {
         table: SymbolTable { scopes: Vec::new(), symbols: Vec::new(), occurrences: Vec::new() },
         diagnostics: Vec::new(),
     };
-    let global = r.push_scope(None, 0);
-    r.walk_stmts(&program.stmts, global);
+    let global = r.push_scope(None, 0, FILE_SPAN);
+    r.walk_stmts(&program.stmts, global, FILE_END);
     ResolveResult { table: r.table, diagnostics: r.diagnostics }
 }
 
@@ -145,22 +162,33 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn push_scope(&mut self, parent: Option<usize>, depth: u32) -> usize {
-        self.table.scopes.push(ScopeData { parent, depth, bounds: None, names: HashMap::new() });
+    fn push_scope(&mut self, parent: Option<usize>, depth: u32, bounds: Span) -> usize {
+        self.table.scopes.push(ScopeData { parent, depth, bounds, names: HashMap::new() });
         self.table.scopes.len() - 1
     }
 
-    /// Expands `scope` and every ancestor's bounding box to include `span`
-    /// — a child scope's contents are always within its parent's, so the
-    /// expansion has to propagate up the whole chain to stay consistent.
+    /// Creates a child scope for a construct that runs in its own
+    /// `env.child()` at runtime (function/lambda bodies, loop/branch/block
+    /// bodies — see the module doc comment), with its extent set up front:
+    /// from `own_start` (this construct's own anchor span — the `fun`/
+    /// `while`/`for`/`if` keyword, a lambda's `{`, etc.) to `following`
+    /// (wherever whatever comes next, textually, begins).
+    fn open_scope(&mut self, parent: usize, own_start: Span, following: Span) -> usize {
+        let depth = self.table.scopes[parent].depth + 1;
+        let bounds = Span::with_end(own_start.line, own_start.col, following.line, following.col);
+        self.push_scope(Some(parent), depth, bounds)
+    }
+
+    /// Widens `scope`'s bounds to also include `span` — used for content
+    /// that can legitimately fall outside the up-front `own_start..following`
+    /// estimate (e.g. `resolve_name`'s widening for a use elsewhere isn't
+    /// needed in practice, but stays defensive/harmless if ever called with
+    /// something outside the initial estimate).
     fn touch(&mut self, scope: usize, span: Span) {
         let mut cur = Some(scope);
         while let Some(s) = cur {
             let scope = &mut self.table.scopes[s];
-            scope.bounds = Some(match scope.bounds {
-                Some(b) => b.merge(&span),
-                None => span,
-            });
+            scope.bounds = scope.bounds.merge(&span);
             cur = scope.parent;
         }
     }
@@ -188,10 +216,10 @@ impl Resolver {
     }
 
     /// Resolves a use of `name` by walking up the scope chain from `scope`.
-    /// Left silently unresolved if nothing matches — an undefined name
-    /// isn't necessarily an error here the way it is at runtime (stdlib
-    /// functions are never declared in the AST at all), so this doesn't
-    /// emit a diagnostic.
+    /// If nothing matches there, it's still not necessarily an error the
+    /// way it would be at runtime — stdlib functions like `println` are
+    /// never declared in the AST at all — so it's checked against the
+    /// known stdlib names too before being flagged as a diagnostic.
     fn resolve_name(&mut self, scope: usize, name: &str, use_span: Span) {
         self.touch(scope, use_span);
         let mut cur = Some(scope);
@@ -202,28 +230,37 @@ impl Resolver {
             }
             cur = self.table.scopes[s].parent;
         }
-    }
-
-    fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize) {
-        for s in stmts {
-            self.walk_stmt(s, scope);
+        if !crate::stdlib::is_known(name) {
+            self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
         }
     }
 
-    /// A new child scope for a construct that runs in its own `env.child()`
-    /// at runtime (loop/branch/block bodies — see the module doc comment).
-    fn walk_block(&mut self, stmts: &[Stmt], parent: usize) {
-        let depth = self.table.scopes[parent].depth + 1;
-        let child = self.push_scope(Some(parent), depth);
-        self.walk_stmts(stmts, child);
+    /// `following` is the span of whatever comes next, textually, after
+    /// this whole statement list — used only to give the *last* statement
+    /// in the list (if it opens a scope) a real upper bound; every earlier
+    /// statement's own `following` is simply the next one in the list.
+    fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize, following: Span) {
+        for (i, s) in stmts.iter().enumerate() {
+            let next = stmts.get(i + 1).map(|s| s.span).unwrap_or(following);
+            self.walk_stmt(s, scope, next);
+        }
     }
 
-    fn walk_stmt(&mut self, stmt: &Stmt, scope: usize) {
+    /// A block that opens its own child scope but declares nothing of its
+    /// own beyond its statements (loop/branch/block bodies — contrast with
+    /// `FunDecl`/`For`/`Lambda`, which also bind params/a loop variable
+    /// into the new scope before walking its body).
+    fn walk_block(&mut self, stmts: &[Stmt], parent: usize, open_at: Span, following: Span) {
+        let child = self.open_scope(parent, open_at, following);
+        self.walk_stmts(stmts, child, following);
+    }
+
+    fn walk_stmt(&mut self, stmt: &Stmt, scope: usize, following: Span) {
         self.touch(scope, stmt.span);
         match &stmt.kind {
-            StmtKind::ExprStmt(e) => self.walk_expr(e, scope),
+            StmtKind::ExprStmt(e) => self.walk_expr(e, scope, following),
             StmtKind::ValDecl { name, name_span, init, mutable, type_hint } => {
-                self.walk_expr(init, scope);
+                self.walk_expr(init, scope, following);
                 let kind = if *mutable { SymbolKind::Var } else { SymbolKind::Val };
                 let keyword = if *mutable { "var" } else { "val" };
                 let sig = match type_hint {
@@ -233,7 +270,7 @@ impl Resolver {
                 self.define(scope, name, kind, *name_span, *mutable, sig);
             }
             StmtKind::Assign { name, value, .. } => {
-                self.walk_expr(value, scope);
+                self.walk_expr(value, scope, following);
                 self.resolve_name(scope, name, stmt.span);
             }
             StmtKind::FunDecl { name, name_span, params, body } => {
@@ -244,27 +281,25 @@ impl Resolver {
                 // `env` its closure captures, mutated after capture.
                 let sig = format!("fun {name}({})", param_list(params));
                 self.define(scope, name, SymbolKind::Fun, *name_span, false, sig);
-                let depth = self.table.scopes[scope].depth + 1;
-                let fn_scope = self.push_scope(Some(scope), depth);
-                self.walk_params(params, fn_scope);
+                let fn_scope = self.open_scope(scope, stmt.span, following);
+                self.walk_params(params, fn_scope, following);
                 match body {
-                    FunBody::Expr(e) => self.walk_expr(e, fn_scope),
-                    FunBody::Block(stmts) => self.walk_stmts(stmts, fn_scope),
+                    FunBody::Expr(e) => self.walk_expr(e, fn_scope, following),
+                    FunBody::Block(stmts) => self.walk_stmts(stmts, fn_scope, following),
                 }
             }
             StmtKind::While { cond, body } => {
-                self.walk_expr(cond, scope);
-                self.walk_block(body, scope);
+                self.walk_expr(cond, scope, following);
+                self.walk_block(body, scope, stmt.span, following);
             }
             StmtKind::For { var_name, var_name_span, iterable, body } => {
-                self.walk_expr(iterable, scope);
-                let depth = self.table.scopes[scope].depth + 1;
-                let for_scope = self.push_scope(Some(scope), depth);
+                self.walk_expr(iterable, scope, following);
+                let for_scope = self.open_scope(scope, stmt.span, following);
                 let sig = format!("val {var_name} (loop variable)");
                 self.define(for_scope, var_name, SymbolKind::Val, *var_name_span, false, sig);
-                self.walk_stmts(body, for_scope);
+                self.walk_stmts(body, for_scope, following);
             }
-            StmtKind::Return(Some(e)) => self.walk_expr(e, scope),
+            StmtKind::Return(Some(e)) => self.walk_expr(e, scope, following),
             StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
@@ -275,10 +310,10 @@ impl Resolver {
     /// A default value expression is walked before its own param is
     /// defined but after earlier params are, mirroring the order
     /// `call_function` evaluates defaults in.
-    fn walk_params(&mut self, params: &[Param], fn_scope: usize) {
+    fn walk_params(&mut self, params: &[Param], fn_scope: usize, following: Span) {
         for p in params {
             if let Some(default) = &p.default {
-                self.walk_expr(default, fn_scope);
+                self.walk_expr(default, fn_scope, following);
             }
             let sig = match &p.type_hint {
                 Some(t) => format!("param {}: {t}", p.name),
@@ -288,37 +323,36 @@ impl Resolver {
         }
     }
 
-    fn walk_expr(&mut self, expr: &Expr, scope: usize) {
+    fn walk_expr(&mut self, expr: &Expr, scope: usize, following: Span) {
         self.touch(scope, expr.span);
         match &expr.kind {
             ExprKind::IntLit(_) | ExprKind::DoubleLit(_) | ExprKind::BoolLit(_) => {}
             ExprKind::StringTemplate(parts) => {
                 for part in parts {
                     if let StringPart::Expr(e) = part {
-                        self.walk_expr(e, scope);
+                        self.walk_expr(e, scope, following);
                     }
                 }
             }
             ExprKind::Name(name) => self.resolve_name(scope, name, expr.span),
-            ExprKind::Unary { expr: inner, .. } => self.walk_expr(inner, scope),
+            ExprKind::Unary { expr: inner, .. } => self.walk_expr(inner, scope, following),
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.walk_expr(lhs, scope);
-                self.walk_expr(rhs, scope);
+                self.walk_expr(lhs, scope, following);
+                self.walk_expr(rhs, scope, following);
             }
             ExprKind::Range { start, end } => {
-                self.walk_expr(start, scope);
-                self.walk_expr(end, scope);
+                self.walk_expr(start, scope, following);
+                self.walk_expr(end, scope, following);
             }
             ExprKind::Call { callee, args } => {
-                self.walk_expr(callee, scope);
+                self.walk_expr(callee, scope, following);
                 for a in args {
-                    self.walk_expr(&a.value, scope);
+                    self.walk_expr(&a.value, scope, following);
                 }
             }
             ExprKind::Lambda { params, body } => {
-                let depth = self.table.scopes[scope].depth + 1;
-                let lambda_scope = self.push_scope(Some(scope), depth);
-                self.walk_params(params, lambda_scope);
+                let lambda_scope = self.open_scope(scope, expr.span, following);
+                self.walk_params(params, lambda_scope, following);
                 if params.is_empty() {
                     // Implicit `it` — synthesized at call time with no
                     // token of its own to point at, so its "declaration"
@@ -332,29 +366,33 @@ impl Resolver {
                         "param it (implicit lambda parameter)".to_string(),
                     );
                 }
-                self.walk_stmts(body, lambda_scope);
+                self.walk_stmts(body, lambda_scope, following);
             }
             ExprKind::If { cond, then_branch, else_branch } => {
-                self.walk_expr(cond, scope);
-                self.walk_block(then_branch, scope);
+                self.walk_expr(cond, scope, following);
+                self.walk_block(then_branch, scope, expr.span, following);
                 if let Some(eb) = else_branch {
-                    self.walk_block(eb, scope);
+                    self.walk_block(eb, scope, expr.span, following);
                 }
             }
             ExprKind::When { subject, arms } => {
                 if let Some(s) = subject {
-                    self.walk_expr(s, scope);
+                    self.walk_expr(s, scope, following);
                 }
                 for arm in arms {
                     for cond in &arm.conditions {
                         match cond {
-                            WhenCondition::Equals(e) | WhenCondition::Bool(e) => self.walk_expr(e, scope),
+                            WhenCondition::Equals(e) | WhenCondition::Bool(e) => {
+                                self.walk_expr(e, scope, following)
+                            }
                         }
                     }
-                    self.walk_block(&arm.body, scope);
+                    // `WhenArm` has no span of its own; the whole `when`
+                    // expression's is the best available anchor.
+                    self.walk_block(&arm.body, scope, expr.span, following);
                 }
             }
-            ExprKind::Block(stmts) => self.walk_block(stmts, scope),
+            ExprKind::Block(stmts) => self.walk_block(stmts, scope, expr.span, following),
         }
     }
 }
@@ -454,10 +492,19 @@ mod tests {
     }
 
     #[test]
-    fn undefined_name_is_left_unresolved_not_an_error() {
-        // println isn't declared anywhere in the AST (it's a stdlib native).
-        let result = resolve_src("println(nope)\n");
+    fn stdlib_call_is_not_flagged_as_undefined() {
+        // println isn't declared anywhere in the AST (it's a stdlib native,
+        // registered directly into the runtime Env) — must not be flagged.
+        let result = resolve_src("println(1)\n");
         assert!(result.diagnostics.is_empty());
+        assert!(result.table.symbol_at(1, 1).is_none(), "println has no AST declaration to point at");
+    }
+
+    #[test]
+    fn genuinely_undefined_name_is_flagged() {
+        let result = resolve_src("println(nope)\n");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0].message.contains("nope"));
         assert!(result.table.symbol_at(1, 9).is_none());
     }
 
@@ -481,5 +528,37 @@ mod tests {
         assert!(names.contains("p"));
         assert!(names.contains("f"));
         assert!(names.contains("outer"));
+    }
+
+    #[test]
+    fn symbols_in_scope_works_right_after_a_keyword_with_nothing_typed_yet() {
+        // Regression test: this is the everyday completion-trigger shape
+        // (cursor right after "return ", nothing typed after it yet) that
+        // exposed the original bounding-box approach's gap — no span had
+        // ever been "touched" at or past that trailing-whitespace position.
+        let src = "fun f(p: Int): Int {\n    val inner = 2\n    return \n}\n";
+        let result = resolve_src(src);
+        // column 12 = right after "    return " (4 spaces + "return" + 1 space).
+        let names: HashSet<&str> =
+            result.table.symbols_in_scope(3, 12).into_iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("inner"), "{names:?}");
+        assert!(names.contains("p"), "{names:?}");
+    }
+
+    #[test]
+    fn symbols_in_scope_does_not_leak_into_a_later_sibling_function() {
+        // A position genuinely inside function b's body must not see
+        // function a's locals — the "next sibling" boundary (function b's
+        // own start) has to actually stop function a's scope somewhere.
+        // (The blank/gap line *between* the two functions is a separate,
+        // documented imprecision — see `ScopeData::bounds` — since there's
+        // no real anchor for a's own closing brace to bound against; this
+        // test only asserts the part that's actually guaranteed.)
+        let src = "fun a() {\n    val onlyInA = 1\n}\n\nfun b() {\n    val onlyInB = 1\n}\n";
+        let result = resolve_src(src);
+        let names: HashSet<&str> =
+            result.table.symbols_in_scope(6, 5).into_iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("onlyInB"), "{names:?}");
+        assert!(!names.contains("onlyInA"), "{names:?}");
     }
 }

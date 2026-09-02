@@ -6,6 +6,34 @@ use crate::error::{Flow, RuntimeError, Span};
 use crate::interpreter::Interpreter;
 use crate::value::{NativeValue, Value};
 
+/// `(name, signature, one-line doc)` for every built-in registered by
+/// `populate_globals`, mirroring `docs/stdlib.md`. Hand-maintained since
+/// `populate_globals` registers functions imperatively (no static,
+/// queryable table otherwise) — used for hover/completion in `ksl-lsp` and
+/// to tell the resolver a name is a real built-in rather than a typo.
+/// Keep in sync with `populate_globals` and `docs/stdlib.md` when adding a
+/// stdlib function (see AGENTS.md's feature checklist) — the
+/// `stdlib_signatures_match_populate_globals` test below catches this
+/// table listing a function that `populate_globals` doesn't (renamed or
+/// removed), though not the reverse.
+pub const STDLIB_SIGNATURES: &[(&str, &str, &str)] = &[
+    ("println", "println(value?)", "Prints value followed by a newline, or just a newline if called with no argument."),
+    ("print", "print(value)", "Like println, but without the trailing newline."),
+    ("listOf", "listOf(vararg values)", "Builds a List from any number of arguments."),
+    ("length", "length(s: String): Int", "Number of characters in s."),
+    ("uppercase", "uppercase(s: String): String", "Uppercases s."),
+    ("lowercase", "lowercase(s: String): String", "Lowercases s."),
+    ("trim", "trim(s: String): String", "Removes leading and trailing whitespace."),
+    ("abs", "abs(x: Int | Double): Int | Double", "Absolute value; result type matches the argument's type."),
+    ("sqrt", "sqrt(x: Int | Double): Double", "Square root."),
+    ("max", "max(a, b): Int | Double", "Returns the larger of a and b."),
+    ("min", "min(a, b): Int | Double", "Returns the smaller of a and b."),
+];
+
+pub fn is_known(name: &str) -> bool {
+    STDLIB_SIGNATURES.iter().any(|(n, _, _)| *n == name)
+}
+
 pub fn populate_globals(env: &Env) {
     register(env, "println", |interp, args| {
         match args.len() {
@@ -134,6 +162,29 @@ fn numeric_binary(a: &Value, b: &Value, f: impl Fn(f64, f64) -> f64) -> Result<V
                 _ => return Err(type_error("max/min", "numeric arguments")),
             };
             Ok(Value::Double(f(xf, yf)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every name listed in `STDLIB_SIGNATURES` must actually be
+    /// registered by `populate_globals` — catches the table listing a
+    /// stdlib function that was renamed or removed. (`Env` doesn't expose
+    /// enumeration, so this can't also check the other direction — a new
+    /// `register` call with no matching table entry has to be caught by
+    /// the "adding a feature" checklist in AGENTS.md instead.)
+    #[test]
+    fn stdlib_signatures_match_populate_globals() {
+        let env = Env::new();
+        populate_globals(&env);
+        for (name, _, _) in STDLIB_SIGNATURES {
+            assert!(
+                matches!(env.get(name), Some(Value::Native(_))),
+                "'{name}' is in STDLIB_SIGNATURES but not registered by populate_globals"
+            );
         }
     }
 }
