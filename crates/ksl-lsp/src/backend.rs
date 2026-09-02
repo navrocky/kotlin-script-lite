@@ -5,14 +5,16 @@ use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, Diagnostic, InitializeParams, InitializeResult, InitializedParams,
-    MessageType, ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
-    Url,
+    MessageType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
 use crate::diagnostics::parse_diagnostics;
 use crate::document_store::DocumentStore;
 use crate::runtime_diagnostics::{run_diagnostics, RuntimeDiagnostics};
+use crate::semantic_tokens::{semantic_tokens, TOKEN_TYPES};
 
 pub struct Backend {
     client: Client,
@@ -95,6 +97,16 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+                semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                    SemanticTokensOptions {
+                        legend: SemanticTokensLegend {
+                            token_types: TOKEN_TYPES.to_vec(),
+                            token_modifiers: Vec::new(),
+                        },
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -146,5 +158,17 @@ impl LanguageServer for Backend {
         self.docs.write().unwrap().close(&uri);
         self.last_runtime_target.write().unwrap().remove(&uri);
         self.publish(uri, Vec::new()).await;
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> RpcResult<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let text = match self.docs.read().unwrap().get(&uri) {
+            Some(doc) => doc.text.clone(),
+            None => return Ok(None),
+        };
+        Ok(semantic_tokens(&text).map(SemanticTokensResult::Tokens))
     }
 }

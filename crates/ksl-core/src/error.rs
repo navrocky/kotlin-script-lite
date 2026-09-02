@@ -2,15 +2,28 @@ use crate::value::Value;
 use std::fmt;
 use std::path::PathBuf;
 
+/// A source location, 1-based (matching how editors/compilers usually
+/// report positions to humans). `end_line`/`end_col` mark one past the
+/// last character, mirroring how `col`/`line` mark the first — so an empty
+/// range has `end == start`. `Span::new` (used at most call sites, where
+/// only the start position is tracked) defaults to a 1-character-wide
+/// range; `Span::with_end` is for call sites that track the real end, used
+/// where it matters (e.g. semantic tokens, hover/goto-def).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
     pub line: u32,
     pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
 }
 
 impl Span {
     pub fn new(line: u32, col: u32) -> Self {
-        Span { line, col }
+        Span { line, col, end_line: line, end_col: col + 1 }
+    }
+
+    pub fn with_end(line: u32, col: u32, end_line: u32, end_col: u32) -> Self {
+        Span { line, col, end_line, end_col }
     }
 }
 

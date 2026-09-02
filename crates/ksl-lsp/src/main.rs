@@ -2,6 +2,7 @@ mod backend;
 mod diagnostics;
 mod document_store;
 mod runtime_diagnostics;
+mod semantic_tokens;
 
 use backend::Backend;
 use tower_lsp::{LspService, Server};

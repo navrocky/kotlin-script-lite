@@ -93,7 +93,15 @@ impl<'a> Lexer<'a> {
         Some(c)
     }
 
-    fn push(&mut self, kind: TokenKind, span: Span) {
+    /// Pushes a token spanning from `start` to the lexer's current
+    /// position. Every call site captures `start` before consuming the
+    /// token's characters and calls `push` right after consuming the last
+    /// of them, so "current position" at push-time is exactly the token's
+    /// real end (one past its last character) — this holds for every call
+    /// site in this file except `StringText`, which tracks its own start
+    /// explicitly for the same reason (see `lex_template_text`).
+    fn push(&mut self, kind: TokenKind, start: Span) {
+        let span = Span::with_end(start.line, start.col, self.line, self.col);
         self.tokens.push(Token { kind, span });
     }
 
@@ -402,12 +410,20 @@ impl<'a> Lexer<'a> {
     /// closing `"`. Escapes are resolved here.
     fn lex_template_text(&mut self) -> Result<(), ParseError> {
         let mut text = String::new();
+        // Tracks the start of the current run of accumulating text
+        // (distinct from `self.span()`, which by the time a `StringText`
+        // is pushed is already the *end* of that run) — unlike every other
+        // token in this lexer, text characters are appended one at a time
+        // via the catch-all `Some(c)` arm below rather than consumed in a
+        // single pass right before `push`, so `push`'s own start-to-current
+        // span computation doesn't apply here.
+        let mut text_start = self.span();
         loop {
             match self.peek() {
                 None => return Err(self.err("unterminated string literal")),
                 Some('"') => {
                     if !text.is_empty() {
-                        self.push(TokenKind::StringText(std::mem::take(&mut text)), self.span());
+                        self.push(TokenKind::StringText(std::mem::take(&mut text)), text_start);
                     }
                     let span = self.span();
                     self.advance();
@@ -437,7 +453,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some('$') if self.peek_at(1) == Some('{') => {
                     if !text.is_empty() {
-                        self.push(TokenKind::StringText(std::mem::take(&mut text)), self.span());
+                        self.push(TokenKind::StringText(std::mem::take(&mut text)), text_start);
                     }
                     let span = self.span();
                     self.advance();
@@ -448,7 +464,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some('$') if self.peek_at(1).map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) => {
                     if !text.is_empty() {
-                        self.push(TokenKind::StringText(std::mem::take(&mut text)), self.span());
+                        self.push(TokenKind::StringText(std::mem::take(&mut text)), text_start);
                     }
                     let span = self.span();
                     self.advance();
@@ -462,6 +478,7 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     self.push(TokenKind::StringInterpText(name), span);
+                    text_start = self.span();
                 }
                 Some(c) => {
                     text.push(c);
@@ -482,6 +499,17 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         tokenize(src).unwrap().into_iter().map(|t| t.kind).collect()
+    }
+
+    /// `(kind, start_col, end_col)` for every token on a single source
+    /// line — used by span tests below, where line is always 1 and only
+    /// columns vary.
+    fn kinds_and_cols(src: &str) -> Vec<(TokenKind, u32, u32)> {
+        tokenize(src)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.kind, t.span.col, t.span.end_col))
+            .collect()
     }
 
     #[test]
@@ -692,6 +720,64 @@ mod tests {
                 TokenKind::TemplateExprEnd,
                 TokenKind::StringEnd,
                 TokenKind::Eof,
+            ]
+        );
+    }
+
+    /// Semantic tokens need real end positions, not just a start point.
+    /// String templates are the trickiest case: `StringText` is
+    /// accumulated one character at a time via a different code path than
+    /// every other token, so it needs its own start-tracking (see
+    /// `lex_template_text`) rather than `push`'s usual
+    /// start-to-current-position span.
+    #[test]
+    fn token_end_spans() {
+        assert_eq!(
+            kinds_and_cols("abc == 12"),
+            vec![
+                (TokenKind::Ident("abc".into()), 1, 4),
+                (TokenKind::Eq, 5, 7),
+                (TokenKind::Int(12), 8, 10),
+                (TokenKind::Eof, 10, 11),
+            ]
+        );
+
+        // "hello" -> StringStart '"' (1..2), StringText "hello" (2..7),
+        // StringEnd '"' (7..8).
+        assert_eq!(
+            kinds_and_cols("\"hello\""),
+            vec![
+                (TokenKind::StringStart, 1, 2),
+                (TokenKind::StringText("hello".into()), 2, 7),
+                (TokenKind::StringEnd, 7, 8),
+                (TokenKind::Eof, 8, 9),
+            ]
+        );
+
+        // "a${x}b" -> text before AND after an interpolation, exercising
+        // text_start's reset after StringInterpText/TemplateExprStart.
+        assert_eq!(
+            kinds_and_cols("\"a${x}b\""),
+            vec![
+                (TokenKind::StringStart, 1, 2),
+                (TokenKind::StringText("a".into()), 2, 3),
+                (TokenKind::TemplateExprStart, 3, 5), // "${" - 2 chars
+                (TokenKind::Ident("x".into()), 5, 6),
+                (TokenKind::TemplateExprEnd, 6, 7), // "}" - 1 char
+                (TokenKind::StringText("b".into()), 7, 8),
+                (TokenKind::StringEnd, 8, 9),
+                (TokenKind::Eof, 9, 10),
+            ]
+        );
+
+        // "$name" shorthand interpolation spans the '$' through the ident.
+        assert_eq!(
+            kinds_and_cols("\"$name\""),
+            vec![
+                (TokenKind::StringStart, 1, 2),
+                (TokenKind::StringInterpText("name".into()), 2, 7), // "$name" - 5 chars
+                (TokenKind::StringEnd, 7, 8),
+                (TokenKind::Eof, 8, 9),
             ]
         );
     }
