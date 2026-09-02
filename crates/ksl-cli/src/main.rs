@@ -47,7 +47,7 @@ fn main() -> ExitCode {
 
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    match kotlin_script_lite::run_source(&source, &mut handle, &base_dir, entry_path.as_deref()) {
+    match ksl_core::run_source(&source, &mut handle, &base_dir, entry_path.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = handle.flush();

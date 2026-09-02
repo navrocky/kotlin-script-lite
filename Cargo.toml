@@ -1,13 +1,6 @@
-[package]
-name = "kotlin-script-lite"
-version = "0.1.0"
-edition = "2021"
-
-[[bin]]
-name = "ksl"
-path = "src/main.rs"
-
-[dependencies]
+[workspace]
+resolver = "2"
+members = ["crates/ksl-core", "crates/ksl-cli", "crates/ksl-lsp"]
 
 [profile.release]
 lto = true

@@ -6,18 +6,24 @@ Guidance for AI coding agents working in this repository.
 
 A tree-walking interpreter for a Kotlin-syntax scripting language, written
 in Rust, with no compilation/bytecode step. See `docs/syntax.md` and
-`docs/stdlib.md` for the language/stdlib reference, and `src/` for the
-pipeline (`lexer.rs` -> `parser.rs` -> `ast.rs` -> `interpreter.rs`). Read
-`README.md`'s "Project layout" table before making changes — it's short
-and saves re-deriving the module map.
+`docs/stdlib.md` for the language/stdlib reference, and
+`crates/ksl-core/src/` for the pipeline (`lexer.rs` -> `parser.rs` ->
+`ast.rs` -> `interpreter.rs`). Read `README.md`'s "Project layout" table
+before making changes — it's short and saves re-deriving the module map.
+
+This is a Cargo **workspace** with three crates: `ksl-core` (the
+interpreter library, zero dependencies — most changes happen here),
+`ksl-cli` (the `ksl` binary, a thin wrapper over `ksl-core`), and
+`ksl-lsp` (the language server binary for editor support, may depend on
+`tower-lsp`/`tokio` — keep those dependencies out of `ksl-core`/`ksl-cli`).
 
 ## Build / test / run
 
 ```sh
-cargo build                 # dev build
-cargo test                  # unit tests (lexer/parser/interpreter) + tests/run_examples.rs
-cargo run -- script.ksl     # run a script (binary is named `ksl`)
-cargo build --release --target x86_64-unknown-linux-musl   # static release binary
+cargo build                          # dev build, whole workspace
+cargo test                           # unit tests (lexer/parser/interpreter) + run_examples.rs, whole workspace
+cargo run -p ksl-cli -- script.ksl   # run a script (binary is named `ksl`)
+cargo build --release -p ksl-cli --target x86_64-unknown-linux-musl   # static release binary
 ```
 
 Always run `cargo test` after a change to `src/`. If you touch lexer,

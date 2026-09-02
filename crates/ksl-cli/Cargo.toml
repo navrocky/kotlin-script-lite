@@ -1,0 +1,11 @@
+[package]
+name = "ksl-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ksl"
+path = "src/main.rs"
+
+[dependencies]
+ksl-core = { path = "../ksl-core" }

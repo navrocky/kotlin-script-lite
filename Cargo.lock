@@ -3,5 +3,19 @@
 version = 4
 
 [[package]]
-name = "kotlin-script-lite"
+name = "ksl-cli"
 version = "0.1.0"
+dependencies = [
+ "ksl-core",
+]
+
+[[package]]
+name = "ksl-core"
+version = "0.1.0"
+
+[[package]]
+name = "ksl-lsp"
+version = "0.1.0"
+dependencies = [
+ "ksl-core",
+]

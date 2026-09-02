@@ -25,7 +25,7 @@ fn examples_match_expected_output() {
 
         let mut out = Vec::new();
         let base_dir = script_path.parent().unwrap();
-        let result = kotlin_script_lite::run_source(&source, &mut out, base_dir, Some(&script_path));
+        let result = ksl_core::run_source(&source, &mut out, base_dir, Some(&script_path));
         let actual = String::from_utf8(out).unwrap();
 
         let name = script_path.file_name().unwrap().to_string_lossy().to_string();
