@@ -102,6 +102,13 @@ pub struct SymbolTable {
     /// as it goes; resolving it against other files is a caller's job
     /// (`ksl-lsp`'s `package_index` module does this for hover/goto-def).
     qualified_refs: Vec<(Span, Vec<String>)>,
+    /// Every `MethodCall`'s method-name span and name, recorded
+    /// unconditionally (unlike `qualified_refs`, which is only populated
+    /// when the receiver isn't a real local) — lets a caller offer hover
+    /// text for a builtin method call on a genuine local receiver (e.g.
+    /// `s.uppercase()`, where `s` resolves via `occurrences` but
+    /// `uppercase` has no declaration site of its own to point at).
+    method_refs: Vec<(Span, String)>,
 }
 
 impl SymbolTable {
@@ -116,6 +123,17 @@ impl SymbolTable {
             .iter()
             .find(|(span, _)| span.contains_line_col(line, col))
             .map(|(span, path)| (*span, path.as_slice()))
+    }
+
+    /// The method name (if any) whose own name-span covers `(line, col)` —
+    /// e.g. `uppercase` in `s.uppercase()`, regardless of whether `s` is a
+    /// real local or turned out to be a package-qualified reference
+    /// instead (see `method_refs`'s doc comment).
+    pub fn method_ref_at(&self, line: u32, col: u32) -> Option<&str> {
+        self.method_refs
+            .iter()
+            .find(|(span, _)| span.contains_line_col(line, col))
+            .map(|(_, name)| name.as_str())
     }
 
     /// Every symbol declared directly at this file's top level (scope 0,
@@ -187,6 +205,7 @@ pub fn resolve(program: &Program) -> ResolveResult {
             symbols: Vec::new(),
             occurrences: Vec::new(),
             qualified_refs: Vec::new(),
+            method_refs: Vec::new(),
         },
         diagnostics: Vec::new(),
         imported_names: program.imports_use.iter().map(|u| u.path.last().unwrap().clone()).collect(),
@@ -293,6 +312,43 @@ impl Resolver {
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
     }
 
+    /// If `expr` is a chain of bare-identifier `.` access (`a`, `a.b`,
+    /// `a.b.c`, ...) whose base name does *not* resolve to a real local
+    /// declaration in `scope`, returns the flattened dotted segments —
+    /// mirrors `Interpreter::dotted_path_if_unresolved`'s runtime fallback
+    /// so hover/goto-def still resolve a genuine package reference like
+    /// `util.math.square`, while a receiver that *is* a real local (`s` in
+    /// `s.uppercase()`) is left for the caller to walk normally instead, so
+    /// hovering `s` still finds its declaration. Returns `None` for
+    /// anything else too, including a chain containing a call partway
+    /// through (`f().g`).
+    fn dotted_path_if_not_local(&self, expr: &Expr, scope: usize) -> Option<Vec<String>> {
+        match &expr.kind {
+            ExprKind::Name(name) if !self.resolves_locally(scope, name) => Some(vec![name.clone()]),
+            ExprKind::FieldAccess { receiver, field, .. } => {
+                let mut path = self.dotted_path_if_not_local(receiver, scope)?;
+                path.push(field.clone());
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Read-only scope-chain lookup — like the first half of `resolve_name`,
+    /// but without recording an occurrence or a diagnostic on failure (used
+    /// by `dotted_path_if_not_local`, which needs to *ask* whether a name
+    /// is local without committing to either interpretation yet).
+    fn resolves_locally(&self, scope: usize, name: &str) -> bool {
+        let mut cur = Some(scope);
+        while let Some(s) = cur {
+            if self.table.scopes[s].names.contains_key(name) {
+                return true;
+            }
+            cur = self.table.scopes[s].parent;
+        }
+        false
+    }
+
     /// `following` is the span of whatever comes next, textually, after
     /// this whole statement list — used only to give the *last* statement
     /// in the list (if it opens a scope) a real upper bound; every earlier
@@ -393,14 +449,33 @@ impl Resolver {
                 }
             }
             ExprKind::Name(name) => self.resolve_name(scope, name, expr.span),
-            // Not resolved here — this resolver is single-file only (see
-            // the module doc comment) and has no notion of packages, the
-            // same limitation it already has for `@file:Import`. Never
-            // flagged as undefined (it isn't a typo), but its location is
-            // still recorded so a caller with cross-file knowledge (see
-            // `qualified_ref_at`) can resolve it itself.
-            ExprKind::QualifiedName(path) => {
-                self.table.qualified_refs.push((expr.span, path.clone()));
+            // `receiver.field` — this resolver has no notion of packages or
+            // (pre-Phase-5) object fields, so it can't tell a local field
+            // access apart from a package-qualified reference any more
+            // than the interpreter can at parse time (see
+            // `ExprKind::FieldAccess`'s doc comment). Mirrors
+            // `Interpreter::dotted_path_if_unresolved`'s approach: if the
+            // whole chain is bare identifiers and its base name does *not*
+            // resolve to a real local declaration, record it in
+            // `qualified_refs` (never flagged as undefined — deferred to
+            // `ksl-lsp`'s cross-file package index, or to the interpreter
+            // at runtime) instead of walking it as an ordinary expression.
+            ExprKind::FieldAccess { receiver, .. } => match self.dotted_path_if_not_local(expr, scope) {
+                Some(path) => self.table.qualified_refs.push((expr.span, path)),
+                None => self.walk_expr(receiver, scope, following),
+            },
+            ExprKind::MethodCall { receiver, method, method_span, args } => {
+                self.table.method_refs.push((*method_span, method.clone()));
+                match self.dotted_path_if_not_local(receiver, scope) {
+                    Some(mut path) => {
+                        path.push(method.clone());
+                        self.table.qualified_refs.push((expr.span, path));
+                    }
+                    None => self.walk_expr(receiver, scope, following),
+                }
+                for a in args {
+                    self.walk_expr(&a.value, scope, following);
+                }
             }
             ExprKind::Unary { expr: inner, .. } => self.walk_expr(inner, scope, following),
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -618,6 +693,29 @@ mod tests {
         assert_eq!(span.col, 1);
         // Not present outside the qualified-name expression's own span.
         assert!(result.table.qualified_ref_at(1, 25).is_none());
+    }
+
+    #[test]
+    fn qualified_ref_at_finds_a_bare_field_access_too() {
+        // `a.b` with no call at all — `ExprKind::FieldAccess`, not `MethodCall`.
+        let result = resolve_src("println(util.math)\n");
+        let (_, path) = result.table.qualified_ref_at(1, 10).expect("should find the qualified ref");
+        assert_eq!(path, &["util".to_string(), "math".to_string()]);
+    }
+
+    #[test]
+    fn method_call_on_a_real_local_resolves_the_receiver_not_a_qualified_name() {
+        // `s` is a genuine local `val` — `s.uppercase()` must resolve `s`
+        // back to its declaration (for hover/goto-def), not be treated as
+        // a possible package-qualified reference the way `util.math.square`
+        // would be (this resolver can't otherwise tell them apart, since
+        // neither `s` nor `util` is declared any differently in the AST).
+        let result = resolve_src("val s = \"hi\"\nprintln(s.uppercase())\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let decl = result.table.symbol_at(1, 5).unwrap();
+        let use_ = result.table.symbol_at(2, 9).expect("s should resolve as a local use");
+        assert!(std::ptr::eq(decl, use_));
+        assert!(result.table.qualified_ref_at(2, 9).is_none());
     }
 
     #[test]

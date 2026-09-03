@@ -59,11 +59,19 @@ sequence) that the end-to-end examples don't check.
   stores the `Env` alive when the function/lambda literal was evaluated;
   calling it creates `closure.child()`, never the caller's env. Preserve
   this when touching `call_function`.
-- **No `.` member-call syntax.** Stdlib functions are plain calls
-  (`length(s)`, not `s.length()`) — there's no `ExprKind` for member
-  access yet. If you add one, it's a real grammar/AST addition, not a
-  small tweak (needs a postfix-parsing change in `parser.rs` and a new
-  `ExprKind` + `eval_expr` arm).
+- **`.` member-call syntax is deliberately ambiguous at parse time.**
+  `ExprKind::FieldAccess`/`MethodCall` (`parser.rs`'s `parse_postfix`) are
+  produced for *any* `receiver.member[(...)]`, including what's really a
+  package-qualified name (`a.b.c`) — the parser has no scope info to tell
+  a local receiver from a package apart. `eval_expr` resolves this at
+  evaluation time (see `Interpreter::dotted_path_if_unresolved`): try the
+  receiver as a real local first, and only fall back to
+  `resolve_qualified` over the flattened dotted chain once its base name
+  is confirmed not to be one. `resolver.rs` mirrors this exact logic
+  (`Resolver::dotted_path_if_not_local`) so hover/goto-def keep working for
+  both cases. Only a handful of builtin `String` methods exist so far
+  (`stdlib::call_builtin_method`); real per-type members need classes
+  (Phase 5 of `docs/roadmap.md`).
 - **Values are `Rc`-based, not `Arc`.** This interpreter is single-threaded
   by design; don't introduce `Send`/`Sync`/threading to `Value`,
   `Env`, or `Interpreter`.

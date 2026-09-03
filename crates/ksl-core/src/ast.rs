@@ -59,12 +59,30 @@ pub enum ExprKind {
     BoolLit(bool),
     StringTemplate(Vec<StringPart>),
     Name(String),
-    /// `a.b.c` — a package-qualified reference (package `a.b`, member `c`;
-    /// the last segment is always the member, everything before it the
-    /// package name). Produced only when a bare name is followed by at
-    /// least one `.`; a plain `Name` is used otherwise. See
-    /// `Interpreter::resolve_qualified`.
-    QualifiedName(Vec<String>),
+    /// `receiver.field` — a `.` access not immediately followed by `(`.
+    /// The parser can't tell locally declared names from package names
+    /// apart (no scope/type info at parse time), so this is produced for
+    /// *any* `.`-access, including what's really a package-qualified
+    /// reference like `a.b` (package `a`, member `b`) — resolved by
+    /// `eval_expr` at runtime, which tries local evaluation first and
+    /// falls back to `Interpreter::resolve_qualified` over the flattened
+    /// dotted chain. See `docs/syntax.md`'s "Packages" section.
+    FieldAccess {
+        receiver: Box<Expr>,
+        field: String,
+        field_span: Span,
+    },
+    /// `receiver.method(args)` — a `.` access immediately followed by `(`.
+    /// Same local-vs-package-qualified ambiguity as `FieldAccess`, resolved
+    /// the same way at evaluation time; also the call site for a builtin
+    /// method (e.g. `"x".uppercase()`) once the receiver evaluates to a
+    /// real value.
+    MethodCall {
+        receiver: Box<Expr>,
+        method: String,
+        method_span: Span,
+        args: Vec<Arg>,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,

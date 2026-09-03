@@ -167,9 +167,10 @@ impl<'a> Parser<'a> {
         Ok(ImportUse { path, span: span.merge(&path_span) })
     }
 
-    /// `ident (. ident)*` — used by `package`/`import`, which (unlike the
-    /// expression-level qualified-name parsing in `parse_primary`) always
-    /// require a dotted path, never a bare single name.
+    /// `ident (. ident)*` — used by `package`/`import`, which (unlike a
+    /// `.`-chain in expression position, parsed as nested
+    /// `FieldAccess`/`MethodCall` by `parse_postfix`) always require a
+    /// dotted path, never a bare single name.
     fn parse_dotted_path(&mut self) -> Result<(Vec<String>, Span), ParseError> {
         let (first, first_span) = self.expect_ident_spanned()?;
         let mut path = vec![first];
@@ -625,6 +626,31 @@ impl<'a> Parser<'a> {
                     },
                     span,
                 );
+            } else if matches!(self.peek_kind(), TokenKind::Dot) {
+                self.advance(); // '.'
+                let (member, member_span) = self.expect_ident_spanned()?;
+                let full_span = expr.span.merge(&member_span);
+                expr = if matches!(self.peek_kind(), TokenKind::LParen) {
+                    let args = self.parse_call_args()?;
+                    Expr::new(
+                        ExprKind::MethodCall {
+                            receiver: Box::new(expr),
+                            method: member,
+                            method_span: member_span,
+                            args,
+                        },
+                        full_span,
+                    )
+                } else {
+                    Expr::new(
+                        ExprKind::FieldAccess {
+                            receiver: Box::new(expr),
+                            field: member,
+                            field_span: member_span,
+                        },
+                        full_span,
+                    )
+                };
             } else {
                 break;
             }
@@ -672,18 +698,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                if matches!(self.peek_kind(), TokenKind::Dot) {
-                    let mut path = vec![name];
-                    let mut full_span = span;
-                    while self.matches(&TokenKind::Dot) {
-                        let (segment, segment_span) = self.expect_ident_spanned()?;
-                        full_span = full_span.merge(&segment_span);
-                        path.push(segment);
-                    }
-                    Ok(Expr::new(ExprKind::QualifiedName(path), full_span))
-                } else {
-                    Ok(Expr::new(ExprKind::Name(name), span))
-                }
+                Ok(Expr::new(ExprKind::Name(name), span))
             }
             TokenKind::StringStart => self.parse_string_template(),
             TokenKind::LParen => {
@@ -1077,12 +1092,55 @@ mod tests {
     }
 
     #[test]
-    fn qualified_name_expression_parses() {
+    fn dotted_call_chain_parses_as_nested_method_call() {
+        // `a.b.greet(1)` — the parser can't know yet whether this is a
+        // package-qualified call or a real method call, so it parses the
+        // same way regardless (see `ExprKind::MethodCall`'s doc comment);
+        // `a.b` becomes the receiver, itself a `FieldAccess` on `a`.
         let stmts = parse_src("a.b.greet(1)");
         match &stmts[0].kind {
             StmtKind::ExprStmt(e) => match &e.kind {
-                ExprKind::Call { callee, .. } => {
-                    assert!(matches!(&callee.kind, ExprKind::QualifiedName(p) if p == &vec!["a".to_string(), "b".to_string(), "greet".to_string()]));
+                ExprKind::MethodCall { receiver, method, args, .. } => {
+                    assert_eq!(method, "greet");
+                    assert_eq!(args.len(), 1);
+                    match &receiver.kind {
+                        ExprKind::FieldAccess { receiver, field, .. } => {
+                            assert_eq!(field, "b");
+                            assert!(matches!(&receiver.kind, ExprKind::Name(n) if n == "a"));
+                        }
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_access_without_call_parses() {
+        let stmts = parse_src("a.b");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::FieldAccess { receiver, field, .. } => {
+                    assert_eq!(field, "b");
+                    assert!(matches!(&receiver.kind, ExprKind::Name(n) if n == "a"));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn method_call_on_a_call_result_parses() {
+        // `f().g()` — a `.` chain doesn't have to start from a bare name.
+        let stmts = parse_src("f().g()");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::MethodCall { receiver, method, .. } => {
+                    assert_eq!(method, "g");
+                    assert!(matches!(&receiver.kind, ExprKind::Call { .. }));
                 }
                 other => panic!("unexpected {other:?}"),
             },

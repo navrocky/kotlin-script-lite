@@ -1,5 +1,5 @@
 use ksl_core::resolver::SymbolKind;
-use ksl_core::stdlib::STDLIB_SIGNATURES;
+use ksl_core::stdlib::{BUILTIN_METHOD_SIGNATURES, STDLIB_SIGNATURES};
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
 use crate::analysis::Analysis;
@@ -16,12 +16,17 @@ const KEYWORDS: &[&str] = &[
 /// `text` (needed, alongside `analysis`, to detect a package-qualified
 /// prefix already typed before the cursor — see `dotted_prefix_before_cursor`).
 ///
-/// If the cursor sits right after `a.b.` (a known package), only that
-/// package's members are offered — matching what's actually valid there,
-/// since a bare local/stdlib/keyword name can't follow a `.`. Otherwise:
-/// locals and outer-scope symbols visible there, every stdlib function,
-/// every known package's full name, and language keywords — merged in
-/// that order (most relevant first).
+/// If the cursor sits right after `a.b.`, two possibilities are offered
+/// together since there's no way to statically tell them apart (the same
+/// ambiguity `ExprKind::FieldAccess`/`MethodCall` defer to evaluation
+/// time, see `docs/syntax.md`'s "Packages" section): `a.b`'s members if
+/// it's a known package, and every builtin method (`BUILTIN_METHOD_SIGNATURES`)
+/// in case `a.b` is actually a real receiver value — this over-suggests
+/// (e.g. offering `.uppercase()` after a package prefix) until Phase 5
+/// gives real per-type member info. Otherwise: locals and outer-scope
+/// symbols visible there, every stdlib function, every known package's
+/// full name, and language keywords — merged in that order (most relevant
+/// first).
 pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
@@ -29,7 +34,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
 
     if !prefix_path.is_empty() {
         let package_name = prefix_path.join(".");
-        return analysis
+        let mut items: Vec<CompletionItem> = analysis
             .packages
             .members_of(&package_name)
             .iter()
@@ -40,6 +45,14 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
                 ..Default::default()
             })
             .collect();
+        items.extend(BUILTIN_METHOD_SIGNATURES.iter().map(|(name, signature, doc)| CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::METHOD),
+            detail: Some(signature.to_string()),
+            documentation: Some(Documentation::String(doc.to_string())),
+            ..Default::default()
+        }));
+        return items;
     }
 
     let line = position.line + 1;
@@ -158,6 +171,21 @@ mod tests {
         let names: Vec<String> =
             completion(&fallback, &broken, Position::new(1, 4)).into_iter().map(|i| i.label).collect();
         assert!(names.contains(&"p".to_string()));
+    }
+
+    #[test]
+    fn completion_after_a_dot_offers_builtin_methods() {
+        // `s` is a local, not a package — there's no way to tell statically
+        // (see the module doc comment), so builtin methods are offered
+        // after any `.`, package prefix or not. Uses a fully-typed line
+        // (`dotted_prefix_before_cursor` only reads up to `position`, so the
+        // cursor placed right after "s." still exercises the same prefix
+        // detection `s.` alone would, without needing an incomplete-parse
+        // fallback tree).
+        let text = "val s = \"hi\"\ns.uppercase()\n";
+        let names = labels(text, Position::new(1, 2));
+        assert!(names.contains(&"uppercase".to_string()), "{names:?}");
+        assert!(names.contains(&"length".to_string()), "{names:?}");
     }
 
     #[test]

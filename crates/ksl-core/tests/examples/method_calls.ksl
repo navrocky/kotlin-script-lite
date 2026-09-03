@@ -1,0 +1,10 @@
+// `.` method-call syntax on values (Phase 1): builtin String methods,
+// chaining, and a local variable as the receiver.
+println("hello".length())
+println("kotlin".uppercase())
+println("KOTLIN".lowercase())
+println("  padded  ".trim())
+println("  Loud  ".trim().uppercase())
+
+val name = "world"
+println(name.uppercase())

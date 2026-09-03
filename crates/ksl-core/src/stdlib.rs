@@ -58,22 +58,22 @@ pub fn populate_globals(env: &Env) {
 
     register(env, "length", |_interp, args, span| {
         let s = expect_str("length", &args, 0, span)?;
-        Ok(Value::Int(s.chars().count() as i64))
+        Ok(str_length(&s))
     });
 
     register(env, "uppercase", |_interp, args, span| {
         let s = expect_str("uppercase", &args, 0, span)?;
-        Ok(Value::str(s.to_uppercase()))
+        Ok(str_uppercase(&s))
     });
 
     register(env, "lowercase", |_interp, args, span| {
         let s = expect_str("lowercase", &args, 0, span)?;
-        Ok(Value::str(s.to_lowercase()))
+        Ok(str_lowercase(&s))
     });
 
     register(env, "trim", |_interp, args, span| {
         let s = expect_str("trim", &args, 0, span)?;
-        Ok(Value::str(s.trim().to_string()))
+        Ok(str_trim(&s))
     });
 
     register(env, "abs", |_interp, args, span| match args.get(0) {
@@ -166,6 +166,77 @@ fn numeric_binary(a: &Value, b: &Value, span: Span, f: impl Fn(f64, f64) -> f64)
     }
 }
 
+fn str_length(s: &str) -> Value {
+    Value::Int(s.chars().count() as i64)
+}
+
+fn str_uppercase(s: &str) -> Value {
+    Value::str(s.to_uppercase())
+}
+
+fn str_lowercase(s: &str) -> Value {
+    Value::str(s.to_lowercase())
+}
+
+fn str_trim(s: &str) -> Value {
+    Value::str(s.trim().to_string())
+}
+
+/// `(method name, signature, one-line doc)` for every builtin method
+/// `call_builtin_method` dispatches on — the `.`-syntax counterpart of
+/// `STDLIB_SIGNATURES`, used the same way for hover/completion in
+/// `ksl-lsp`. Every entry here is currently also reachable as a plain
+/// stdlib function (`"x".length()` and `length("x")` both work) — see
+/// `call_builtin_method`, which reuses the same `str_*` helpers as
+/// `populate_globals`'s registrations.
+pub const BUILTIN_METHOD_SIGNATURES: &[(&str, &str, &str)] = &[
+    ("length", "String.length(): Int", "Number of characters in the receiver."),
+    ("uppercase", "String.uppercase(): String", "Uppercases the receiver."),
+    ("lowercase", "String.lowercase(): String", "Lowercases the receiver."),
+    ("trim", "String.trim(): String", "Removes leading and trailing whitespace from the receiver."),
+];
+
+/// Dispatches a `.`-call (`receiver.method(args)`) once `receiver` has
+/// already evaluated to a real value — the counterpart of `parse_postfix`
+/// producing `ExprKind::MethodCall` for `receiver.method(...)` syntax. Only
+/// a handful of `String` methods exist so far (mirroring the equivalent
+/// plain stdlib functions); every other `(type, method)` pair is a runtime
+/// error until Phase 5 (classes) and Phase 7 (extension functions) give
+/// this real per-type dispatch.
+pub fn call_builtin_method(receiver: Value, method: &str, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    match (&receiver, method) {
+        (Value::Str(s), "length") => {
+            expect_no_args(method, &args, span)?;
+            Ok(str_length(s))
+        }
+        (Value::Str(s), "uppercase") => {
+            expect_no_args(method, &args, span)?;
+            Ok(str_uppercase(s))
+        }
+        (Value::Str(s), "lowercase") => {
+            expect_no_args(method, &args, span)?;
+            Ok(str_lowercase(s))
+        }
+        (Value::Str(s), "trim") => {
+            expect_no_args(method, &args, span)?;
+            Ok(str_trim(s))
+        }
+        _ => Err(RuntimeError::new(
+            format!("'{}' has no method '{method}'", receiver.type_name()),
+            span,
+        )
+        .into()),
+    }
+}
+
+fn expect_no_args(method: &str, args: &[Value], span: Span) -> Result<(), Flow> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(arity_error(method, "0", args.len(), span))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +276,40 @@ mod tests {
         match (f.func)(&mut interp, vec![Value::Int(1)], span) {
             Err(Flow::Error(e)) => assert_eq!(e.span, span),
             _ => panic!("expected Flow::Error"),
+        }
+    }
+
+    /// Every name in `BUILTIN_METHOD_SIGNATURES` must actually be
+    /// dispatchable by `call_builtin_method` on some receiver — mirrors
+    /// `stdlib_signatures_match_populate_globals` for the `.`-method table.
+    #[test]
+    fn builtin_method_signatures_are_all_dispatchable_on_a_string() {
+        for (name, _, _) in BUILTIN_METHOD_SIGNATURES {
+            let result = call_builtin_method(Value::str("x"), name, vec![], Span::default());
+            assert!(result.is_ok(), "'{name}' listed in BUILTIN_METHOD_SIGNATURES but not dispatchable: {:?}", result.err().map(|_| ()));
+        }
+    }
+
+    #[test]
+    fn call_builtin_method_dispatches_string_methods() {
+        assert!(matches!(call_builtin_method(Value::str("abc"), "length", vec![], Span::default()), Ok(Value::Int(3))));
+        assert!(matches!(call_builtin_method(Value::str("abc"), "uppercase", vec![], Span::default()), Ok(Value::Str(s)) if &*s == "ABC"));
+    }
+
+    #[test]
+    fn call_builtin_method_unknown_method_is_an_error() {
+        match call_builtin_method(Value::str("x"), "shout", vec![], Span::default()) {
+            Err(Flow::Error(e)) => assert!(e.message.contains("has no method 'shout'"), "{}", e.message),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn call_builtin_method_arity_error_reports_the_given_span() {
+        let span = Span::new(4, 2);
+        match call_builtin_method(Value::str("x"), "length", vec![Value::Int(1)], span) {
+            Err(Flow::Error(e)) => assert_eq!(e.span, span),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
         }
     }
 }

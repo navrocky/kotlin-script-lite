@@ -1,14 +1,12 @@
 # Standard library reference
 
-All built-ins are plain global functions — there is no `.` method-call
-syntax, so e.g. `length(s)` rather than `s.length()`. See
-[`syntax.md`](syntax.md) for the language itself.
+Built-ins are plain global functions, e.g. `length(s)`. A handful also
+have a `.` method-call form (`s.length()`) — see [Methods](#methods)
+below. See [`syntax.md`](syntax.md) for the language itself.
 
-Errors thrown by these functions are runtime errors like any other (they
+Errors thrown by these functions are runtime errors like any other — they
 stop the script and print `runtime error: <message> at <line:col>` to
-stderr), though the reported location currently always points at `0:0`
-for stdlib errors rather than the actual call site — a known gap, not
-something to rely on.
+stderr, `<line:col>` being the actual call site.
 
 ## Output
 
@@ -67,6 +65,26 @@ Removes leading and trailing whitespace.
 ```kotlin
 trim("  hi  ")   // "hi"
 ```
+
+## Methods
+
+`length`, `uppercase`, `lowercase`, and `trim` above are also callable as
+`.` methods on a `String` receiver — `s.uppercase()` is exactly
+`uppercase(s)`, just written the other way round:
+
+```kotlin
+println("hello".length())     // 5
+println("kotlin".uppercase())  // "KOTLIN"
+println("  Loud  ".trim().uppercase())   // "LOUD" — methods chain
+```
+
+No other type has methods yet, and `.field` access (no call) always
+fails at runtime — there's no object system yet to have real fields (see
+`docs/syntax.md`'s "Not supported"). `receiver.name` is otherwise
+ambiguous with a package-qualified reference (`util.math.square`, see
+`syntax.md`'s "Packages"); this is resolved by trying `receiver` as a
+local value first and only falling back to a package lookup if it isn't
+one — so a local variable always wins over a same-named package.
 
 ## Math
 

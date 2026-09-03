@@ -83,7 +83,7 @@ Listed loosest-to-tightest binding (i.e. `a || b && c` parses as
 | 6 | `+` `-` | `+` also concatenates `String` (`"x" + 1`) and `List` |
 | 7 | `*` `/` `%` | integer division/remainder by zero is a runtime error |
 | — | unary `-` `+` `!` | tightest, right-associative |
-| — | `f(...)` | postfix call, tightest of all |
+| — | `f(...)`, `.field`, `.method(...)` | postfix call/member-access, tightest of all, left-associative (`a.b.c()` is `(a.b).c(...)`) |
 
 `Int`/`Double` operands mix freely (`1 + 2.5`); the result is `Double`
 whenever either operand is. `Int` arithmetic wraps on overflow, matching
@@ -266,12 +266,27 @@ println(square(5))
 - `a.b.c` qualified-name syntax (package `a.b`, member `c`) works in any
   expression position without needing `import` first.
 
+`a.b.c` in expression position is genuinely ambiguous between a
+package-qualified name and `.` member access on a value (see "Methods"
+below) — there's no parser-level way to tell `a` is a package rather than
+a local, so this is resolved at evaluation time: `a` is tried as a local
+first, and only treated as a package name if it isn't one.
+
+## Methods
+
+Some values support `.` method-call syntax, e.g. `"hi".uppercase()` —
+equivalent to, and currently implemented in terms of, the same-named
+plain stdlib function (`uppercase("hi")`). See
+[`stdlib.md`](stdlib.md#methods) for the full list. `.field` access with
+no call is also legal syntax, but no value has real fields yet (that
+needs classes/objects, not yet implemented) — it's always a runtime
+error until then.
+
 ## Not supported
 
 Deliberately out of scope for now: classes/objects, inheritance,
 generics, null-safety operators (`?`, `?.`, `?:`, `!!`), list/map
-literals, `try`/`catch`, coroutines, extension functions, network imports,
-and `.` member-call syntax on *values* — stdlib functions are still called
-directly (`length(s)`, not `s.length()`). `.` in an expression only ever
-means a package-qualified name (`a.b.c`, see "Packages" above), never a
-method or field access on whatever `a` evaluates to.
+literals, `try`/`catch`, coroutines, extension functions, and network
+imports. `.` method syntax only covers the small builtin set in
+[`stdlib.md`](stdlib.md#methods) — arbitrary field/method access on a
+value needs classes/objects first.

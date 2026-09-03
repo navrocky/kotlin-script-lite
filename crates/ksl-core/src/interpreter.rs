@@ -57,8 +57,9 @@ impl<'a> Interpreter<'a> {
     /// Resolves a package-qualified path like `["a","b","greet"]` — package
     /// `a.b`, member `greet` (the last segment is always the member, every
     /// segment before it the package name) — to the value it names. Shared
-    /// by `ExprKind::QualifiedName` evaluation and `import a.b.greet`
-    /// processing in `importer.rs`.
+    /// by `ExprKind::FieldAccess`/`MethodCall` evaluation (see
+    /// `dotted_path_if_unresolved`) and `import a.b.greet` processing in
+    /// `importer.rs`.
     pub fn resolve_qualified(&self, path: &[String], span: Span) -> Result<Value, RuntimeError> {
         let (package, member) = path.split_at(path.len() - 1);
         let package_name = package.join(".");
@@ -68,6 +69,38 @@ impl<'a> Interpreter<'a> {
         package_env
             .get(&member[0])
             .ok_or_else(|| RuntimeError::new(format!("undefined name '{}'", path.join(".")), span))
+    }
+
+    /// If `receiver` is a chain of bare-identifier `.` access (`a`, `a.b`,
+    /// `a.b.c`, ...) whose base name does *not* resolve to a real local
+    /// binding in `env`, returns the flattened dotted segments — the
+    /// parser can't tell a local from a package name apart (see
+    /// `ExprKind::FieldAccess`'s doc comment), so this is how `eval_expr`
+    /// defers that decision to evaluation time: try the receiver as a
+    /// local value first, and only treat the whole chain as a possible
+    /// package-qualified reference (`Interpreter::resolve_qualified`) once
+    /// its base is confirmed to not be one. Returns `None` for anything
+    /// else, including a chain whose base name *is* a real local (the
+    /// receiver is then evaluated normally instead).
+    fn dotted_path_if_unresolved(&self, receiver: &Expr, env: &Env) -> Option<Vec<String>> {
+        let path = flatten_dotted_chain(receiver)?;
+        if env.get(&path[0]).is_some() {
+            None
+        } else {
+            Some(path)
+        }
+    }
+
+    /// Evaluates a call's argument list in order, pairing each with its
+    /// (optional) name — shared by `ExprKind::Call` and the "receiver
+    /// wasn't a package reference" branch of `MethodCall`.
+    fn eval_args(&mut self, args: &[Arg], env: &Env) -> Result<Vec<(Option<String>, Value)>, Flow> {
+        let mut arg_values = Vec::with_capacity(args.len());
+        for a in args {
+            let v = self.eval_expr(&a.value, env)?;
+            arg_values.push((a.name.clone(), v));
+        }
+        Ok(arg_values)
     }
 
     /// A block's value is the value of its last statement if that statement
@@ -210,7 +243,32 @@ impl<'a> Interpreter<'a> {
             ExprKind::Name(name) => env
                 .get(name)
                 .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span).into()),
-            ExprKind::QualifiedName(path) => self.resolve_qualified(path, expr.span).map_err(Into::into),
+            ExprKind::FieldAccess { receiver, field, .. } => {
+                if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
+                    let mut full_path = path;
+                    full_path.push(field.clone());
+                    return self.resolve_qualified(&full_path, expr.span).map_err(Into::into);
+                }
+                let recv = self.eval_expr(receiver, env)?;
+                Err(RuntimeError::new(
+                    format!("'{}' has no field '{field}'", recv.type_name()),
+                    expr.span,
+                )
+                .into())
+            }
+            ExprKind::MethodCall { receiver, method, args, .. } => {
+                if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
+                    let mut full_path = path;
+                    full_path.push(method.clone());
+                    let callee = self.resolve_qualified(&full_path, expr.span)?;
+                    let arg_values = self.eval_args(args, env)?;
+                    return self.call_value(callee, arg_values, expr.span);
+                }
+                let recv = self.eval_expr(receiver, env)?;
+                let arg_values: Vec<Value> =
+                    self.eval_args(args, env)?.into_iter().map(|(_, v)| v).collect();
+                crate::stdlib::call_builtin_method(recv, method, arg_values, expr.span)
+            }
             ExprKind::Unary { op, expr: inner } => {
                 let v = self.eval_expr(inner, env)?;
                 match (op, &v) {
@@ -263,11 +321,7 @@ impl<'a> Interpreter<'a> {
             }
             ExprKind::Call { callee, args } => {
                 let callee_val = self.eval_expr(callee, env)?;
-                let mut arg_values = Vec::with_capacity(args.len());
-                for a in args {
-                    let v = self.eval_expr(&a.value, env)?;
-                    arg_values.push((a.name.clone(), v));
-                }
+                let arg_values = self.eval_args(args, env)?;
                 self.call_value(callee_val, arg_values, expr.span)
             }
             ExprKind::Lambda { params, body } => Ok(Value::Function(Rc::new(FunctionValue {
@@ -395,6 +449,22 @@ impl<'a> Interpreter<'a> {
                 Err(e) => Err(e),
             },
         }
+    }
+}
+
+/// Flattens a chain of bare-identifier `.` access (`a`, `a.b`, `a.b.c`,
+/// ...) into its dotted segments, or `None` if it contains anything else
+/// partway through (a call, a literal, ...) — see
+/// `Interpreter::dotted_path_if_unresolved`, the only caller.
+fn flatten_dotted_chain(expr: &Expr) -> Option<Vec<String>> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(vec![name.clone()]),
+        ExprKind::FieldAccess { receiver, field, .. } => {
+            let mut path = flatten_dotted_chain(receiver)?;
+            path.push(field.clone());
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -684,5 +754,47 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
         // Full backward-compatibility check: a script with no `package`
         // declaration behaves exactly as before this feature existed.
         assert_eq!(run("fun greet(name: String): String = \"Hi, $name\"\nprintln(greet(\"World\"))"), "Hi, World\n");
+    }
+
+    #[test]
+    fn builtin_string_methods_via_dot_syntax() {
+        assert_eq!(run(r#"println("hello".length())"#), "5\n");
+        assert_eq!(run(r#"println("kotlin".uppercase())"#), "KOTLIN\n");
+        assert_eq!(run(r#"println("KOTLIN".lowercase())"#), "kotlin\n");
+        assert_eq!(run(r#"println("  hi  ".trim())"#), "hi\n");
+    }
+
+    #[test]
+    fn builtin_method_call_on_a_local_variable_receiver() {
+        // `s` is a real local, not a package name — must still evaluate `s`
+        // and dispatch the method on its value, not treat "s.uppercase" as
+        // a qualified-name lookup.
+        assert_eq!(run("val s = \"hi\"\nprintln(s.uppercase())"), "HI\n");
+    }
+
+    #[test]
+    fn method_call_chaining() {
+        assert_eq!(run(r#"println("  Loud  ".trim().uppercase())"#), "LOUD\n");
+    }
+
+    #[test]
+    fn unknown_builtin_method_is_a_runtime_error() {
+        let err = run_err(r#"println("hi".shout())"#);
+        assert!(err.contains("'String' has no method 'shout'"), "{err}");
+    }
+
+    #[test]
+    fn field_access_on_a_value_with_no_fields_is_a_runtime_error() {
+        // No object system yet (Phase 5) — any `FieldAccess` whose base
+        // isn't a package name is a clear runtime error.
+        let err = run_err("val s = \"hi\"\nprintln(s.bogus)");
+        assert!(err.contains("'String' has no field 'bogus'"), "{err}");
+    }
+
+    #[test]
+    fn builtin_method_arity_error_reports_call_site_span() {
+        let err = run_err("\"hi\".length(1)");
+        assert!(err.contains("length expects 0 argument(s), got 1"), "{err}");
+        assert!(!err.contains("at 0:0"), "{err}");
     }
 }
