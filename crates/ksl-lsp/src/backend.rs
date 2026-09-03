@@ -76,6 +76,8 @@ impl Backend {
             return;
         }
 
+        let static_diags = static_diagnostics(&text);
+
         let entry_uri = uri.clone();
         // `run_diagnostics` blocks its calling thread on `recv_timeout` (up
         // to several seconds) while the script runs on a separate OS
@@ -84,9 +86,24 @@ impl Backend {
             Ok(r) => r,
             Err(_) => return,
         };
-        let RuntimeDiagnostics { uri: target_uri, diagnostics } = result;
+        let RuntimeDiagnostics { uri: target_uri, diagnostics: runtime_diags } = result;
 
         self.clear_stale_runtime_target(&uri, Some(&target_uri)).await;
+
+        // `publishDiagnostics` replaces a file's full diagnostic set rather
+        // than merging with it, so publishing runtime-only diagnostics here
+        // would wipe out the static ones `did_save` just sent moments ago
+        // (e.g. a script with a static-only error like a missing parameter
+        // type annotation still runs fine, so `runtime_diags` comes back
+        // empty). Merge them back in when the runtime error (if any) lands
+        // on the entry file itself; a runtime error attributed to a
+        // different, imported file has no static diagnostics of its own to
+        // preserve here.
+        let diagnostics: Vec<_> = if target_uri == uri {
+            static_diags.into_iter().chain(runtime_diags).collect()
+        } else {
+            runtime_diags
+        };
         self.publish(target_uri.clone(), diagnostics).await;
 
         let mut map = self.last_runtime_target.write().unwrap();

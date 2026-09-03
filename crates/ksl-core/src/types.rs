@@ -101,6 +101,12 @@ impl Type {
 /// matching `known_classes` resolves to `Type::Class`; else `Type::Unknown`
 /// (formalizes `check_type`'s old whitelist-plus-fallback as one named
 /// function instead of a duplicated match).
+/// Every primitive type name `resolve_type_hint` recognizes directly (not
+/// generics or classes) — the source of truth for anything outside this
+/// function that needs to list "the built-in type names", e.g. `ksl-lsp`'s
+/// completion when the cursor sits in type-annotation position.
+pub const PRIMITIVE_TYPE_NAMES: &[&str] = &["Int", "Double", "Boolean", "String", "Unit", "List"];
+
 pub fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
     match hint {
         "Int" => Type::Int,
@@ -149,6 +155,19 @@ mod tests {
             ("List", Type::List),
         ] {
             assert_eq!(resolve_type_hint(hint, &empty_params, &empty_classes), expected);
+        }
+    }
+
+    #[test]
+    fn primitive_type_names_all_resolve_to_a_known_primitive() {
+        // Guards `PRIMITIVE_TYPE_NAMES` against drifting out of sync with
+        // `resolve_type_hint`'s own match arms.
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        for name in PRIMITIVE_TYPE_NAMES {
+            let ty = resolve_type_hint(name, &empty_params, &empty_classes);
+            assert_ne!(ty, Type::Unknown, "{name} should resolve to a primitive");
+            assert!(!matches!(ty, Type::Generic(_) | Type::Class(_)), "{name} resolved to {ty:?}");
         }
     }
 

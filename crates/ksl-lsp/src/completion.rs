@@ -36,6 +36,18 @@ const KEYWORDS: &[&str] = &[
 pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
+
+    if type_position_before_cursor(&up_to_cursor) {
+        return ksl_core::types::PRIMITIVE_TYPE_NAMES
+            .iter()
+            .map(|name| CompletionItem {
+                label: name.to_string(),
+                kind: Some(CompletionItemKind::CLASS),
+                ..Default::default()
+            })
+            .collect();
+    }
+
     let (prefix_path, _partial) = dotted_prefix_before_cursor(&up_to_cursor);
 
     if !prefix_path.is_empty() {
@@ -43,7 +55,15 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         // concrete type narrows the builtin-method suggestions to that
         // type; anything else (multi-segment, unresolved, or `Unknown`)
         // falls back to the over-suggesting "show everything" behavior.
+        // A numeric-literal prefix (`1`, or the two-segment `1.5` shape)
+        // is recognized directly — never a real identifier, so a symbol
+        // lookup for it would always fail — instead of falling through to
+        // the unfiltered case.
         let receiver_type = match prefix_path.as_slice() {
+            [int_part] if is_digits(int_part) => Some(ksl_core::types::Type::Int),
+            [int_part, frac_part] if is_digits(int_part) && is_digits(frac_part) => {
+                Some(ksl_core::types::Type::Double)
+            }
             [name] => {
                 let line = position.line + 1;
                 let col = position.character + 1;
@@ -156,18 +176,48 @@ fn dotted_prefix_before_cursor(text_before_cursor: &str) -> (Vec<String>, String
     }
     let chunk = &text_before_cursor[start..];
     // A chunk starting with a digit is a numeric literal (`1`, `1.5`, ...),
-    // never a dotted name chain — identifiers can't start with a digit
-    // (see `lexer.rs`'s `lex_ident_or_keyword` vs `lex_number`). Without
-    // this check, mid-typing a `Double` literal like `1.5` (i.e. the
-    // buffer momentarily reads `1.`) would be misread as a receiver prefix
-    // and offer builtin-method completions (`.length()` etc.) after a
-    // plain number.
-    if chunk.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return (Vec::new(), String::new());
-    }
+    // never a dotted *name* chain — identifiers can't start with a digit
+    // (see `lexer.rs`'s `lex_ident_or_keyword` vs `lex_number`). It's
+    // still returned as an ordinary prefix, though (not rejected/emptied
+    // out): `completion()` recognizes an all-digit segment as a numeric
+    // literal and assigns it a real `Int`/`Double` type directly (no
+    // symbol to look up), so the existing type-aware filtering still
+    // applies — an earlier version of this function instead returned an
+    // empty prefix here, which fell through to the *general* completion
+    // branch (locals/stdlib/keywords) and still offered `length`/etc. as
+    // plain stdlib functions right after a number, just not flagged as
+    // `.`-methods — the visible bug this comment now guards against.
     let mut parts: Vec<String> = chunk.split('.').map(String::from).collect();
     let partial = parts.pop().unwrap_or_default();
     (parts, partial)
+}
+
+/// Whether the cursor sits in type-annotation position: right after a `:`
+/// (optionally with whitespace and a partially-typed name already in
+/// between, e.g. `val x: I` mid-typing `Int`). Every `:` in the grammar
+/// introduces a type — `val`/`var`/parameter annotations and `fun` return
+/// types, `parser.rs`'s only three `Colon` call sites — so this plain
+/// suffix check is unambiguous, unlike method-receiver detection.
+fn type_position_before_cursor(text_before_cursor: &str) -> bool {
+    let mut start = text_before_cursor.len();
+    for (i, c) in text_before_cursor.char_indices().rev() {
+        if c.is_alphanumeric() || c == '_' {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    text_before_cursor[..start].trim_end().ends_with(':')
+}
+
+/// `true` for a non-empty run of ASCII digits — used to recognize a
+/// dotted-prefix segment that's actually (part of) a numeric literal
+/// rather than an identifier, so its type can be assigned directly
+/// (`Int`, or `Double` for the two-segment `N.M` shape) instead of
+/// attempting — and always failing — a symbol lookup for something that
+/// was never a legal identifier to begin with.
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
 fn symbol_completion_kind(kind: SymbolKind) -> CompletionItemKind {
@@ -242,30 +292,77 @@ mod tests {
     }
 
     #[test]
-    fn completion_after_a_numeric_literal_dot_does_not_offer_string_methods() {
-        // Regression test: mid-typing a `Double` literal like `1.5`, the
-        // buffer momentarily reads `1.` — this must not be misread as a
-        // receiver prefix and offer the builtin-method table (`.length()`
-        // etc. as `CompletionItemKind::METHOD`) after a plain number. The
-        // *plain* stdlib functions `length`/`uppercase`/... are still fine
-        // to see here (they're always-suggested global functions, offered
-        // regardless of context) — only the `.`-method duplicates are the
-        // bug.
-        let text = "println(1.5)\n";
-        let analysis = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
-        let items = completion(&analysis, text, Position::new(0, 10)); // right after "println(1."
-        assert!(
-            !items.iter().any(|i| i.kind == Some(CompletionItemKind::METHOD)),
-            "{:?}",
-            items.iter().map(|i| &i.label).collect::<Vec<_>>()
-        );
+    fn completion_after_a_dot_on_an_int_literal_offers_nothing_string_shaped() {
+        // The exact bug report: `1.length()` — `1` is an `Int` literal
+        // (recognized directly, no symbol lookup involved), so no
+        // `String` method, and nothing from the general branch either.
+        let text = "1.length()\n";
+        let names = labels(text, Position::new(0, 2)); // right after "1."
+        assert!(names.is_empty(), "{names:?}");
     }
 
     #[test]
-    fn dotted_prefix_before_cursor_rejects_a_numeric_prefix() {
-        assert_eq!(dotted_prefix_before_cursor("1."), (vec![], String::new()));
-        assert_eq!(dotted_prefix_before_cursor("1.5"), (vec![], String::new()));
-        assert_eq!(dotted_prefix_before_cursor("println(1."), (vec![], String::new()));
+    fn completion_after_a_numeric_literal_dot_does_not_offer_string_methods() {
+        // Regression test for the real bug: right after `1.` (an `Int`
+        // literal), nothing offered may be a `String` method — and,
+        // critically, general completion items (locals, stdlib functions
+        // as plain names, keywords) must not leak in either. An earlier
+        // version of this fix only blocked the `.`-method-table branch,
+        // which made the function fall through to the general branch —
+        // `length` etc. still appeared in the list (just as a plain
+        // stdlib function instead of a flagged `.`-method), which reads
+        // identically to "1.length() is offered" in an editor.
+        let text = "println(1.5)\n";
+        let analysis = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
+        let items = completion(&analysis, text, Position::new(0, 10)); // right after "println(1."
+        let labels: Vec<&String> = items.iter().map(|i| &i.label).collect();
+        assert!(!labels.iter().any(|l| *l == "length"), "{labels:?}");
+        assert!(!labels.iter().any(|l| *l == "uppercase"), "{labels:?}");
+        assert!(!labels.iter().any(|l| *l == "fun"), "{labels:?}");
+    }
+
+    #[test]
+    fn dotted_prefix_before_cursor_returns_a_numeric_prefix_as_is() {
+        // Not rejected/emptied out (see the function's doc comment) — a
+        // numeric segment is returned like any other, so `completion()`
+        // can recognize it and assign a real type directly.
+        assert_eq!(dotted_prefix_before_cursor("1."), (vec!["1".to_string()], String::new()));
+        assert_eq!(dotted_prefix_before_cursor("1.5"), (vec!["1".to_string()], "5".to_string()));
+        assert_eq!(dotted_prefix_before_cursor("println(1."), (vec!["1".to_string()], String::new()));
+    }
+
+    #[test]
+    fn completion_in_type_annotation_position_offers_primitive_type_names() {
+        // The cursor sits mid-line, right after "val x: " — the rest of
+        // the (fully valid) line is irrelevant to `completion()`, which
+        // only ever looks at text up to `position`.
+        let text = "val x: Int = 0\n";
+        let names = labels(text, Position::new(0, 7));
+        assert!(names.contains(&"Int".to_string()), "{names:?}");
+        assert!(names.contains(&"String".to_string()), "{names:?}");
+        assert!(!names.contains(&"println".to_string()), "{names:?}");
+        assert!(!names.contains(&"fun".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_mid_typing_a_type_name_still_offers_primitive_type_names() {
+        let text = "val x: Int = 0\n";
+        let names = labels(text, Position::new(0, 8)); // right after "val x: I"
+        assert!(names.contains(&"Int".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_in_a_function_parameter_type_position_offers_primitive_type_names() {
+        let text = "fun f(p: Int): Int {\n    return p\n}\n";
+        let names = labels(text, Position::new(0, 9)); // right after "fun f(p: "
+        assert!(names.contains(&"Int".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn type_position_before_cursor_rejects_non_type_positions() {
+        assert!(!type_position_before_cursor("val x = "));
+        assert!(!type_position_before_cursor("println("));
+        assert!(!type_position_before_cursor(""));
     }
 
     #[test]
