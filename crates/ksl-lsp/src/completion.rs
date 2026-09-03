@@ -121,6 +121,16 @@ fn dotted_prefix_before_cursor(text_before_cursor: &str) -> (Vec<String>, String
         }
     }
     let chunk = &text_before_cursor[start..];
+    // A chunk starting with a digit is a numeric literal (`1`, `1.5`, ...),
+    // never a dotted name chain — identifiers can't start with a digit
+    // (see `lexer.rs`'s `lex_ident_or_keyword` vs `lex_number`). Without
+    // this check, mid-typing a `Double` literal like `1.5` (i.e. the
+    // buffer momentarily reads `1.`) would be misread as a receiver prefix
+    // and offer builtin-method completions (`.length()` etc.) after a
+    // plain number.
+    if chunk.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return (Vec::new(), String::new());
+    }
     let mut parts: Vec<String> = chunk.split('.').map(String::from).collect();
     let partial = parts.pop().unwrap_or_default();
     (parts, partial)
@@ -186,6 +196,33 @@ mod tests {
         let names = labels(text, Position::new(1, 2));
         assert!(names.contains(&"uppercase".to_string()), "{names:?}");
         assert!(names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_numeric_literal_dot_does_not_offer_string_methods() {
+        // Regression test: mid-typing a `Double` literal like `1.5`, the
+        // buffer momentarily reads `1.` — this must not be misread as a
+        // receiver prefix and offer the builtin-method table (`.length()`
+        // etc. as `CompletionItemKind::METHOD`) after a plain number. The
+        // *plain* stdlib functions `length`/`uppercase`/... are still fine
+        // to see here (they're always-suggested global functions, offered
+        // regardless of context) — only the `.`-method duplicates are the
+        // bug.
+        let text = "println(1.5)\n";
+        let analysis = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
+        let items = completion(&analysis, text, Position::new(0, 10)); // right after "println(1."
+        assert!(
+            !items.iter().any(|i| i.kind == Some(CompletionItemKind::METHOD)),
+            "{:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dotted_prefix_before_cursor_rejects_a_numeric_prefix() {
+        assert_eq!(dotted_prefix_before_cursor("1."), (vec![], String::new()));
+        assert_eq!(dotted_prefix_before_cursor("1.5"), (vec![], String::new()));
+        assert_eq!(dotted_prefix_before_cursor("println(1."), (vec![], String::new()));
     }
 
     #[test]

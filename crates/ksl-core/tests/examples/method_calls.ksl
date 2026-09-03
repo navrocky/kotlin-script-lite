@@ -6,5 +6,7 @@ println("KOTLIN".lowercase())
 println("  padded  ".trim())
 println("  Loud  ".trim().uppercase())
 
+println("  Loud ${ "   asdasdas   ".trim() }  ".trim().uppercase())
+
 val name = "world"
 println(name.uppercase())
