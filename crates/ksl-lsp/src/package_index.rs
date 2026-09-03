@@ -30,6 +30,15 @@ pub struct PackageMember {
 #[derive(Default)]
 pub struct PackageIndex {
     members: HashMap<String, Vec<PackageMember>>,
+    /// Top-level `fun`/`val`/`var` declarations of a *package-less*
+    /// `@file:Import`ed file, keyed by their own plain name (no package
+    /// qualifier) — these get flattened into the importing file's own
+    /// global scope at runtime (see `importer::run_program`'s `None =>
+    /// interp.globals.clone()` branch), so a name like `greet` used
+    /// unqualified needs its own lookup here, distinct from `members`
+    /// (which is keyed by `package.member` and only ever populated for a
+    /// file that actually declares a `package`).
+    flat: HashMap<String, Vec<PackageMember>>,
 }
 
 impl PackageIndex {
@@ -43,6 +52,19 @@ impl PackageIndex {
 
     pub fn package_names(&self) -> impl Iterator<Item = &String> {
         self.members.keys()
+    }
+
+    /// The flat (package-less) member named `name`, if any — see `flat`'s
+    /// doc comment. First match wins on a same-named clash across two
+    /// separate imports (rare, and no more precise than the runtime's own
+    /// last-import-wins global-scope behavior would be anyway).
+    pub fn flat_member(&self, name: &str) -> Option<&PackageMember> {
+        self.flat.get(name).and_then(|v| v.first())
+    }
+
+    /// Every flat (package-less) member indexed, for completion.
+    pub fn flat_members(&self) -> impl Iterator<Item = &PackageMember> {
+        self.flat.values().flat_map(|v| v.iter())
     }
 }
 
@@ -64,7 +86,7 @@ pub fn build_package_index(program: &Program, own_file: &Path) -> PackageIndex {
     if let Some(canonical) = &own_canonical {
         visited.insert(canonical.clone());
     }
-    index_program(program, base_dir, &mut index, &mut visited, own_canonical.as_deref());
+    index_program(program, base_dir, &mut index, &mut visited, own_canonical.as_deref(), true);
     index
 }
 
@@ -74,21 +96,44 @@ fn index_program(
     index: &mut PackageIndex,
     visited: &mut HashSet<PathBuf>,
     own_file: Option<&Path>,
+    is_entry: bool,
 ) {
-    if let Some(pkg) = &program.package {
-        let package_name = pkg.path.join(".");
-        // A canonical own-file path is needed for a Url; a document with no
-        // real backing file (e.g. an unsaved buffer) simply can't be
-        // goto-def'd into, so it's skipped rather than indexed with a bogus URI.
-        if let Some(file) = own_file.and_then(path_to_url) {
-            let resolved = resolver::resolve(program);
-            for symbol in resolved.table.top_level_symbols() {
-                index.members.entry(package_name.clone()).or_default().push(PackageMember {
-                    symbol: symbol.clone(),
-                    file: file.clone(),
-                });
+    match &program.package {
+        Some(pkg) => {
+            let package_name = pkg.path.join(".");
+            // A canonical own-file path is needed for a Url; a document with
+            // no real backing file (e.g. an unsaved buffer) simply can't be
+            // goto-def'd into, so it's skipped rather than indexed with a
+            // bogus URI.
+            if let Some(file) = own_file.and_then(path_to_url) {
+                let resolved = resolver::resolve(program);
+                for symbol in resolved.table.top_level_symbols() {
+                    index.members.entry(package_name.clone()).or_default().push(PackageMember {
+                        symbol: symbol.clone(),
+                        file: file.clone(),
+                    });
+                }
             }
         }
+        // A package-less file only gets flat-indexed when it's reached
+        // *through* an `@file:Import` (`!is_entry`) — the entry document's
+        // own top-level names are already resolved directly via its own
+        // `analysis.resolved` (real locals, not a cross-file lookup), so
+        // indexing them again here would be redundant, not wrong, but
+        // needlessly duplicates the current document's live tree with a
+        // separately-parsed one that's already stale the moment it's typed.
+        None if !is_entry => {
+            if let Some(file) = own_file.and_then(path_to_url) {
+                let resolved = resolver::resolve(program);
+                for symbol in resolved.table.top_level_symbols() {
+                    index.flat.entry(symbol.name.clone()).or_default().push(PackageMember {
+                        symbol: symbol.clone(),
+                        file: file.clone(),
+                    });
+                }
+            }
+        }
+        None => {}
     }
 
     for import in &program.imports {
@@ -103,7 +148,7 @@ fn index_program(
         let Ok(source) = fs::read_to_string(&canonical) else { continue };
         let Ok(imported_program) = ksl_core::parse_only(&source) else { continue };
         let child_base_dir = canonical.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-        index_program(&imported_program, &child_base_dir, index, visited, Some(&canonical));
+        index_program(&imported_program, &child_base_dir, index, visited, Some(&canonical), false);
     }
 }
 
@@ -163,7 +208,7 @@ mod tests {
 
         let index = build(&dir, "main.ksl");
         let member = index.find("util.math", "square").expect("square should be indexed");
-        assert_eq!(member.symbol.signature, "fun square(x: Int)");
+        assert_eq!(member.symbol.signature, "fun square(x: Int): Int");
     }
 
     #[test]
@@ -193,6 +238,41 @@ mod tests {
 
         let index = build(&dir, "main.ksl"); // must not panic
         assert!(index.package_names().next().is_none());
+    }
+
+    #[test]
+    fn package_less_import_flattens_its_top_level_names() {
+        let dir = TempDir::new("flat");
+        dir.write("greeter.ksl", "fun greet(name: String): String {\n    return \"Hello, $name!\"\n}\n");
+        dir.write("main.ksl", "@file:Import(\"greeter.ksl\")\nprintln(greet(\"World\"))\n");
+
+        let index = build(&dir, "main.ksl");
+        let member = index.flat_member("greet").expect("greet should be flat-indexed");
+        assert_eq!(member.symbol.signature, "fun greet(name: String): String");
+    }
+
+    #[test]
+    fn package_less_import_transitively_flattens_too() {
+        let dir = TempDir::new("flat_transitive");
+        dir.write("deep.ksl", "fun helper(): Int = 1\n");
+        dir.write("mid.ksl", "@file:Import(\"deep.ksl\")\nprintln(1)\n");
+        dir.write("main.ksl", "@file:Import(\"mid.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.flat_member("helper").is_some());
+    }
+
+    #[test]
+    fn the_entry_documents_own_top_level_names_are_not_flat_indexed() {
+        // Redundant, not wrong -- the entry document's own locals are
+        // already covered by `analysis.resolved`, so re-indexing them here
+        // from a separately-parsed (potentially stale) tree would be
+        // pointless.
+        let dir = TempDir::new("flat_entry");
+        dir.write("main.ksl", "fun helper(): Int = 1\nprintln(helper())\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.flat_member("helper").is_none());
     }
 
     #[test]

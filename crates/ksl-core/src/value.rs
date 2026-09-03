@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ast::{FunBody, Param};
+use crate::ast::{FunBody, Param, TypeAnnotation};
 use crate::environment::Env;
 use crate::error::{Flow, Span};
 use crate::interpreter::Interpreter;
@@ -27,7 +27,7 @@ pub struct FunctionValue {
     /// Raw return-type annotation, if any — always `None` for a lambda
     /// (`ExprKind::Lambda` has no return-type syntax). Resolved into a real
     /// `types::Type` by `check_type`, not here.
-    pub return_type: Option<String>,
+    pub return_type: Option<TypeAnnotation>,
     pub body: FunBody,
     pub closure: Env,
 }

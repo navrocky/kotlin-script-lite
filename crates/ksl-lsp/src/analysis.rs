@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ksl_core::ast::Program;
+use ksl_core::ast::{ImportDecl, Program};
 use ksl_core::resolver::{self, ResolveResult};
 
 use crate::package_index::{self, PackageIndex};
@@ -14,6 +14,17 @@ pub struct Analysis {
     /// hover/goto-definition/completion answer `a.b.c` qualified-name
     /// queries, which `resolved` alone can't (it's single-file).
     pub packages: PackageIndex,
+    /// This document's own `@file:Import(...)` declarations — needed by
+    /// goto-definition to jump straight to the file one of them names
+    /// (matched by `ImportDecl::path_span`), separate from `resolved`
+    /// (which is scoped to expressions/statements, not import declarations).
+    pub imports: Vec<ImportDecl>,
+    /// This document's own path, as given to `analyze` — needed by
+    /// completion/goto-definition for anything relative to the file on
+    /// disk: resolving `@file:Import("...")` path completion candidates,
+    /// and jumping to the file a partially- or fully-typed import path
+    /// names. Not necessarily canonical (see `analyze`'s own doc comment).
+    pub own_file: PathBuf,
     /// False if `text` itself didn't parse and this fell back to a
     /// previously cached tree — see the module doc comment on
     /// `document_store::DocumentState`.
@@ -48,12 +59,14 @@ pub fn analyze(text: &str, last_good: Option<Arc<Program>>, own_file: &Path) -> 
         Ok(program) => {
             let resolved = resolver::resolve(&program);
             let packages = package_index::build_package_index(&program, own_file);
-            Some(Analysis { resolved, packages, is_current: true })
+            let imports = program.imports.clone();
+            Some(Analysis { resolved, packages, imports, own_file: own_file.to_path_buf(), is_current: true })
         }
         Err(_) => last_good.map(|program| {
             let resolved = resolver::resolve(&program);
             let packages = package_index::build_package_index(&program, own_file);
-            Analysis { resolved, packages, is_current: false }
+            let imports = program.imports.clone();
+            Analysis { resolved, packages, imports, own_file: own_file.to_path_buf(), is_current: false }
         }),
     }
 }

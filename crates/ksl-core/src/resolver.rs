@@ -141,6 +141,16 @@ pub struct SymbolTable {
     /// require the receiver type to match a candidate builtin method,
     /// rather than matching by method name alone.
     method_receiver_types: Vec<(Span, Type)>,
+    /// Every bare `ExprKind::Name` occurrence's span and text, recorded
+    /// unconditionally — including names that never resolve to a local
+    /// symbol at all (a stdlib function like `println`, or a name brought
+    /// in flat by a package-less `@file:Import`, see `resolve_name`).
+    /// `occurrences` only covers names that *do* resolve locally, so this
+    /// is what a caller (`ksl-lsp`'s `hover`/`goto_definition`) falls back
+    /// to for everything else — checking the name against
+    /// `stdlib::STDLIB_SIGNATURES` or a cross-file flat index, neither of
+    /// which this single-file resolver knows about itself.
+    name_refs: Vec<(Span, String)>,
 }
 
 impl SymbolTable {
@@ -176,6 +186,19 @@ impl SymbolTable {
             .iter()
             .find(|(span, _)| span.contains_line_col(line, col))
             .map(|(_, ty)| ty)
+    }
+
+    /// The bare name (if any) whose own `ExprKind::Name` span covers
+    /// `(line, col)` — see `name_refs`'s doc comment. Note this fires for
+    /// *every* name reference, including ones that also resolve to a real
+    /// local symbol (`occurrence_at` would already find those); a caller
+    /// should check `occurrence_at`/`qualified_ref_at` first and only use
+    /// this as the final fallback.
+    pub fn name_ref_at(&self, line: u32, col: u32) -> Option<&str> {
+        self.name_refs
+            .iter()
+            .find(|(span, _)| span.contains_line_col(line, col))
+            .map(|(_, name)| name.as_str())
     }
 
     /// Every symbol declared directly at this file's top level (scope 0,
@@ -257,6 +280,7 @@ pub fn resolve(program: &Program) -> ResolveResult {
             qualified_refs: Vec::new(),
             method_refs: Vec::new(),
             method_receiver_types: Vec::new(),
+            name_refs: Vec::new(),
         },
         diagnostics: Vec::new(),
         type_errors: Vec::new(),
@@ -386,6 +410,17 @@ fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Double)
 }
 
+/// `true` for a primitive that can never have a "common supertype" with a
+/// different primitive — used to decide whether mismatched `if`/`when`
+/// branch types are an immediate error. `Class`/`Generic`/`Unknown`/
+/// `Function` are excluded: computing a real common supertype needs a class
+/// hierarchy that doesn't exist yet (deferred to a later phase, see the
+/// approved plan's central-principle section), so those keep the existing
+/// lenient join-to-`Unknown` behavior for now.
+fn is_primitive(t: &Type) -> bool {
+    matches!(t, Type::Int | Type::Double | Type::Bool | Type::String | Type::Unit | Type::List)
+}
+
 impl Resolver {
     fn push_scope(&mut self, parent: Option<usize>, depth: u32, bounds: Span) -> usize {
         self.table.scopes.push(ScopeData { parent, depth, bounds, names: HashMap::new() });
@@ -456,28 +491,45 @@ impl Resolver {
         idx
     }
 
-    /// Resolves a raw type-hint string (or `None`, meaning no annotation)
-    /// to a `Type` using this resolver's current generic-parameter/known-
-    /// class context (both always empty today — see `Resolver::generic_params`/
-    /// `known_classes`'s doc comments).
+    /// Resolves a type annotation (or `None`, meaning no annotation) to a
+    /// `Type` using this resolver's current generic-parameter/known-class
+    /// context (both always empty today — see `Resolver::generic_params`/
+    /// `known_classes`'s doc comments), recursively diagnosing every
+    /// unresolvable name anywhere in the tree (not just a top-level one) —
+    /// e.g. `(Foo, Int) -> Bar` with both `Foo` and `Bar` undefined pushes
+    /// two separate "unknown type" diagnostics, each pointing at its own
+    /// name.
     ///
-    /// An **absent** hint (`None`) is genuinely dynamic and never an error.
-    /// An explicitly-**given** hint that still resolves to `Unknown` — a
-    /// typo, or a name that would be a real type if a later phase (classes,
-    /// generics) had landed — has no legitimate meaning today, so it pushes
-    /// an "unknown type" diagnostic at `hint_span` (expected to be `Some`
-    /// exactly when `hint` is, since the parser always captures them
-    /// together — see `Param::type_hint_span`).
-    fn resolve_type_hint_here(&mut self, hint: Option<&str>, hint_span: Option<Span>) -> Type {
-        let Some(h) = hint else { return Type::Unknown };
-        let ty = types::resolve_type_hint(h, &self.generic_params, &self.known_classes);
-        if ty == Type::Unknown {
-            self.type_errors.push(RuntimeError::new(
-                format!("unknown type '{h}'"),
-                hint_span.unwrap_or_default(),
-            ));
+    /// An **absent** annotation (`None`) is genuinely dynamic and never an
+    /// error. An explicitly-**given** name that still resolves to `Unknown`
+    /// — a typo, or a name that would be a real type if a later phase
+    /// (classes, generics) had landed — has no legitimate meaning today.
+    fn resolve_type_annotation_here(&mut self, ann: Option<&TypeAnnotation>) -> Type {
+        let Some(ann) = ann else { return Type::Unknown };
+        self.diagnose_unknown_names(ann);
+        types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes)
+    }
+
+    /// Walks `ann`, pushing an "unknown type" diagnostic for every `Named`
+    /// leaf that doesn't resolve — the recursive half of
+    /// `resolve_type_annotation_here`, split out so it can run once ahead
+    /// of the (non-diagnosing) `types::resolve_type_annotation` call rather
+    /// than duplicating that function's own traversal.
+    fn diagnose_unknown_names(&mut self, ann: &TypeAnnotation) {
+        match ann {
+            TypeAnnotation::Named(name, span) => {
+                let ty = types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes);
+                if ty == Type::Unknown {
+                    self.type_errors.push(RuntimeError::new(format!("unknown type '{name}'"), *span));
+                }
+            }
+            TypeAnnotation::Function(params, ret, _) => {
+                for p in params {
+                    self.diagnose_unknown_names(p);
+                }
+                self.diagnose_unknown_names(ret);
+            }
         }
-        ty
     }
 
     /// Resolves a use of `name` by walking up the scope chain from `scope`,
@@ -584,11 +636,16 @@ impl Resolver {
         self.touch(scope, stmt.span);
         match &stmt.kind {
             StmtKind::ExprStmt(e) => self.walk_expr(e, scope, following),
-            StmtKind::ValDecl { name, name_span, init, mutable, type_hint, type_hint_span } => {
-                let init_ty = self.walk_expr(init, scope, following);
+            StmtKind::ValDecl { name, name_span, init, mutable, type_annotation } => {
                 let kind = if *mutable { SymbolKind::Var } else { SymbolKind::Val };
                 let keyword = if *mutable { "var" } else { "val" };
-                let declared_ty = self.resolve_type_hint_here(type_hint.as_deref(), *type_hint_span);
+                let declared_ty = self.resolve_type_annotation_here(type_annotation.as_ref());
+                // Walked with the declared type as the "expected" type so a
+                // lambda initializer (`val f: (Int) -> Int = { x -> ... }`)
+                // can infer its own parameter types from it — see
+                // `walk_expr_expected`'s doc comment.
+                let expected = if matches!(declared_ty, Type::Function(..)) { Some(&declared_ty) } else { None };
+                let init_ty = self.walk_expr_expected(init, scope, following, expected);
                 let ty = if declared_ty != Type::Unknown {
                     if init_ty != Type::Unknown && !types::is_assignable(&init_ty, &declared_ty) {
                         self.type_errors.push(RuntimeError::new(
@@ -604,22 +661,23 @@ impl Resolver {
                     // reassignment identically (see the `Assign` arm).
                     init_ty
                 };
-                // Hover text shows the type either way — explicitly
-                // annotated or merely inferred — so `var count = 0` reads
-                // as `var count: Int`, not a bare `var count` that hides
-                // what was actually worked out for it. Only a genuinely
+                // Hover text shows the resolved type either way —
+                // explicitly annotated or merely inferred — via
+                // `Type::name()` (which also renders a function type as
+                // `(Int) -> Int`), so `var count = 0` reads as
+                // `var count: Int`, not a bare `var count` that hides what
+                // was actually worked out for it. Only a genuinely
                 // `Unknown` type (nothing could be inferred) falls back to
                 // the bare form.
-                let sig = match (type_hint, &ty) {
-                    (Some(t), _) => format!("{keyword} {name}: {t}"),
-                    (None, Type::Unknown) => format!("{keyword} {name}"),
-                    (None, inferred) => format!("{keyword} {name}: {}", inferred.name()),
+                let sig = match &ty {
+                    Type::Unknown => format!("{keyword} {name}"),
+                    t => format!("{keyword} {name}: {}", t.name()),
                 };
                 // A hint-less declaration whose initializer's type couldn't
                 // be inferred at all has no type — a "type-committing site"
                 // per the strict-typing decision, so this is an error, not
                 // a silently-accepted `Unknown`.
-                if type_hint.is_none() && ty == Type::Unknown {
+                if type_annotation.is_none() && ty == Type::Unknown {
                     self.type_errors.push(RuntimeError::new(
                         format!("cannot infer type of '{name}'; add an explicit type annotation"),
                         *name_span,
@@ -652,11 +710,11 @@ impl Resolver {
                 }
                 Type::Unit
             }
-            StmtKind::FunDecl { name, name_span, params, return_type, return_type_span, body } => {
-                let ret_ty = self.resolve_type_hint_here(return_type.as_deref(), *return_type_span);
+            StmtKind::FunDecl { name, name_span, params, return_type, body } => {
+                let ret_ty = self.resolve_type_annotation_here(return_type.as_ref());
                 // Resolved quietly (no "unknown type" diagnostic here) —
-                // `walk_params` below resolves each param's hint again,
-                // at its own declaration site, which is where that
+                // `walk_params` below resolves each param's annotation
+                // again, at its own declaration site, which is where that
                 // diagnostic belongs; resolving twice would double it up.
                 // A `fun`'s params are mandatory-annotated (checked for
                 // real, with a diagnostic, in `walk_params` below) so this
@@ -664,8 +722,8 @@ impl Resolver {
                 // is fixed — but computed the same way regardless.
                 let param_types: Vec<Type> = params
                     .iter()
-                    .map(|p| match &p.type_hint {
-                        Some(h) => types::resolve_type_hint(h, &self.generic_params, &self.known_classes),
+                    .map(|p| match &p.type_annotation {
+                        Some(ann) => types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes),
                         None => Type::Unknown,
                     })
                     .collect();
@@ -675,12 +733,13 @@ impl Resolver {
                 // within the body resolve it — matches how `FunDecl`'s
                 // runtime handler defines the function's name on the same
                 // `env` its closure captures, mutated after capture. Its
-                // `return_type` is provisional when there's no annotation
-                // (patched to the real inferred value below, once the body
-                // has been walked) — a recursive call to this same
-                // function from within its own body sees `Unknown` for
-                // that call's result in the meantime, never a false
-                // rejection, just no check for that one call.
+                // `return_type` (and the `Type::Function` stored as `ty`)
+                // is provisional when there's no annotation (patched to the
+                // real inferred value below, once the body has been walked)
+                // — a recursive call to this same function from within its
+                // own body sees `Unknown` for that call's result in the
+                // meantime, never a false rejection, just no check for that
+                // one call.
                 let has_return_annotation = return_type.is_some();
                 let idx = self.define(
                     scope,
@@ -689,13 +748,13 @@ impl Resolver {
                     *name_span,
                     false,
                     format!("fun {name}({})", param_list(params)),
-                    Type::Function,
+                    Type::Function(param_types.clone(), Box::new(ret_ty.clone())),
                     ret_ty.clone(),
-                    param_types,
+                    param_types.clone(),
                     param_names,
                 );
                 let fn_scope = self.open_scope(scope, stmt.span, following);
-                self.walk_params(params, fn_scope, following, true);
+                self.walk_params(params, fn_scope, following);
                 self.return_type_stack.push(if has_return_annotation {
                     ReturnTypeContext::Expected(ret_ty.clone())
                 } else {
@@ -764,6 +823,21 @@ impl Resolver {
                             }
                         }
                     }
+                };
+                self.table.symbols[idx].ty = Type::Function(param_types, Box::new(final_ret_ty.clone()));
+                // The signature built at `define()` time above (before the
+                // body was walked) can't have known this yet — an
+                // unannotated return type is only ever inferred *after*
+                // walking the body. Bare (no `: Type` at all) only when
+                // `final_ret_ty` is itself `Unknown` — always an already-
+                // reported error state here (return-type inference failed
+                // or disagreed), never a legitimate "genuinely no return
+                // type" case (`Unit` is shown explicitly, same as anywhere
+                // else) — mirrors `ValDecl`'s identical bare-vs-typed
+                // signature choice for a hint-less `val`.
+                self.table.symbols[idx].signature = match &final_ret_ty {
+                    Type::Unknown => format!("fun {name}({})", param_list(params)),
+                    t => format!("fun {name}({}): {}", param_list(params), t.name()),
                 };
                 self.table.symbols[idx].return_type = final_ret_ty;
                 Type::Unit
@@ -835,37 +909,179 @@ impl Resolver {
         }
     }
 
-    /// Params share one scope with the function/lambda body (not a nested
-    /// child of it) — matches `call_function`, which defines each param
-    /// directly into `call_env` and then runs the body in that same env.
-    /// A default value expression is walked before its own param is
-    /// defined but after earlier params are, mirroring the order
-    /// `call_function` evaluates defaults in.
-    /// `require_annotation`: `true` for a named `fun`'s parameters (must
-    /// always carry an explicit type — checked here, immediately, with a
-    /// `type_errors` diagnostic if missing); `false` for a lambda's
-    /// (inferred from an expected type at the lambda's use site instead —
-    /// see the `Lambda` arm of `walk_expr`, which is where that inference
-    /// actually happens; this function only handles the "explicit hint
-    /// given" case for a lambda, same as always).
-    fn walk_params(&mut self, params: &[Param], fn_scope: usize, following: Span, require_annotation: bool) {
+    /// Params share one scope with the function body (not a nested child of
+    /// it) — matches `call_function`, which defines each param directly
+    /// into `call_env` and then runs the body in that same env. A default
+    /// value expression is walked before its own param is defined but
+    /// after earlier params are, mirroring the order `call_function`
+    /// evaluates defaults in.
+    ///
+    /// Only ever called for a named `fun`'s parameters, which must always
+    /// carry an explicit type annotation (checked here, immediately, with
+    /// a `type_errors` diagnostic if missing) — a lambda's parameters go
+    /// through `walk_lambda_params` instead, which infers a missing
+    /// annotation from an expected type at the lambda's use site rather
+    /// than requiring one outright.
+    fn walk_params(&mut self, params: &[Param], fn_scope: usize, following: Span) {
         for p in params {
             if let Some(default) = &p.default {
                 self.walk_expr(default, fn_scope, following);
             }
-            if require_annotation && p.type_hint.is_none() {
+            if p.type_annotation.is_none() {
                 self.type_errors.push(RuntimeError::new(
                     format!("parameter '{}' must have an explicit type annotation", p.name),
                     p.name_span,
                 ));
             }
-            let sig = match &p.type_hint {
-                Some(t) => format!("param {}: {t}", p.name),
-                None => format!("param {}", p.name),
+            let ty = self.resolve_type_annotation_here(p.type_annotation.as_ref());
+            let sig = match &ty {
+                Type::Unknown => format!("param {}", p.name),
+                t => format!("param {}: {}", p.name, t.name()),
             };
-            let ty = self.resolve_type_hint_here(p.type_hint.as_deref(), p.type_hint_span);
             self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new());
         }
+    }
+
+    /// A lambda's parameters, unlike a named `fun`'s (`walk_params`), are
+    /// never required to carry an explicit annotation — each one's type
+    /// comes from (in order of preference) its own explicit annotation (a
+    /// lambda param *can* be annotated, same syntax as a `fun` param's),
+    /// else the corresponding slot of `expected_param_types` (the
+    /// surrounding context's declared function type — a `val`/`var`
+    /// annotation, or the matching parameter's type at the lambda's call
+    /// site; see `walk_expr_expected`), else — a genuine "type-committing
+    /// site" per the strict-typing decision — a `type_errors` diagnostic,
+    /// same as a hint-less `val` with an uninferable initializer.
+    ///
+    /// The implicit `it` parameter (an empty `params` list) is handled the
+    /// same way, using `expected_param_types` only when it names exactly
+    /// one parameter (any other arity means `it`'s type genuinely can't be
+    /// worked out from context either).
+    ///
+    /// Returns the resolved parameter types, in order — needed by the
+    /// caller (`walk_lambda`) to build the lambda's own `Type::Function`.
+    fn walk_lambda_params(
+        &mut self,
+        params: &[Param],
+        fn_scope: usize,
+        lambda_span: Span,
+        following: Span,
+        expected_param_types: Option<&[Type]>,
+    ) -> Vec<Type> {
+        if params.is_empty() {
+            let inferred = expected_param_types
+                .filter(|p| p.len() == 1)
+                .map(|p| p[0].clone())
+                .unwrap_or(Type::Unknown);
+            if inferred == Type::Unknown {
+                self.type_errors.push(RuntimeError::new(
+                    "cannot infer type of lambda parameter 'it'; add an explicit expected function type"
+                        .to_string(),
+                    lambda_span,
+                ));
+            }
+            let sig = match &inferred {
+                Type::Unknown => "param it (implicit lambda parameter)".to_string(),
+                t => format!("param it: {} (implicit lambda parameter)", t.name()),
+            };
+            self.define(
+                fn_scope,
+                "it",
+                SymbolKind::Param,
+                lambda_span,
+                false,
+                sig,
+                inferred.clone(),
+                Type::Unknown,
+                Vec::new(),
+                Vec::new(),
+            );
+            return vec![inferred];
+        }
+
+        let mut param_types = Vec::with_capacity(params.len());
+        for (i, p) in params.iter().enumerate() {
+            if let Some(default) = &p.default {
+                self.walk_expr(default, fn_scope, following);
+            }
+            let explicit = self.resolve_type_annotation_here(p.type_annotation.as_ref());
+            let inferred = if explicit != Type::Unknown {
+                explicit
+            } else {
+                expected_param_types.and_then(|v| v.get(i)).cloned().unwrap_or(Type::Unknown)
+            };
+            if inferred == Type::Unknown {
+                self.type_errors.push(RuntimeError::new(
+                    format!(
+                        "cannot infer type of lambda parameter '{}'; add an explicit expected function type",
+                        p.name
+                    ),
+                    p.name_span,
+                ));
+            }
+            let sig = match &inferred {
+                Type::Unknown => format!("param {}", p.name),
+                t => format!("param {}: {}", p.name, t.name()),
+            };
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new());
+            param_types.push(inferred);
+        }
+        param_types
+    }
+
+    /// A lambda's own type is always a real `Type::Function` — inferred,
+    /// never optionally absent, matching the strict-typing decision that a
+    /// lambda "always has its own type, e.g. `(Int, String) -> Result`".
+    /// Parameter types come from `walk_lambda_params` (explicit annotation,
+    /// else `expected`'s corresponding slot, else a diagnosed error); the
+    /// return type is inferred from the body the same way an unannotated
+    /// `fun`'s is (see `FunDecl`'s `ReturnTypeContext::Collect` handling,
+    /// which this mirrors) — every `return` in the body plus, when nothing
+    /// unconditionally returns, the tail expression, all reconciled into
+    /// one type or flagged as a disagreement/uninferable error.
+    fn walk_lambda(
+        &mut self,
+        expr: &Expr,
+        params: &[Param],
+        body: &[Stmt],
+        scope: usize,
+        following: Span,
+        expected: Option<&Type>,
+    ) -> Type {
+        let expected_params: Option<&[Type]> = match expected {
+            Some(Type::Function(p, _)) => Some(p.as_slice()),
+            _ => None,
+        };
+        let lambda_scope = self.open_scope(scope, expr.span, following);
+        let param_types = self.walk_lambda_params(params, lambda_scope, expr.span, following, expected_params);
+
+        self.return_type_stack.push(ReturnTypeContext::Collect(Vec::new()));
+        let body_ty = self.walk_stmts(body, lambda_scope, following);
+        let ReturnTypeContext::Collect(mut seen) = self.return_type_stack.pop().unwrap() else {
+            unreachable!("just pushed a Collect context")
+        };
+        let falls_through = !body.last().map(always_returns).unwrap_or(false);
+        if falls_through {
+            seen.push(body_ty);
+        }
+        let inferred_ret = match reconcile_types(&seen) {
+            Reconciled::Agreed(t) => t,
+            Reconciled::Nothing => {
+                self.type_errors.push(RuntimeError::new(
+                    "cannot infer return type of lambda; add an explicit expected function type".to_string(),
+                    expr.span,
+                ));
+                Type::Unknown
+            }
+            Reconciled::Disagreement(a, b) => {
+                self.type_errors.push(RuntimeError::new(
+                    format!("lambda returns both {} and {}", a.name(), b.name()),
+                    expr.span,
+                ));
+                Type::Unknown
+            }
+        };
+        Type::Function(param_types, Box::new(inferred_ret))
     }
 
     /// Walks `expr` (recording occurrences/diagnostics as before) and
@@ -873,8 +1089,25 @@ impl Resolver {
     /// single-pass, exhaustive over every `ExprKind` (no wildcard arm).
     /// `Type::Unknown` covers anything not covered below (see
     /// `types`'s module doc comment for the "Unknown is always compatible"
-    /// rule this feeds into).
+    /// rule this feeds into). A thin wrapper over `walk_expr_expected` with
+    /// no expected type — see its doc comment for when a caller needs one.
     fn walk_expr(&mut self, expr: &Expr, scope: usize, following: Span) -> Type {
+        self.walk_expr_expected(expr, scope, following, None)
+    }
+
+    /// Like `walk_expr`, but with an optional "expected type" for `expr`
+    /// itself — used only by a `Lambda` at this exact position to infer its
+    /// parameter types when it has no explicit annotation of its own (see
+    /// `walk_lambda_params`): a `val`/`var`'s own annotation
+    /// (`ValDecl`'s handling) or a call argument's matching declared
+    /// parameter type (`Call`'s handling), both of which call this
+    /// directly instead of `walk_expr`. Not threaded into recursive calls
+    /// on subexpressions — an expected type only ever applies to the exact
+    /// expression position it was computed for (a lambda passed as *this*
+    /// argument, not one buried three calls deep inside it), so every
+    /// nested `walk_expr`/`walk_stmt` call below still goes through the
+    /// plain, expected-type-less path.
+    fn walk_expr_expected(&mut self, expr: &Expr, scope: usize, following: Span, expected: Option<&Type>) -> Type {
         self.touch(scope, expr.span);
         match &expr.kind {
             ExprKind::IntLit(_) => Type::Int,
@@ -888,7 +1121,10 @@ impl Resolver {
                 }
                 Type::String
             }
-            ExprKind::Name(name) => self.resolve_name(scope, name, expr.span),
+            ExprKind::Name(name) => {
+                self.table.name_refs.push((expr.span, name.clone()));
+                self.resolve_name(scope, name, expr.span)
+            }
             // `receiver.field` — this resolver has no notion of packages or
             // (pre-Phase-5) object fields, so it can't tell a local field
             // access apart from a package-qualified reference any more
@@ -947,7 +1183,7 @@ impl Resolver {
                             .iter()
                             .any(|(recv_type, name, ..)| *recv_type == t.name() && *name == method);
                         if known {
-                            crate::stdlib::builtin_method_return_type(t.name(), method)
+                            crate::stdlib::builtin_method_return_type(&t.name(), method)
                         } else {
                             self.type_errors.push(RuntimeError::new(
                                 format!("'{}' has no method '{method}'", t.name()),
@@ -1051,26 +1287,6 @@ impl Resolver {
             }
             ExprKind::Call { callee, args } => {
                 self.walk_expr(callee, scope, following);
-                let mut arg_infos: Vec<(Option<String>, Type)> = Vec::with_capacity(args.len());
-                for a in args {
-                    let t = self.walk_expr(&a.value, scope, following);
-                    arg_infos.push((a.name.clone(), t));
-                }
-
-                // `abs`/`max`/`min` are numeric-polymorphic (their return
-                // type mirrors whichever numeric type the caller actually
-                // passed) — doesn't fit the "one fixed Type" shape every
-                // other signature below has, so it's handled directly here
-                // instead of via `stdlib::stdlib_call_types`.
-                if let ExprKind::Name(name) = &callee.kind {
-                    if matches!(name.as_str(), "abs" | "max" | "min") {
-                        return arg_infos
-                            .first()
-                            .map(|(_, t)| t.clone())
-                            .filter(is_numeric)
-                            .unwrap_or(Type::Unknown);
-                    }
-                }
 
                 // A checkable signature comes from either a local `fun`
                 // symbol or a stdlib function with a known machine-
@@ -1080,11 +1296,37 @@ impl Resolver {
                 // against (`String::new()` placeholders — any named-arg
                 // call to a stdlib function falls into the "unknown
                 // parameter" case below, a minor, documented limitation).
+                // Resolved *before* walking the arguments (unlike every
+                // other subexpression here) so a lambda argument whose
+                // matching parameter is itself a function type
+                // (`apply({ x -> x * 2 }, 5)`) can infer its own parameter
+                // types from that — see `walk_expr_expected`.
                 let signature = match &callee.kind {
                     ExprKind::Name(name) => self
                         .resolve_symbol(scope, name)
-                        .filter(|s| s.kind == SymbolKind::Fun)
-                        .map(|s| (s.return_type.clone(), s.param_types.clone(), s.param_names.clone()))
+                        .and_then(|s| {
+                            // A named `fun` symbol carries its own
+                            // `param_names` (needed for named-argument
+                            // matching below); anything else — a `val`/
+                            // `var` holding a lambda, or a function-typed
+                            // parameter (`f: (Int) -> Int` inside another
+                            // function's body) — is only known
+                            // structurally, via its `Type::Function`, with
+                            // no parameter names of its own to match a
+                            // named argument against (same placeholder
+                            // scheme already used for stdlib calls below,
+                            // and for the same reason: a function *type*,
+                            // unlike a `fun` declaration, never names its
+                            // parameters).
+                            if s.kind == SymbolKind::Fun {
+                                Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone()))
+                            } else if let Type::Function(params, ret) = &s.ty {
+                                let names = vec![String::new(); params.len()];
+                                Some(((**ret).clone(), params.clone(), names))
+                            } else {
+                                None
+                            }
+                        })
                         .or_else(|| {
                             crate::stdlib::stdlib_call_types(name)
                                 .map(|(param_types, ret_ty)| {
@@ -1094,6 +1336,41 @@ impl Resolver {
                         }),
                     _ => None,
                 };
+
+                let mut arg_infos: Vec<(Option<String>, Type)> = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    // Matched by name if the argument is named, else by
+                    // position — a best-effort lookup only for the purpose
+                    // of expected-type propagation into a lambda argument;
+                    // the real named-vs-positional argument *checking*
+                    // below (once `arg_infos` is filled in) does its own,
+                    // more careful two-pass matching.
+                    let expected_param_ty = signature.as_ref().and_then(|(_, param_types, param_names)| {
+                        match &a.name {
+                            Some(n) => param_names.iter().position(|p| p == n).and_then(|i| param_types.get(i)),
+                            None => param_types.get(i),
+                        }
+                    });
+                    let t = self.walk_expr_expected(&a.value, scope, following, expected_param_ty);
+                    arg_infos.push((a.name.clone(), t));
+                }
+
+                // `abs`/`max`/`min` are numeric-polymorphic (their return
+                // type mirrors whichever numeric type the caller actually
+                // passed) — doesn't fit the "one fixed Type" shape every
+                // other signature above has, so it's handled directly here
+                // instead of via `stdlib::stdlib_call_types` (and, being
+                // stdlib functions, never matched a real `signature` above
+                // anyway).
+                if let ExprKind::Name(name) = &callee.kind {
+                    if matches!(name.as_str(), "abs" | "max" | "min") {
+                        return arg_infos
+                            .first()
+                            .map(|(_, t)| t.clone())
+                            .filter(is_numeric)
+                            .unwrap_or(Type::Unknown);
+                    }
+                }
 
                 match signature {
                     Some((ret_ty, param_types, param_names)) => {
@@ -1161,37 +1438,7 @@ impl Resolver {
                     None => Type::Unknown,
                 }
             }
-            ExprKind::Lambda { params, body } => {
-                let lambda_scope = self.open_scope(scope, expr.span, following);
-                // `require_annotation: false` — a lambda's params are
-                // inferred from an expected type at its use site, not
-                // required to carry an explicit hint (see Phase 2.2's
-                // expected-type propagation; not yet wired in this pass).
-                self.walk_params(params, lambda_scope, following, false);
-                if params.is_empty() {
-                    // Implicit `it` — synthesized at call time with no
-                    // token of its own to point at, so its "declaration"
-                    // is the lambda itself.
-                    self.define(
-                        lambda_scope,
-                        "it",
-                        SymbolKind::Param,
-                        expr.span,
-                        false,
-                        "param it (implicit lambda parameter)".to_string(),
-                        Type::Unknown,
-                        Type::Unknown,
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                }
-                // The lambda body's own inferred type is discarded — a
-                // lambda's return type isn't tracked (no annotation syntax
-                // exists for one); the lambda value itself is always
-                // `Type::Function`.
-                self.walk_stmts(body, lambda_scope, following);
-                Type::Function
-            }
+            ExprKind::Lambda { params, body } => self.walk_lambda(expr, params, body, scope, following, expected),
             ExprKind::If { cond, then_branch, else_branch } => {
                 self.walk_expr(cond, scope, following);
                 let then_ty = self.walk_block(then_branch, scope, expr.span, following);
@@ -1199,7 +1446,23 @@ impl Resolver {
                     Some(eb) => self.walk_block(eb, scope, expr.span, following),
                     None => Type::Unit,
                 };
-                if then_ty == else_ty { then_ty } else { Type::Unknown }
+                if then_ty == else_ty {
+                    then_ty
+                } else {
+                    // Two different primitives have no common supertype to
+                    // join to (no class hierarchy exists yet — see
+                    // `is_primitive`'s doc comment) — an immediate error,
+                    // per the strict-typing decision, rather than the
+                    // lenient `Unknown` join every other mismatch still
+                    // gets.
+                    if is_primitive(&then_ty) && is_primitive(&else_ty) {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("branches have incompatible types: {} and {}", then_ty.name(), else_ty.name()),
+                            expr.span,
+                        ));
+                    }
+                    Type::Unknown
+                }
             }
             ExprKind::When { subject, arms } => {
                 if let Some(s) = subject {
@@ -1207,10 +1470,15 @@ impl Resolver {
                 }
                 // Join rule: same type on every arm (a missing `else`
                 // implicitly joins with `Unit`, matching the runtime's "no
-                // arm matched" fallthrough) → that type; any mismatch →
+                // arm matched" fallthrough) → that type; a primitive-vs-
+                // primitive mismatch → an immediate error (see `If`'s
+                // handling above, mirrored here); any other mismatch →
                 // `Unknown`. `WhenArm` has no span of its own, so the whole
                 // `when` expression's span is the anchor for each arm's
-                // block.
+                // block. Only the *first* mismatch is flagged — once `acc`
+                // itself becomes `Unknown`, `is_primitive(&prev)` is false
+                // for every later arm, so a three-way `Int`/`String`/`Bool`
+                // mismatch reports once, not twice.
                 let has_else = arms.iter().any(|a| a.is_else);
                 let mut acc: Option<Type> = if has_else { None } else { Some(Type::Unit) };
                 for arm in arms {
@@ -1225,7 +1493,19 @@ impl Resolver {
                     acc = Some(match acc {
                         None => arm_ty,
                         Some(prev) if prev == arm_ty => prev,
-                        Some(_) => Type::Unknown,
+                        Some(prev) => {
+                            if is_primitive(&prev) && is_primitive(&arm_ty) {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!(
+                                        "branches have incompatible types: {} and {}",
+                                        prev.name(),
+                                        arm_ty.name()
+                                    ),
+                                    expr.span,
+                                ));
+                            }
+                            Type::Unknown
+                        }
                     });
                 }
                 acc.unwrap_or(Type::Unknown)
@@ -1235,11 +1515,25 @@ impl Resolver {
     }
 }
 
+/// Renders a `TypeAnnotation` back to source-like text — used only for
+/// `param_list`'s hover signature, built straight from the raw AST *before*
+/// the resolver has walked (and thus validated) it, so this shows exactly
+/// what was written, typo and all, rather than a resolved `Type::name()`.
+fn type_annotation_display(ann: &TypeAnnotation) -> String {
+    match ann {
+        TypeAnnotation::Named(name, _) => name.clone(),
+        TypeAnnotation::Function(params, ret, _) => {
+            let params = params.iter().map(type_annotation_display).collect::<Vec<_>>().join(", ");
+            format!("({params}) -> {}", type_annotation_display(ret))
+        }
+    }
+}
+
 fn param_list(params: &[Param]) -> String {
     params
         .iter()
-        .map(|p| match &p.type_hint {
-            Some(t) => format!("{}: {t}", p.name),
+        .map(|p| match &p.type_annotation {
+            Some(ann) => format!("{}: {}", p.name, type_annotation_display(ann)),
             None => p.name.clone(),
         })
         .collect::<Vec<_>>()
@@ -1286,7 +1580,7 @@ mod tests {
         let (name, kind) = symbol_names_at(&result.table, 1, 5).expect("fact should resolve");
         assert_eq!(name, "fact");
         assert_eq!(kind, SymbolKind::Fun);
-        assert_eq!(result.table.symbol_at(1, 5).unwrap().signature, "fun fact(n: Int)");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().signature, "fun fact(n: Int): Int");
         let (pname, pkind) = symbol_names_at(&result.table, 1, 10).expect("n param should resolve");
         assert_eq!(pname, "n");
         assert_eq!(pkind, SymbolKind::Param);
@@ -1714,5 +2008,171 @@ mod tests {
         let result2 = resolve_src("val x = 1\nval x = 2\n");
         assert_eq!(result2.diagnostics.len(), 1);
         assert!(result2.type_errors.is_empty());
+    }
+
+    #[test]
+    fn if_branches_with_mismatched_primitives_is_a_type_error() {
+        // `x` itself also has no inferable type (the `if`'s own type is
+        // `Unknown` once its branches disagree) — that's a second, genuine
+        // diagnosis from the same construct, not a bug, so this only checks
+        // that the branch-mismatch error is among the ones reported.
+        let result = resolve_src("val x = if (true) 1 else \"two\"\n");
+        assert!(
+            result
+                .type_errors
+                .iter()
+                .any(|e| e.message.contains("branches have incompatible types: Int and String")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn when_arms_with_mismatched_primitives_is_a_type_error_reported_once() {
+        let result = resolve_src("val x = when {\n    1 < 2 -> 1\n    else -> \"two\"\n}\n");
+        assert_eq!(
+            result.type_errors.iter().filter(|e| e.message.contains("branches have incompatible types")).count(),
+            1,
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn if_branches_with_matching_primitives_is_not_a_type_error() {
+        let result = resolve_src("val x = if (true) 1 else 2\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn fun_parameter_without_a_type_annotation_is_a_type_error() {
+        let result = resolve_src("fun apply(f, x: Int): Int = x\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("parameter 'f' must have an explicit type annotation")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn function_type_annotated_parameter_resolves_structurally() {
+        let result = resolve_src("fun apply(f: (Int) -> Int, x: Int): Int = f(x)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        let f = result.table.symbol_at(1, 11).unwrap();
+        assert_eq!(f.ty, Type::Function(vec![Type::Int], Box::new(Type::Int)));
+    }
+
+    #[test]
+    fn calling_a_val_holding_a_lambda_checks_its_argument_types() {
+        // Regression test: the `Call` arm's signature lookup only
+        // recognized `SymbolKind::Fun`, so calling a function-typed
+        // `val`/`var` (as opposed to a named `fun`) skipped argument
+        // checking entirely and silently accepted anything.
+        let result = resolve_src("val fn: (Int) -> String = { x -> \"hi\" }\nprintln(fn(\"wrong\"))\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("argument 1 has type String, expected Int")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn calling_a_val_holding_a_lambda_with_a_correct_argument_is_not_flagged() {
+        let result = resolve_src("val fn: (Int) -> String = { x -> \"hi\" }\nprintln(fn(5))\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn calling_a_function_typed_parameter_checks_its_argument_types() {
+        // Same bug, reached through a function-typed *parameter* rather
+        // than a `val`: `f`'s `SymbolKind::Param` was excluded the same way.
+        let result = resolve_src("fun apply(f: (Int) -> Int, x: Int): Int = f(\"bad\")\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("argument 1 has type String, expected Int")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn calling_a_val_holding_a_lambda_infers_its_return_type() {
+        let result = resolve_src("val fn: (Int) -> String = { x -> \"hi\" }\nval r = fn(5)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.table.symbol_at(2, 5).unwrap().ty, Type::String);
+    }
+
+    #[test]
+    fn lambda_parameter_type_is_inferred_from_the_val_annotation() {
+        let result = resolve_src("val double: (Int) -> Int = { x -> x * 2 }\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(
+            result.table.symbol_at(1, 5).unwrap().ty,
+            Type::Function(vec![Type::Int], Box::new(Type::Int))
+        );
+    }
+
+    #[test]
+    fn lambda_implicit_it_type_is_inferred_from_the_val_annotation() {
+        let result = resolve_src("val addOne: (Int) -> Int = { it + 1 }\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(
+            result.table.symbol_at(1, 5).unwrap().ty,
+            Type::Function(vec![Type::Int], Box::new(Type::Int))
+        );
+    }
+
+    #[test]
+    fn lambda_parameter_type_is_inferred_from_the_call_site_argument() {
+        let result =
+            resolve_src("fun apply(f: (Int) -> Int, x: Int): Int = f(x)\napply({ x -> x * 2 }, 5)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn lambda_parameter_without_any_expected_type_is_a_type_error() {
+        let result = resolve_src("val double = { x -> x * 2 }\n");
+        assert!(
+            result
+                .type_errors
+                .iter()
+                .any(|e| e.message.contains("cannot infer type of lambda parameter 'x'")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn lambda_implicit_it_without_any_expected_type_is_a_type_error() {
+        let result = resolve_src("val addOne = { it + 1 }\n");
+        assert!(
+            result
+                .type_errors
+                .iter()
+                .any(|e| e.message.contains("cannot infer type of lambda parameter 'it'")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn lambda_return_type_disagreement_is_a_type_error() {
+        let result = resolve_src(
+            "val f: (Boolean) -> Int = { b ->\n    if (b) { return 1 }\n    return \"x\"\n}\n",
+        );
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("lambda returns both")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn lambda_return_type_is_inferred_from_its_body() {
+        let result = resolve_src("val f: (Int) -> Int = { x -> x + 1 }\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(
+            result.table.symbol_at(1, 5).unwrap().ty,
+            Type::Function(vec![Type::Int], Box::new(Type::Int))
+        );
     }
 }

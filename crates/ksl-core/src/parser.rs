@@ -167,6 +167,36 @@ impl<'a> Parser<'a> {
         Ok(ImportUse { path, span: span.merge(&path_span) })
     }
 
+    /// `TypeAnnotation ::= Ident | '(' (TypeAnnotation (',' TypeAnnotation)*)? ')' '->' TypeAnnotation`
+    ///
+    /// Called only from a type-annotation position (right after the `:` in
+    /// a `val`/`var`/parameter annotation or a `fun` return type) — never
+    /// from expression position, so a leading `(` here is unambiguously a
+    /// function type's parameter list, not a parenthesized expression.
+    fn parse_type_annotation(&mut self) -> Result<TypeAnnotation, ParseError> {
+        if matches!(self.peek_kind(), TokenKind::LParen) {
+            let span = self.span();
+            self.advance(); // '('
+            let mut params = Vec::new();
+            if !matches!(self.peek_kind(), TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_type_annotation()?);
+                    if !self.matches(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen, "')'")?;
+            self.expect(TokenKind::Arrow, "'->'")?;
+            let ret = self.parse_type_annotation()?;
+            let full_span = span.merge(&ret.span());
+            Ok(TypeAnnotation::Function(params, Box::new(ret), full_span))
+        } else {
+            let (name, name_span) = self.expect_ident_spanned()?;
+            Ok(TypeAnnotation::Named(name, name_span))
+        }
+    }
+
     /// `ident (. ident)*` — used by `package`/`import`, which (unlike a
     /// `.`-chain in expression position, parsed as nested
     /// `FieldAccess`/`MethodCall` by `parse_postfix`) always require a
@@ -198,18 +228,23 @@ impl<'a> Parser<'a> {
             )));
         }
         self.expect(TokenKind::LParen, "'('")?;
-        let path = self.parse_plain_string_literal()?;
+        let (path, path_span) = self.parse_plain_string_literal()?;
         self.expect(TokenKind::RParen, "')'")?;
-        Ok(ImportDecl { path, span })
+        Ok(ImportDecl { path, span, path_span })
     }
 
     /// A `"..."` string literal with no interpolation — used for import
     /// paths, which must be known without evaluating any expression.
-    fn parse_plain_string_literal(&mut self) -> Result<String, ParseError> {
+    /// Returns the literal's own span (quotes included) alongside its text,
+    /// so a caller needing to point *at the string itself* (goto-definition
+    /// on an import's file name, see `ksl-lsp`'s `goto_definition.rs`) has
+    /// something narrower than the whole enclosing declaration to use.
+    fn parse_plain_string_literal(&mut self) -> Result<(String, Span), ParseError> {
         let start = self.span();
         self.expect(TokenKind::StringStart, "'\"'")?;
         let mut s = String::new();
-        loop {
+        let end = loop {
+            let tok_span = self.span();
             match self.peek_kind().clone() {
                 TokenKind::StringText(text) => {
                     self.advance();
@@ -217,7 +252,7 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::StringEnd => {
                     self.advance();
-                    break;
+                    break tok_span;
                 }
                 TokenKind::StringInterpText(_) | TokenKind::TemplateExprStart => {
                     return Err(self.err(
@@ -226,14 +261,14 @@ impl<'a> Parser<'a> {
                 }
                 other => return Err(self.err(format!("unexpected token in string: {other:?}"))),
             }
-        }
+        };
         if s.is_empty() {
             return Err(ParseError {
                 message: "import path must not be empty".into(),
                 span: start,
             });
         }
-        Ok(s)
+        Ok((s, start.merge(&end)))
     }
 
     fn parse_stmts_until_rbrace(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -311,20 +346,15 @@ impl<'a> Parser<'a> {
         let mutable = matches!(self.peek_kind(), TokenKind::Var);
         self.advance(); // val/var
         let (name, name_span) = self.expect_ident_spanned()?;
-        let (type_hint, type_hint_span) = if self.matches(&TokenKind::Colon) {
-            let (t, s) = self.expect_ident_spanned()?;
-            (Some(t), Some(s))
-        } else {
-            (None, None)
-        };
+        let type_annotation =
+            if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
         self.expect(TokenKind::Assign, "'='")?;
         let init = self.parse_expr()?;
         Ok(Stmt::new(
             StmtKind::ValDecl {
                 name,
                 name_span,
-                type_hint,
-                type_hint_span,
+                type_annotation,
                 mutable,
                 init,
             },
@@ -337,12 +367,8 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen, "'('")?;
         while !matches!(self.peek_kind(), TokenKind::RParen) {
             let (name, name_span) = self.expect_ident_spanned()?;
-            let (type_hint, type_hint_span) = if self.matches(&TokenKind::Colon) {
-                let (t, s) = self.expect_ident_spanned()?;
-                (Some(t), Some(s))
-            } else {
-                (None, None)
-            };
+            let type_annotation =
+                if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
             let default = if self.matches(&TokenKind::Assign) {
                 Some(self.parse_expr()?)
             } else {
@@ -351,8 +377,7 @@ impl<'a> Parser<'a> {
             params.push(Param {
                 name,
                 name_span,
-                type_hint,
-                type_hint_span,
+                type_annotation,
                 default,
             });
             if !self.matches(&TokenKind::Comma) {
@@ -368,12 +393,8 @@ impl<'a> Parser<'a> {
         self.advance(); // fun
         let (name, name_span) = self.expect_ident_spanned()?;
         let params = self.parse_params()?;
-        let (return_type, return_type_span) = if self.matches(&TokenKind::Colon) {
-            let (t, s) = self.expect_ident_spanned()?;
-            (Some(t), Some(s))
-        } else {
-            (None, None)
-        };
+        let return_type =
+            if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         let body = if self.matches(&TokenKind::Assign) {
             self.parse_expr().map(|e| FunBody::Expr(Box::new(e)))
@@ -382,7 +403,7 @@ impl<'a> Parser<'a> {
         };
         self.loop_depth = saved_loop_depth;
         Ok(Stmt::new(
-            StmtKind::FunDecl { name, name_span, params, return_type, return_type_span, body: body? },
+            StmtKind::FunDecl { name, name_span, params, return_type, body: body? },
             span,
         ))
     }
@@ -781,8 +802,7 @@ impl<'a> Parser<'a> {
                     params.push(Param {
                         name,
                         name_span,
-                        type_hint: None,
-                        type_hint_span: None,
+                        type_annotation: None,
                         default: None,
                     });
                 }
@@ -1210,5 +1230,52 @@ mod tests {
     #[test]
     fn break_inside_loop_inside_fun_body_is_fine() {
         parse_src("fun f() { while (true) { break } }");
+    }
+
+    #[test]
+    fn function_type_annotation_parses() {
+        let stmts = parse_src("fun apply(f: (Int, String) -> Result, x: Int): Int = x");
+        match &stmts[0].kind {
+            StmtKind::FunDecl { params, .. } => match &params[0].type_annotation {
+                Some(TypeAnnotation::Function(param_types, ret, _)) => {
+                    assert_eq!(param_types.len(), 2);
+                    assert!(matches!(&param_types[0], TypeAnnotation::Named(n, _) if n == "Int"));
+                    assert!(matches!(&param_types[1], TypeAnnotation::Named(n, _) if n == "String"));
+                    assert!(matches!(ret.as_ref(), TypeAnnotation::Named(n, _) if n == "Result"));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_function_type_annotation_parses() {
+        // `((Int) -> Int) -> String` — a function type itself taking a
+        // function type as its only parameter.
+        let stmts = parse_src("val f: ((Int) -> Int) -> String = g");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { type_annotation: Some(TypeAnnotation::Function(params, ret, _)), .. } => {
+                assert_eq!(params.len(), 1);
+                assert!(matches!(&params[0], TypeAnnotation::Function(inner_params, inner_ret, _)
+                    if inner_params.len() == 1
+                        && matches!(&inner_params[0], TypeAnnotation::Named(n, _) if n == "Int")
+                        && matches!(inner_ret.as_ref(), TypeAnnotation::Named(n, _) if n == "Int")));
+                assert!(matches!(ret.as_ref(), TypeAnnotation::Named(n, _) if n == "String"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_type_with_no_parameters_parses() {
+        let stmts = parse_src("val f: () -> Unit = g");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { type_annotation: Some(TypeAnnotation::Function(params, ret, _)), .. } => {
+                assert!(params.is_empty());
+                assert!(matches!(ret.as_ref(), TypeAnnotation::Named(n, _) if n == "Unit"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

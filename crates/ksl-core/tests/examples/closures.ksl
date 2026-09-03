@@ -10,10 +10,10 @@ fun makeCounter(): Int {
     return increment()
 }
 
-fun apply(f, x: Int): Int = f(x)
+fun apply(f: (Int) -> Int, x: Int): Int = f(x)
 
-val double = { x -> x * 2 }
-val addOne = { it + 1 }
+val double: (Int) -> Int = { x -> x * 2 }
+val addOne: (Int) -> Int = { it + 1 }
 
 println(makeCounter())
 println(apply(double, 21))

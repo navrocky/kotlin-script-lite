@@ -1,5 +1,26 @@
 use crate::error::Span;
 
+/// A type as written in source — `Int`, `String`, or a function type like
+/// `(Int, String) -> Result`. Distinct from `types::Type`, the *resolved*
+/// representation the resolver/interpreter actually check against: this is
+/// still raw syntax (an unresolved name might be a typo, a generic
+/// parameter, or a not-yet-declared class — see `types::resolve_type_annotation`,
+/// which turns one of these into a real `Type`).
+#[derive(Debug, Clone)]
+pub enum TypeAnnotation {
+    Named(String, Span),
+    Function(Vec<TypeAnnotation>, Box<TypeAnnotation>, Span),
+}
+
+impl TypeAnnotation {
+    pub fn span(&self) -> Span {
+        match self {
+            TypeAnnotation::Named(_, s) => *s,
+            TypeAnnotation::Function(_, _, s) => *s,
+        }
+    }
+}
+
 /// `package a.b` — optional, must be the very first thing in a file if
 /// present. Namespaces the file's own top-level `fun`/`val`/`var`
 /// declarations under `path` (joined with `.`) instead of the flat global
@@ -13,7 +34,15 @@ pub struct PackageDecl {
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
     pub path: String,
+    /// Span of the whole `@file:Import(...)` construct (starting at `@`) —
+    /// used for runtime error reporting (`importer.rs`), where pointing at
+    /// the declaration as a whole reads better than just its string.
     pub span: Span,
+    /// Span of just the path string literal (quotes included) — separate
+    /// from `span` so a goto-definition on the file name itself (see
+    /// `ksl-lsp`'s `goto_definition.rs`) can target precisely that, not the
+    /// whole declaration.
+    pub path_span: Span,
 }
 
 /// `import a.b.c` — brings the package-qualified name `a.b.c` (package
@@ -155,14 +184,10 @@ pub struct Arg {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
-    /// Span of just the parameter name (not its type hint or default),
-    /// used for hover/goto-definition.
+    /// Span of just the parameter name (not its type annotation or
+    /// default), used for hover/goto-definition.
     pub name_span: Span,
-    pub type_hint: Option<String>,
-    /// Span of just the type-hint identifier, if there is one — used to
-    /// point an "unknown type" diagnostic at the annotation itself rather
-    /// than the whole parameter.
-    pub type_hint_span: Option<Span>,
+    pub type_annotation: Option<TypeAnnotation>,
     pub default: Option<Expr>,
 }
 
@@ -200,10 +225,7 @@ pub enum StmtKind {
         name: String,
         /// Span of just the declared name, used for hover/goto-definition.
         name_span: Span,
-        type_hint: Option<String>,
-        /// Span of just the type-hint identifier, if there is one — see
-        /// `Param::type_hint_span`.
-        type_hint_span: Option<Span>,
+        type_annotation: Option<TypeAnnotation>,
         mutable: bool,
         init: Expr,
     },
@@ -219,10 +241,7 @@ pub enum StmtKind {
         params: Vec<Param>,
         /// Raw return-type annotation (`fun f(): Int`), if any — resolved
         /// into a real `types::Type` by the resolver/interpreter, not here.
-        return_type: Option<String>,
-        /// Span of just the return-type identifier, if there is one — see
-        /// `Param::type_hint_span`.
-        return_type_span: Option<Span>,
+        return_type: Option<TypeAnnotation>,
         body: FunBody,
     },
     While {

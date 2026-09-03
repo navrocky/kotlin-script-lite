@@ -75,58 +75,102 @@ this checking happens and how far it goes.
 
 ## Types
 
-ksl has a small, best-effort type checker — not a full static type
-system, but real checking, both ahead of time and while a script runs:
+ksl's type checking is deliberately strict, matching Kotlin: a value
+without an explicit or inferable type is always an error, not a silent
+"dynamic" fallback. It runs both ahead of time (static analysis, powering
+`ksl-lsp` and gating the `ksl` CLI before a script runs at all) and again
+at runtime inside the interpreter itself.
+
+**Type-committing sites — always either a real type or an error:**
 
 - **Every `val`/`var` has a type, annotation or not.** `var count: Int = 0`
-  and `var count = 0` end up with the exact same type — `Int` — the
-  second form just *infers* it from the initializer instead of reading it
-  off an annotation. Either way, that type is then enforced on every later
+  and `var count = 0` end up with the exact same type — `Int` — the second
+  form just *infers* it from the initializer instead of reading it off an
+  annotation. Either way, that type is then enforced on every later
   reassignment: `count = "hi"` is a type mismatch regardless of which form
-  declared `count`. There's no "dynamic by default" carve-out for the
-  unannotated form, matching Kotlin.
-- **What's checked**: a `val`/`var`'s initializer against its (explicit or
-  inferred) type; a `var`'s reassignment against that same type; a
-  function call's positional arguments against the callee's declared
-  parameter types; and a function's actual return value against its
-  declared return type.
-- **An annotation that doesn't name a real type is itself an error** —
-  `val x: Sting = 1` (a typo) or naming a feature this interpreter
-  doesn't have yet (a class, before classes exist) is rejected as
-  `unknown type 'Sting'`, not silently accepted. There is currently
-  nothing a type annotation can legitimately name besides the 6 listed
-  below, so an unrecognized one is never given the benefit of the doubt.
-- **What's never checked**: named arguments (checked positionally only,
-  for now); anything whose type genuinely can't be worked out without
-  running the script — most commonly the result of a package-qualified
-  call (`util.math.square(5)`), or anything derived from one. These are
-  always accepted, never a false rejection; but note this only applies
-  statically — at runtime every value is concrete, so a `var` initialized
-  from such a call still gets locked to whatever type that call's result
-  actually turns out to be, checked from then on (see "Where the check
-  happens" below for why the same script can behave slightly more
-  leniently in an editor's live diagnostics than it does when actually
-  run).
-- **`Int`/`Double` mixing is not the same rule as arithmetic.** `1 + 2.0`
-  freely produces a `Double` (see "Operators" below) — but assigning,
-  passing, or returning an `Int` where a `Double` is explicitly expected
-  (or vice versa) *is* a type mismatch. The two rules don't interact.
-- **Where the check happens, twice**: the same checking runs statically
-  (as you type, in an editor connected to `ksl-lsp`, and once more when
-  the `ksl` CLI loads a script, *before* running it — a type problem here
-  means the script never runs at all, not even its first line) and again
-  at runtime inside the interpreter itself (so embedding `ksl-core`
-  directly, without going through the CLI's pre-check, still can't skip
-  it). The runtime check is strictly more precise (it always has a
-  concrete value to work from, never "can't tell without running it"), so
-  it can catch a mismatch the static pass couldn't have. A type-mismatch
-  error looks like `type mismatch: expected Int, got String`; an
-  unrecognized annotation looks like `unknown type 'Sting'`.
-- Only 6 annotation names are recognized today — `Int`, `Double`,
-  `Boolean`, `String`, `Unit`, `List` — no class/generic/nullable types
-  exist yet (see "Not supported" below). A lambda's own type is always
-  inferred as a plain "function" internally, but there's no `Function`
-  annotation to write down for it.
+  declared `count`. If neither an annotation nor the initializer's type can
+  be worked out (e.g. the initializer is itself an uninferable call), that's
+  an error — `cannot infer type of 'count'; add an explicit type
+  annotation` — never a silent "untyped" fallback.
+- **A named `fun`'s parameters always require an explicit annotation** —
+  `fun apply(f, x: Int)` is rejected (`parameter 'f' must have an explicit
+  type annotation`), even though the parameter's type might seem inferable
+  from how it's used in the body. A `fun`'s *return* type, unlike its
+  parameters, may be omitted — it's then inferred from the body (every
+  `return` plus, when nothing unconditionally returns, the tail
+  expression), reconciled into one type; disagreement (`return 1` and
+  `return "x"` in the same function) is an error.
+- **A lambda's parameters are inferred from context, not required to carry
+  an annotation** — `{ x -> x * 2 }` gets `x`'s type from the function type
+  its surrounding context expects: a `val`/`var`'s own annotation
+  (`val double: (Int) -> Int = { x -> x * 2 }`) or the matching parameter's
+  declared type at a call site (`apply({ x -> x * 2 }, 5)`, where `apply`'s
+  first parameter is `(Int) -> Int`). If no such context exists, that's an
+  error — `cannot infer type of lambda parameter 'x'; add an explicit
+  expected function type` — same for the implicit `it` parameter. A
+  lambda's return type is always inferred from its body the same way an
+  unannotated `fun`'s is; a lambda's own type is always a real function
+  type, e.g. `(Int) -> Int`, never left unresolved.
+
+**Immediate errors, regardless of context:**
+
+- A binary/unary operation on two concretely-known but incompatible types
+  (`true + false`) — never deferred, even mid-expression.
+- Calling a method that doesn't exist for a concretely-known receiver type
+  (`5.uppercase()`) or accessing a field on a real local value (nothing has
+  fields until classes exist).
+- Mismatched `if`/`when` branch types where every branch is a primitive
+  (`if (b) 1 else "two"`) — there's no common supertype to join to without
+  a class hierarchy, so this is an error, not a silent `Unknown`. A branch
+  that's a class/generic/unresolvable type still joins leniently for now
+  (deferred until classes exist).
+- A named argument whose type doesn't match its parameter's declared type,
+  or that names a parameter the callee doesn't have.
+
+**What's still deferred**: anything whose type genuinely can't be worked
+out without running the script and isn't at one of the sites above — most
+commonly the result of a package-qualified call (`util.math.square(5)`), or
+anything derived from one (cross-file type inference is planned but not
+implemented yet). These stay `Unknown` and are never a false rejection; but
+note this only applies statically — at runtime every value is concrete, so
+a `var` initialized from such a call still gets locked to whatever type
+that call's result actually turns out to be, checked from then on (see
+"Where the check happens" below for why the same script can behave
+slightly more leniently in an editor's live diagnostics than it does when
+actually run).
+
+**An annotation that doesn't name a real type is itself an error** — `val
+x: Sting = 1` (a typo) or naming a feature this interpreter doesn't have
+yet (a class, before classes exist) is rejected as `unknown type 'Sting'`,
+not silently accepted, at exactly the position of the bad name (a bad name
+buried inside a function type, e.g. `(Sting) -> Int`, is flagged the same
+way, at its own position).
+
+**`Int`/`Double` mixing is not the same rule as arithmetic.** `1 + 2.0`
+freely produces a `Double` (see "Operators" below) — but assigning,
+passing, or returning an `Int` where a `Double` is explicitly expected (or
+vice versa) *is* a type mismatch. The two rules don't interact.
+
+**Where the check happens, twice**: the same checking runs statically (as
+you type, in an editor connected to `ksl-lsp`, and once more when the `ksl`
+CLI loads a script, *before* running it — a type problem here means the
+script never runs at all, not even its first line) and again at runtime
+inside the interpreter itself (so embedding `ksl-core` directly, without
+going through the CLI's pre-check, still can't skip it). The runtime check
+is strictly more precise (it always has a concrete value to work from,
+never "can't tell without running it"), so it can catch a mismatch the
+static pass couldn't have. A type-mismatch error looks like `type
+mismatch: expected Int, got String`; an unrecognized annotation looks like
+`unknown type 'Sting'`.
+
+**Type annotation syntax**: a plain name — one of the 6 recognized
+primitives, `Int`, `Double`, `Boolean`, `String`, `Unit`, `List` (no
+class/generic/nullable types exist yet, see "Not supported" below) — or a
+function type, `(ParamType, ...) -> ReturnType`, e.g. `(Int, String) ->
+Boolean` or `() -> Unit`. Function types nest (`((Int) -> Int) -> String`)
+and are compared structurally: same parameter count, each parameter and
+the return type individually compatible — no named function-type
+declaration to match by identity.
 
 ## Operators
 
@@ -233,33 +277,42 @@ add(1, b = 2)           // 3, named argument
 add(a = 1, b = 2)       // named arguments can be given in any order
 ```
 
-- Parameters may have a `: Type` annotation (see [Types](#types)) and a
-  default value. A positional argument's value is checked against its
-  parameter's annotation, when both are of a checkable type.
+- A named `fun`'s parameters always require a `: Type` annotation (see
+  [Types](#types)) — `fun apply(f, x: Int)` is rejected, `f` needs one too.
+  A parameter may also have a default value.
+- Both positional and named arguments are checked against their matching
+  parameter's declared type; a named argument that names a parameter the
+  function doesn't have is also an error.
 - Positional and named arguments can be mixed; a named argument must
-  match a declared parameter name. **Named arguments are not
-  type-checked** (checked positionally only, for now — see
-  [Types](#types)).
+  match a declared parameter name.
 - A declared `: ReturnType` after the parameter list is checked against
-  what the function actually returns.
+  what the function actually returns; if omitted, the return type is
+  inferred from the body instead (see [Types](#types)) — never left
+  unresolved.
 - Functions declared with `fun` inside another function's body are
   closures over that enclosing scope, and can be recursive.
 
 ## Lambdas / closures
 
 ```kotlin
-val double = { x -> x * 2 }
-val add = { a, b -> a + b }
-val square = { it * it }          // implicit `it` — only when called with exactly one argument
+val double: (Int) -> Int = { x -> x * 2 }
+val add: (Int, Int) -> Int = { a, b -> a + b }
+val square: (Int) -> Int = { it * it }   // implicit `it` — only when called with exactly one argument
 
-fun apply(f, x: Int): Int = f(x)
+fun apply(f: (Int) -> Int, x: Int): Int = f(x)
 apply(square, 5)                   // 25
 ```
 
-A lambda captures the environment that was active where it was written
-(true lexical closures), not the caller's environment. There is no
-trailing-lambda call syntax (`list.map { ... }`) — lambdas are passed and
-invoked like any other value: `f(x)`.
+A lambda's parameter types (and the implicit `it`'s) are inferred from the
+function type its surrounding context expects — the enclosing `val`/`var`'s
+own annotation, as above, or the matching parameter's declared type at a
+call site (`apply({ x -> x * 2 }, 5)` needs no annotation on `double`
+itself, since `apply`'s first parameter already says `(Int) -> Int`). With
+no such context, an unannotated parameter's type can't be inferred and is
+an error (see [Types](#types)). A lambda captures the environment that was
+active where it was written (true lexical closures), not the caller's
+environment. There is no trailing-lambda call syntax (`list.map { ... }`)
+— lambdas are passed and invoked like any other value: `f(x)`.
 
 ## Imports
 

@@ -291,6 +291,84 @@ in the unit tests above, not this fixture, since it can only ever
 demonstrate scripts that succeed); `completion.rs`/`hover.rs`/
 `diagnostics.rs` tests for the type-aware filtering.
 
+### Phase 2.1/2.2 — Strict typing, function types, lambda inference (addendum)
+
+The section above describes Phase 2 as it originally shipped, built around
+one central rule: **`Type::Unknown` is always compatible, on either side**.
+Hands-on use immediately after showed that rule was too lenient for what a
+Kotlin-like language's users actually expect (a hint-less `var` not
+enforced on reassignment, a typo'd annotation silently accepted, a named
+`fun` parameter allowed with no type at all), so the design was
+deliberately reversed: **a value without an explicit or inferable type is
+now always an error**, not a silently-accepted `Unknown` — matching
+Kotlin's own strictness. Everything below supersedes the equivalent claims
+above; the rest of Phase 2's description (module layout, `Symbol` fields,
+LSP wiring) still holds.
+
+- **`Type::Function` is no longer a bare marker** — it's
+  `Function(Vec<Type>, Box<Type>)`, a real structural signature
+  (`(Int, String) -> Result`). `is_assignable`'s new `Function`/`Function`
+  arm compares element-wise (same arity, each parameter and the return
+  individually `is_assignable`) rather than by variant alone — except the
+  exact sentinel shape `Function(vec![], Unknown)`, reserved for a
+  `Value::Native`'s unknowable-at-runtime signature (see
+  `Type::from_value`), which is always compatible with any function type
+  since there's nothing real to check.
+- **New AST node** `TypeAnnotation { Named(String, Span), Function(Vec<TypeAnnotation>,
+  Box<TypeAnnotation>, Span) }` (`ast.rs`) replaces the old bare
+  `Option<String>` + `Option<Span>` pair on `Param`/`ValDecl`/`FunDecl`'s
+  return type. `parser.rs`'s `parse_type_annotation` implements
+  `TypeAnnotation ::= Ident | '(' (TypeAnnotation (',' TypeAnnotation)*)? ')' '->' TypeAnnotation`,
+  called only from type-annotation position (right after a `:`) so a
+  leading `(` there is unambiguous. `types::resolve_type_hint` (a plain
+  name) is joined by `types::resolve_type_annotation` (the full tree,
+  recursing into a function type's parameter/return annotations).
+- **"Type-committing sites" now error on `Unknown` instead of accepting
+  it**: a hint-less `val`/`var` whose initializer's type can't be inferred
+  either; a named `fun`'s parameters (**always** mandatory now, no
+  exception — `walk_params` in `resolver.rs`); a lambda parameter (or the
+  implicit `it`) with no explicit annotation *and* no expected function
+  type available from context (see below); an unannotated `fun`'s or
+  lambda's return type when nothing in the body could be reconciled to one
+  type (`ReturnTypeContext::Collect` + `reconcile_types`, shared machinery
+  for both).
+- **Immediate errors** (not deferred, regardless of context) were added
+  for: a binary/unary operator on two concretely-known incompatible types;
+  a method call on a concretely-known receiver type with no matching entry
+  in `stdlib::BUILTIN_METHOD_SIGNATURES`; a `.field` access on a real local
+  value; mismatched `if`/`when` branch types when every branch is a
+  primitive (`is_primitive` in `resolver.rs` — `Class`/`Generic`/`Unknown`
+  branches still join leniently, deferred to Phases 6/7's common-supertype
+  work); a named argument whose type doesn't match, or that names a
+  parameter that doesn't exist (`Symbol` gained `param_names: Vec<String>`
+  for this, matched by the same two-pass claim-named-then-positional
+  algorithm `call_function` already used at runtime).
+- **Lambda type inference** (`resolver.rs`'s `walk_lambda`/
+  `walk_lambda_params`): a lambda's own type is always a real
+  `Type::Function`, never left unresolved. Parameter types come from (in
+  order) an explicit annotation, else the "expected type" propagated in
+  from the lambda's use site — a `val`/`var`'s own function-type
+  annotation, or the matching parameter's declared type at a call site —
+  else an error. This needed a new `walk_expr_expected` (an `Option<&Type>`-
+  carrying sibling of `walk_expr`, used only at the exact expression
+  position a lambda might sit in — a `val`'s initializer, a call argument —
+  never threaded into recursive subexpression calls) so the `Call` arm
+  could resolve the callee's signature *before* walking its arguments,
+  instead of after. Return type inference reuses the same
+  `ReturnTypeContext::Collect`/`reconcile_types`/`always_returns` machinery
+  Phase 2.1 built for an unannotated `fun`'s return type.
+- **Breaking, by explicit product decision**: every named `fun` parameter
+  needs a real type now (no bare `fun apply(f, x: Int)`); a lambda needs
+  either an explicit parameter annotation or a real expected-type context
+  (no more bare `val double = { x -> x * 2 }` with nothing to infer `x`
+  from) — `tests/examples/closures.ksl` was rewritten to
+  `fun apply(f: (Int) -> Int, x: Int): Int = f(x)` /
+  `val double: (Int) -> Int = { x -> x * 2 }` accordingly.
+- **Still pending** (tracked, not part of this addendum): cross-file type
+  inference through `@file:Import`/`package` — a package-qualified call
+  (`util.math.square(5)`) still resolves to `Unknown` rather than a real
+  checked signature, same as originally shipped Phase 2.
+
 ---
 
 ## Phase 3 — Collection literals

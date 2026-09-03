@@ -129,19 +129,15 @@ impl<'a> Interpreter<'a> {
             }
             StmtKind::ValDecl {
                 name,
-                type_hint,
-                type_hint_span,
+                type_annotation,
                 mutable,
                 init,
                 ..
             } => {
                 let v = self.eval_expr(init, env)?;
-                let declared_type = match type_hint {
-                    Some(hint) => {
-                        check_type(hint, &v, type_hint_span.unwrap_or(stmt.span))?;
-                        crate::types::resolve_type_hint(hint, &[], &std::collections::HashSet::new())
-                    }
-                    // No hint — infer from the value itself, matching
+                let declared_type = match type_annotation {
+                    Some(ann) => check_type(ann, &v, ann.span())?,
+                    // No annotation — infer from the value itself, matching
                     // Kotlin: `var x = 5` infers `Int` just as surely as
                     // `var x: Int = 5` does, so `Env::assign` can enforce
                     // it on every later reassignment (see
@@ -454,8 +450,8 @@ impl<'a> Interpreter<'a> {
                 } else {
                     return Err(RuntimeError::new(format!("missing argument '{}'", p.name), span).into());
                 };
-                if let Some(hint) = &p.type_hint {
-                    check_type(hint, &v, span)?;
+                if let Some(ann) = &p.type_annotation {
+                    check_type(ann, &v, span)?;
                 }
                 call_env.define(&p.name, v, false, crate::types::Type::Unknown);
             }
@@ -469,8 +465,8 @@ impl<'a> Interpreter<'a> {
                 Err(e) => Err(e),
             },
         }?;
-        if let Some(hint) = &f.return_type {
-            check_type(hint, &result, span)?;
+        if let Some(ann) = &f.return_type {
+            check_type(ann, &result, span)?;
         }
         Ok(result)
     }
@@ -499,28 +495,39 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
     }
 }
 
-/// Checks a value against a raw type-hint string — a thin wrapper over
-/// `types::resolve_type_hint`/`Type::from_value`/`is_assignable` shared with
-/// the resolver's static checks (see `docs/roadmap.md`'s type-system
-/// phase). No generic-parameter/known-class context is threaded through
-/// here (both always empty today, same as the resolver's — see
-/// `types::resolve_type_hint`'s doc comment; once classes exist, the
+/// Checks a value against a source-level type annotation — a thin wrapper
+/// over `types::resolve_type_annotation`/`Type::from_value`/`is_assignable`
+/// shared with the resolver's static checks (see `docs/roadmap.md`'s
+/// type-system phase). No generic-parameter/known-class context is
+/// threaded through here (both always empty today, same as the resolver's
+/// — see `types::resolve_type_hint`'s doc comment; once classes exist, the
 /// interpreter will need its own live class-name lookup to pass through
 /// here instead of an always-empty set, so a real class name doesn't
-/// start being rejected as "unknown" at runtime).
+/// start being rejected as "unknown" at runtime). Returns the resolved
+/// `Type` on success, so a caller (e.g. `ValDecl`) that needs it for the
+/// binding's own declared type doesn't have to resolve the annotation a
+/// second time.
 ///
-/// `hint` not resolving to anything known is itself an error here — a
-/// typo or a reference to a type this interpreter doesn't have yet has no
-/// legitimate meaning, mirroring `resolver.rs`'s `resolve_type_hint_here`
-/// (this is no longer the old "unenforced, always accepted" whitelist).
-fn check_type(hint: &str, v: &Value, span: Span) -> Result<(), Flow> {
-    let expected = crate::types::resolve_type_hint(hint, &[], &std::collections::HashSet::new());
-    if expected == crate::types::Type::Unknown {
-        return Err(RuntimeError::new(format!("unknown type '{hint}'"), span).into());
+/// A bare name that doesn't resolve to anything known is itself an error
+/// here — a typo or a reference to a type this interpreter doesn't have
+/// yet has no legitimate meaning, mirroring `resolver.rs`'s
+/// `resolve_type_hint_here` (this is no longer the old "unenforced, always
+/// accepted" whitelist). A bad name *inside* a function-type annotation
+/// (`(Foo) -> Int`, `Foo` unresolvable) isn't separately flagged here —
+/// `is_assignable` already treats that slot as a wildcard `Unknown`, same
+/// leniency as everywhere else an inner type can't be pinned down; the
+/// resolver's own static check is the one that flags every bad name
+/// precisely (see `resolve_type_annotation_here`).
+fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span) -> Result<crate::types::Type, Flow> {
+    let expected = crate::types::resolve_type_annotation(annotation, &[], &std::collections::HashSet::new());
+    if let TypeAnnotation::Named(name, _) = annotation {
+        if expected == crate::types::Type::Unknown {
+            return Err(RuntimeError::new(format!("unknown type '{name}'"), span).into());
+        }
     }
     let actual = crate::types::Type::from_value(v);
     if crate::types::is_assignable(&actual, &expected) {
-        Ok(())
+        Ok(expected)
     } else {
         Err(RuntimeError::new(
             format!("type mismatch: expected {}, got {}", expected.name(), actual.name()),
@@ -892,5 +899,24 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
     fn check_type_error_wording_is_unchanged_by_the_refactor() {
         let err = run_err("val x: Double = 5");
         assert!(err.contains("type mismatch: expected Double, got Int"), "{err}");
+    }
+
+    #[test]
+    fn function_typed_val_accepts_a_matching_function_value() {
+        let src = "fun addOne(x: Int): Int { return x + 1 }\nval f: (Int) -> Int = addOne\nprintln(f(4))\n";
+        assert_eq!(run(src), "5\n");
+    }
+
+    #[test]
+    fn function_typed_val_rejects_a_wrongly_shaped_function_value() {
+        let src = "fun greet(x: String): String { return x }\nval f: (Int) -> Int = greet\n";
+        let err = run_err(src);
+        assert!(err.contains("type mismatch"), "{err}");
+    }
+
+    #[test]
+    fn function_typed_val_rejects_a_non_callable_value() {
+        let err = run_err("val f: (Int) -> Int = 5\n");
+        assert!(err.contains("type mismatch: expected (Int) -> Int, got Int"), "{err}");
     }
 }

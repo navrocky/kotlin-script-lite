@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::ast::TypeAnnotation;
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +32,11 @@ pub enum Type {
     String,
     Unit,
     List,
-    Function,
+    /// `(A, B) -> R` — parameter types in order, then the return type.
+    /// Structural, not nominal: two function types are compatible whenever
+    /// their shapes line up (see `is_assignable`), no named function-type
+    /// declaration exists to match by identity.
+    Function(Vec<Type>, Box<Type>),
     /// A named class/object type (nominal) — unconstructable until classes
     /// exist (no `class` declaration is parsed yet). Compared by exact name
     /// only for now; inheritance-aware subtype compatibility ("Dog is-a
@@ -53,24 +58,35 @@ pub enum Type {
 impl Type {
     /// Display name — matches `Value::type_name()`'s exact strings for the
     /// primitive variants, so error/hover text stays consistent with
-    /// existing runtime wording.
-    pub fn name(&self) -> &str {
+    /// existing runtime wording. Owned (not `&str`) since a `Function`
+    /// type's name is built from its parts, e.g. `(Int, String) -> Result`.
+    pub fn name(&self) -> String {
         match self {
-            Type::Int => "Int",
-            Type::Double => "Double",
-            Type::Bool => "Boolean",
-            Type::String => "String",
-            Type::Unit => "Unit",
-            Type::List => "List",
-            Type::Function => "Function",
-            Type::Class(name) | Type::Generic(name) => name,
-            Type::Unknown => "Unknown",
+            Type::Int => "Int".to_string(),
+            Type::Double => "Double".to_string(),
+            Type::Bool => "Boolean".to_string(),
+            Type::String => "String".to_string(),
+            Type::Unit => "Unit".to_string(),
+            Type::List => "List".to_string(),
+            Type::Function(params, ret) => {
+                let params = params.iter().map(Type::name).collect::<Vec<_>>().join(", ");
+                format!("({params}) -> {}", ret.name())
+            }
+            Type::Class(name) | Type::Generic(name) => name.to_string(),
+            Type::Unknown => "Unknown".to_string(),
         }
     }
 
-    /// The exact runtime type of an already-evaluated value. `Function` and
-    /// `Native` both collapse to `Type::Function`, matching
-    /// `Value::type_name()`'s existing collapse. No `Value` variant
+    /// The exact runtime type of an already-evaluated value. `Function`
+    /// reconstructs a best-effort signature from the value's own params/
+    /// return-type annotation (`Type::Unknown` for anything unannotated —
+    /// consistent with everywhere else an absent annotation means
+    /// "genuinely not statically known", not "any type"). `Native` has no
+    /// param list to draw from at all (see `value::NativeValue`) — its
+    /// signature is represented by the empty/`Unknown` sentinel shape
+    /// `Function(vec![], Unknown)`, which `is_assignable` treats as
+    /// compatible with any function type rather than checking arity against
+    /// it, since there's genuinely nothing to check. No `Value` variant
     /// produces `Class`/`Generic` today (there is no object system yet).
     pub fn from_value(v: &Value) -> Type {
         match v {
@@ -80,15 +96,33 @@ impl Type {
             Value::Str(_) => Type::String,
             Value::Unit => Type::Unit,
             Value::List(_) => Type::List,
-            Value::Function(_) | Value::Native(_) => Type::Function,
+            Value::Function(f) => {
+                let empty_params: Vec<String> = Vec::new();
+                let empty_classes: HashSet<Rc<str>> = HashSet::new();
+                let param_types = f
+                    .params
+                    .iter()
+                    .map(|p| match &p.type_annotation {
+                        Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
+                        None => Type::Unknown,
+                    })
+                    .collect();
+                let ret_ty = match &f.return_type {
+                    Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
+                    None => Type::Unknown,
+                };
+                Type::Function(param_types, Box::new(ret_ty))
+            }
+            Value::Native(_) => Type::Function(Vec::new(), Box::new(Type::Unknown)),
         }
     }
 }
 
-/// Resolves a raw type-hint string (`Param.type_hint`/`ValDecl.type_hint`/a
-/// function's return-type annotation) to a `Type`, given the generic
-/// parameter names in scope (from an enclosing declaration's own `<T, ...>`
-/// list) and the set of class names known so far.
+/// Resolves a raw type-hint name (`Param.type_annotation`/`ValDecl.type_annotation`/a
+/// function's return-type annotation, in its `TypeAnnotation::Named` form)
+/// to a `Type`, given the generic parameter names in scope (from an
+/// enclosing declaration's own `<T, ...>` list) and the set of class names
+/// known so far.
 ///
 /// Both context arguments are always empty today — no declaration has a
 /// `type_params` list yet, and no `class` declaration is parsed yet — they
@@ -107,7 +141,7 @@ impl Type {
 /// completion when the cursor sits in type-annotation position.
 pub const PRIMITIVE_TYPE_NAMES: &[&str] = &["Int", "Double", "Boolean", "String", "Unit", "List"];
 
-pub fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
+fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
     match hint {
         "Int" => Type::Int,
         "Double" => Type::Double,
@@ -121,19 +155,56 @@ pub fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &
     }
 }
 
+/// Resolves a full `TypeAnnotation` tree (a plain name, or a function type
+/// like `(Int, String) -> Result`) to a `Type`, recursing into a function
+/// type's parameter/return annotations. An unresolvable name anywhere in
+/// the tree resolves to `Type::Unknown` at that position only — it doesn't
+/// collapse the whole annotation to `Unknown` (a caller wanting to flag
+/// each bad name individually, like the resolver's own diagnostics, walks
+/// the `TypeAnnotation` tree itself; see `resolver.rs`'s
+/// `resolve_type_annotation_here`).
+pub fn resolve_type_annotation(
+    ann: &TypeAnnotation,
+    generic_params: &[String],
+    known_classes: &HashSet<Rc<str>>,
+) -> Type {
+    match ann {
+        TypeAnnotation::Named(name, _) => resolve_type_hint(name, generic_params, known_classes),
+        TypeAnnotation::Function(params, ret, _) => {
+            let param_types =
+                params.iter().map(|p| resolve_type_annotation(p, generic_params, known_classes)).collect();
+            let ret_ty = resolve_type_annotation(ret, generic_params, known_classes);
+            Type::Function(param_types, Box::new(ret_ty))
+        }
+    }
+}
+
 /// Whether a value of type `from` can be used where `to` is expected.
 /// `Unknown` or `Generic` on **either** side is always compatible (the
 /// named escape hatch — see the module doc comment); `Class` compares by
-/// exact name only (no subtyping yet); everything else requires exact
-/// equality. No numeric widening — `Int`/`Double` mixing is an arithmetic
-/// result-type rule (see `resolver.rs`'s `infer_type`), not an assignment
-/// rule (matches verified current behavior: `val x: Double = 5` is already
-/// a type-mismatch error today).
+/// exact name only (no subtyping yet); `Function` compares structurally,
+/// element-wise (no variance — matching the approved plan's "exact
+/// equality in v1"), except for the `Value::Native` sentinel shape (empty
+/// params, `Unknown` return — see `Type::from_value`), which has nothing
+/// real to check against and so is always compatible; everything else
+/// requires exact equality. No numeric widening — `Int`/`Double` mixing is
+/// an arithmetic result-type rule (see `resolver.rs`'s `infer_type`), not
+/// an assignment rule (matches verified current behavior: `val x: Double =
+/// 5` is already a type-mismatch error today).
 pub fn is_assignable(from: &Type, to: &Type) -> bool {
     match (from, to) {
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Generic(_), _) | (_, Type::Generic(_)) => true,
         (Type::Class(a), Type::Class(b)) => a == b,
+        (Type::Function(fp, fr), Type::Function(tp, tr)) => {
+            if fp.is_empty() && **fr == Type::Unknown {
+                true
+            } else {
+                fp.len() == tp.len()
+                    && fp.iter().zip(tp.iter()).all(|(a, b)| is_assignable(a, b))
+                    && is_assignable(fr, tr)
+            }
+        }
         (a, b) => a == b,
     }
 }
@@ -235,5 +306,94 @@ mod tests {
         let animal: Rc<str> = "Animal".into();
         assert!(is_assignable(&Type::Class(dog.clone()), &Type::Class(dog)));
         assert!(!is_assignable(&Type::Class("Dog".into()), &Type::Class(animal)));
+    }
+
+    #[test]
+    fn function_type_name_renders_like_kotlin() {
+        let f = Type::Function(vec![Type::Int, Type::String], Box::new(Type::Bool));
+        assert_eq!(f.name(), "(Int, String) -> Boolean");
+        let no_params = Type::Function(Vec::new(), Box::new(Type::Unit));
+        assert_eq!(no_params.name(), "() -> Unit");
+    }
+
+    #[test]
+    fn is_assignable_function_types_structural_same_shape() {
+        let a = Type::Function(vec![Type::Int], Box::new(Type::Int));
+        let b = Type::Function(vec![Type::Int], Box::new(Type::Int));
+        assert!(is_assignable(&a, &b));
+    }
+
+    #[test]
+    fn is_assignable_function_types_reject_arity_mismatch() {
+        let one_param = Type::Function(vec![Type::Int], Box::new(Type::Int));
+        let two_params = Type::Function(vec![Type::Int, Type::Int], Box::new(Type::Int));
+        assert!(!is_assignable(&one_param, &two_params));
+    }
+
+    #[test]
+    fn is_assignable_function_types_reject_param_or_return_mismatch() {
+        let int_to_int = Type::Function(vec![Type::Int], Box::new(Type::Int));
+        let string_to_int = Type::Function(vec![Type::String], Box::new(Type::Int));
+        let int_to_string = Type::Function(vec![Type::Int], Box::new(Type::String));
+        assert!(!is_assignable(&int_to_int, &string_to_int));
+        assert!(!is_assignable(&int_to_int, &int_to_string));
+    }
+
+    #[test]
+    fn is_assignable_function_types_unknown_slot_is_a_wildcard() {
+        // A lambda param inferred from context, or a return type that
+        // couldn't be pinned down, is `Unknown` at that slot only — still
+        // compatible element-wise, same as `Unknown` everywhere else.
+        let partially_known = Type::Function(vec![Type::Unknown], Box::new(Type::Int));
+        let fully_known = Type::Function(vec![Type::Int], Box::new(Type::Int));
+        assert!(is_assignable(&partially_known, &fully_known));
+    }
+
+    #[test]
+    fn is_assignable_native_sentinel_matches_any_function_type() {
+        // `Type::from_value(&Value::Native(_))`'s exact shape (empty params,
+        // `Unknown` return) — nothing to check structurally, so it's always
+        // compatible with any declared function type, unlike a real
+        // zero-param function (which would have a concrete, non-`Unknown`
+        // return type).
+        let native_sentinel = Type::Function(Vec::new(), Box::new(Type::Unknown));
+        let declared = Type::Function(vec![Type::Int, Type::String], Box::new(Type::Bool));
+        assert!(is_assignable(&native_sentinel, &declared));
+    }
+
+    #[test]
+    fn resolve_type_annotation_named_resolves_like_resolve_type_hint() {
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        let ann = TypeAnnotation::Named("Int".to_string(), crate::error::Span::default());
+        assert_eq!(resolve_type_annotation(&ann, &empty_params, &empty_classes), Type::Int);
+    }
+
+    #[test]
+    fn resolve_type_annotation_function_resolves_structurally() {
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        let span = crate::error::Span::default();
+        let ann = TypeAnnotation::Function(
+            vec![TypeAnnotation::Named("Int".to_string(), span), TypeAnnotation::Named("String".to_string(), span)],
+            Box::new(TypeAnnotation::Named("Boolean".to_string(), span)),
+            span,
+        );
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        assert_eq!(resolved, Type::Function(vec![Type::Int, Type::String], Box::new(Type::Bool)));
+    }
+
+    #[test]
+    fn resolve_type_annotation_unresolvable_name_is_unknown_only_at_its_own_position() {
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        let span = crate::error::Span::default();
+        let ann = TypeAnnotation::Function(
+            vec![TypeAnnotation::Named("Frobnicator".to_string(), span)],
+            Box::new(TypeAnnotation::Named("Int".to_string(), span)),
+            span,
+        );
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        assert_eq!(resolved, Type::Function(vec![Type::Unknown], Box::new(Type::Int)));
     }
 }

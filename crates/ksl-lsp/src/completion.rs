@@ -37,6 +37,14 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
 
+    if let Some(ctx) = file_import_context(&up_to_cursor) {
+        return match ctx {
+            FileImportContext::AtHead => file_head_completion(),
+            FileImportContext::AfterFileColon => import_keyword_completion(),
+            FileImportContext::InsidePath(partial) => file_path_completions(&analysis.own_file, &partial),
+        };
+    }
+
     if type_position_before_cursor(&up_to_cursor) {
         return ksl_core::types::PRIMITIVE_TYPE_NAMES
             .iter()
@@ -140,6 +148,20 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         });
     }
 
+    // Top-level names of a package-less `@file:Import`ed file — flattened
+    // into this file's own global scope at runtime (see
+    // `package_index::PackageIndex::flat_member`'s doc comment), so they're
+    // offered right alongside this file's own locals, not under any
+    // package-qualified prefix.
+    for member in analysis.packages.flat_members() {
+        items.push(CompletionItem {
+            label: member.symbol.name.clone(),
+            kind: Some(symbol_completion_kind(member.symbol.kind)),
+            detail: Some(member.symbol.signature.clone()),
+            ..Default::default()
+        });
+    }
+
     for kw in KEYWORDS {
         items.push(CompletionItem {
             label: kw.to_string(),
@@ -193,21 +215,56 @@ fn dotted_prefix_before_cursor(text_before_cursor: &str) -> (Vec<String>, String
 }
 
 /// Whether the cursor sits in type-annotation position: right after a `:`
-/// (optionally with whitespace and a partially-typed name already in
-/// between, e.g. `val x: I` mid-typing `Int`). Every `:` in the grammar
-/// introduces a type — `val`/`var`/parameter annotations and `fun` return
-/// types, `parser.rs`'s only three `Colon` call sites — so this plain
-/// suffix check is unambiguous, unlike method-receiver detection.
+/// or `->`, or anywhere inside the (possibly nested) type that follows one
+/// — including inside a function type's own `(...)` parameter list, e.g.
+/// `val f: (I` or `val f: (Int) -> I`. Scans the whole line up to the
+/// cursor (every `:` in the grammar introduces a type — `val`/`var`/
+/// parameter annotations and `fun` return types, `parser.rs`'s only three
+/// `Colon` call sites — so hitting one anywhere is unambiguous), tracking
+/// a single `in_type` flag plus a stack recording, for each currently-open
+/// `(`, whether it's a function type's own parameter list (`TypeList` —
+/// entered while already in type position, so its contents start in type
+/// position too, and a `,` inside it stays in type position for the next
+/// parameter) or an ordinary call/`fun`-decl parameter list (`NameList` —
+/// entered *not* in type position, so its contents start out awaiting a
+/// name/argument, and a `,` inside it goes back to that, not to type
+/// position). The `NameList` case is why `fun f(a: Int, b` correctly does
+/// *not* offer type completions while typing `b`'s name, even though an
+/// earlier `:` already appeared on the same line — without tracking which
+/// kind of list we're in, that earlier `:` alone would be indistinguishable
+/// from actually still being inside `a`'s own type. No special handling is
+/// needed for `->` itself: it's inert to this state machine, so `in_type`
+/// simply stays whatever it already was on either side of it, which is
+/// exactly right (a function type continues being "type position" straight
+/// through its own arrow).
 fn type_position_before_cursor(text_before_cursor: &str) -> bool {
-    let mut start = text_before_cursor.len();
-    for (i, c) in text_before_cursor.char_indices().rev() {
-        if c.is_alphanumeric() || c == '_' {
-            start = i;
-        } else {
-            break;
+    #[derive(Clone, Copy)]
+    enum ParenKind {
+        /// A function type's own parameter list — bare types only, no
+        /// names (`(Int, String) -> Result`).
+        TypeList,
+        /// An ordinary call's arguments or a `fun`-decl's own parameter
+        /// list — `name: Type` pairs, or bare argument expressions.
+        NameList,
+    }
+
+    let mut in_type = false;
+    let mut stack: Vec<ParenKind> = Vec::new();
+    for c in text_before_cursor.chars() {
+        match c {
+            ':' => in_type = true,
+            '=' | '{' => in_type = false,
+            ',' => in_type = matches!(stack.last(), Some(ParenKind::TypeList)),
+            '(' => {
+                let kind = if in_type { ParenKind::TypeList } else { ParenKind::NameList };
+                stack.push(kind);
+                in_type = matches!(kind, ParenKind::TypeList);
+            }
+            ')' => in_type = matches!(stack.pop(), Some(ParenKind::TypeList)),
+            _ => {}
         }
     }
-    text_before_cursor[..start].trim_end().ends_with(':')
+    in_type
 }
 
 /// `true` for a non-empty run of ASCII digits — used to recognize a
@@ -225,6 +282,121 @@ fn symbol_completion_kind(kind: SymbolKind) -> CompletionItemKind {
         SymbolKind::Val | SymbolKind::Var | SymbolKind::Param => CompletionItemKind::VARIABLE,
         SymbolKind::Fun => CompletionItemKind::FUNCTION,
     }
+}
+
+/// Where the cursor sits within an in-progress `@file:Import("...")` —
+/// doesn't exist as an AST node while mid-typed (same reason
+/// `dotted_prefix_before_cursor` operates on raw text: an incomplete
+/// `@file:Import("` fails to parse at all), so this is a raw-text
+/// recognizer, same approach as `type_position_before_cursor`.
+enum FileImportContext {
+    /// Right after `@` plus a partial prefix of `file` — e.g. `@f`, `@fil`.
+    AtHead,
+    /// Right after `@file:` plus a partial prefix of `Import` — e.g.
+    /// `@file:Im`.
+    AfterFileColon,
+    /// Inside the path string's quotes, not yet closed — the partial path
+    /// text typed so far (e.g. `"` -> `""`, `"imp` -> `"imp"`).
+    InsidePath(String),
+}
+
+/// Recognizes the three `@file:Import("...")` positions above by looking
+/// for the *longest* (most specific) matching suffix first — checking
+/// `InsidePath` before `AfterFileColon` before `AtHead` matters because
+/// each shorter pattern is also a substring of the longer ones (`@file:`
+/// appears inside `@file:Import("`, and `@` inside `@file:`), so checking
+/// in the other order would misfire on the shorter pattern before ever
+/// reaching the real, more specific position.
+fn file_import_context(up_to_cursor: &str) -> Option<FileImportContext> {
+    if let Some(idx) = up_to_cursor.rfind("@file:Import(\"") {
+        let after = &up_to_cursor[idx + "@file:Import(\"".len()..];
+        if !after.contains('"') {
+            return Some(FileImportContext::InsidePath(after.to_string()));
+        }
+    }
+    if let Some(idx) = up_to_cursor.rfind("@file:") {
+        let after = &up_to_cursor[idx + "@file:".len()..];
+        // Empty `after` (cursor right on the `:`, nothing typed yet) must
+        // still match — `"".chars().all(...)` is vacuously `true`, so no
+        // separate `is_empty` guard is needed; the `@` branch below already
+        // relies on the same vacuous-true behavior for its own empty case,
+        // this just needed to match it.
+        if after.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Some(FileImportContext::AfterFileColon);
+        }
+    }
+    if let Some(idx) = up_to_cursor.rfind('@') {
+        let after = &up_to_cursor[idx + 1..];
+        if after.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Some(FileImportContext::AtHead);
+        }
+    }
+    None
+}
+
+fn file_head_completion() -> Vec<CompletionItem> {
+    vec![CompletionItem {
+        label: "file".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        ..Default::default()
+    }]
+}
+
+fn import_keyword_completion() -> Vec<CompletionItem> {
+    vec![CompletionItem {
+        label: "Import".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        documentation: Some(Documentation::String(
+            "the only supported `@file:` annotation".to_string(),
+        )),
+        ..Default::default()
+    }]
+}
+
+/// File/directory completions for the partial path typed so far inside an
+/// `@file:Import("...")` string, resolved the same way a real import path
+/// is (`ksl_core::importer::resolve_path`, relative to `own_file`'s own
+/// directory). Lists the directory implied by everything up to the last
+/// `/` in `partial` (or `own_file`'s own directory, if there is no `/`
+/// yet) — every entry in it, not just ones matching what's typed after
+/// that: like every other completion source in this file, filtering
+/// against the in-progress prefix is left to the editor/client, not done
+/// here (see this module's own doc comment). A directory entry's label
+/// carries a trailing `/` (so accepting it and continuing to type
+/// naturally descends further); only `.ksl` files are offered (the only
+/// files `@file:Import` can legally name), but every subdirectory is,
+/// hidden ones (dotfiles) aside.
+fn file_path_completions(own_file: &std::path::Path, partial: &str) -> Vec<CompletionItem> {
+    let base_dir = own_file.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir_part = match partial.rfind('/') {
+        Some(idx) => &partial[..idx],
+        None => "",
+    };
+    let dir = ksl_core::importer::resolve_path(base_dir, dir_part);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+
+    let mut items = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            items.push(CompletionItem {
+                label: format!("{name}/"),
+                kind: Some(CompletionItemKind::FOLDER),
+                ..Default::default()
+            });
+        } else if name.ends_with(".ksl") {
+            items.push(CompletionItem {
+                label: name,
+                kind: Some(CompletionItemKind::FILE),
+                ..Default::default()
+            });
+        }
+    }
+    items
 }
 
 #[cfg(test)]
@@ -322,6 +494,99 @@ mod tests {
     }
 
     #[test]
+    fn completion_after_at_offers_file_keyword() {
+        // `@f` alone doesn't parse, so `completion()` is called directly
+        // against a separate, validly-parsed `Analysis` — the `AtHead`
+        // branch never touches `analysis.resolved` anyway (see
+        // `file_import_context`'s doc comment).
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let names: Vec<String> = completion(&a, "@f\n", Position::new(0, 2)).into_iter().map(|i| i.label).collect();
+        assert_eq!(names, vec!["file".to_string()]);
+    }
+
+    #[test]
+    fn completion_after_file_colon_offers_import_keyword() {
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let names: Vec<String> =
+            completion(&a, "@file:Im\n", Position::new(0, 8)).into_iter().map(|i| i.label).collect();
+        assert_eq!(names, vec!["Import".to_string()]);
+    }
+
+    #[test]
+    fn completion_right_after_file_colon_with_nothing_typed_yet_offers_import_keyword() {
+        // The exact reported bug: right after typing `@file:`, before any
+        // letter of "Import" — must still offer it, not just once a prefix
+        // of "Import" has already been typed.
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let names: Vec<String> =
+            completion(&a, "@file:\n", Position::new(0, 6)).into_iter().map(|i| i.label).collect();
+        assert_eq!(names, vec!["Import".to_string()]);
+    }
+
+    #[test]
+    fn completion_inside_the_import_path_string_offers_files_and_directories() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_completion_import_path_{n}_{}", std::process::id()));
+        fs::create_dir_all(dir.join("helpers")).unwrap();
+        fs::write(dir.join("greeter.ksl"), "fun greet(): String = \"hi\"\n").unwrap();
+        fs::write(dir.join("notes.txt"), "not a script").unwrap();
+        let main_path = dir.join("main.ksl");
+        // A complete, valid file on disk (so `analyze` has a real tree to
+        // work with) — `completion()`'s own `text` argument below is a
+        // separate, mid-typed line; only `analysis.own_file` (the path,
+        // not its contents) matters to this particular completion branch.
+        fs::write(&main_path, "@file:Import(\"x.ksl\")\nprintln(1)\n").unwrap();
+        let a = analysis::analyze("@file:Import(\"x.ksl\")\nprintln(1)\n", None, &main_path).expect("should parse");
+
+        let mid_typing = "@file:Import(\"\n";
+        let items = completion(&a, mid_typing, Position::new(0, 14)); // right after the opening quote
+        let names: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
+        assert!(names.contains(&"greeter.ksl".to_string()), "{names:?}");
+        assert!(names.contains(&"helpers/".to_string()), "{names:?}");
+        assert!(!names.contains(&"notes.txt".to_string()), "{names:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_import_context_recognizes_all_three_positions() {
+        assert!(matches!(file_import_context("@f"), Some(FileImportContext::AtHead)));
+        assert!(matches!(file_import_context("@"), Some(FileImportContext::AtHead)));
+        // Right on the colon, nothing typed yet -- must still offer
+        // "Import" (this was the reported bug: an `is_empty` guard here
+        // meant `@file:` alone matched neither position).
+        assert!(matches!(file_import_context("@file:"), Some(FileImportContext::AfterFileColon)));
+        assert!(matches!(file_import_context("@file:Im"), Some(FileImportContext::AfterFileColon)));
+        assert!(matches!(file_import_context("@file:Import(\"a/b"), Some(FileImportContext::InsidePath(p)) if p == "a/b"));
+        // Already closed -- neither position applies anymore.
+        assert!(file_import_context("@file:Import(\"a.ksl\")").is_none());
+        assert!(file_import_context("println(").is_none());
+    }
+
+    #[test]
+    fn completion_offers_a_flat_cross_file_imports_top_level_names() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_completion_flat_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("greeter.ksl"), "fun greet(name: String): String {\n    return name\n}\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"greeter.ksl\")\nprintln(greet(\"World\"))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        let names = completion(&a, text, Position::new(1, 8)).into_iter().map(|i| i.label).collect::<Vec<_>>();
+        assert!(names.contains(&"greet".to_string()), "{names:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dotted_prefix_before_cursor_returns_a_numeric_prefix_as_is() {
         // Not rejected/emptied out (see the function's doc comment) — a
         // numeric segment is returned like any other, so `completion()`
@@ -363,6 +628,61 @@ mod tests {
         assert!(!type_position_before_cursor("val x = "));
         assert!(!type_position_before_cursor("println("));
         assert!(!type_position_before_cursor(""));
+    }
+
+    #[test]
+    fn type_position_before_cursor_inside_a_function_types_own_parens() {
+        assert!(type_position_before_cursor("val f: ("));
+        assert!(type_position_before_cursor("val f: (I"));
+    }
+
+    #[test]
+    fn type_position_before_cursor_after_a_function_types_comma() {
+        // A second parameter inside a function type's own list is still a
+        // type (`(Int, String) -> ...`), unlike a `fun`-decl's own comma.
+        assert!(type_position_before_cursor("val f: (Int, "));
+    }
+
+    #[test]
+    fn type_position_before_cursor_after_the_arrow() {
+        assert!(type_position_before_cursor("val f: (Int) -> "));
+        assert!(type_position_before_cursor("val f: (Int) -> I"));
+    }
+
+    #[test]
+    fn type_position_before_cursor_handles_nested_function_types() {
+        assert!(type_position_before_cursor("val f: ((Int) -> Int) -> "));
+        assert!(type_position_before_cursor("val f: ((I"));
+    }
+
+    #[test]
+    fn type_position_before_cursor_rejects_a_subsequent_params_name() {
+        // The bug a naive "any `:` on this line" check would have: typing
+        // `b`'s *name* right after `a`'s type must not offer type
+        // completions just because an earlier `:` appeared on the line.
+        assert!(!type_position_before_cursor("fun f(a: Int, b"));
+        // But `b`'s own type position, right after, is correctly detected.
+        assert!(type_position_before_cursor("fun f(a: Int, b: I"));
+    }
+
+    #[test]
+    fn type_position_before_cursor_rejects_inside_a_default_values_call() {
+        assert!(!type_position_before_cursor("fun f(a: Int = compute("));
+    }
+
+    #[test]
+    fn completion_inside_a_function_types_parens_offers_primitive_type_names() {
+        let text = "val f: (Int) -> Int = { x -> x + 1 }\n";
+        let names = labels(text, Position::new(0, 8)); // right after "val f: ("
+        assert!(names.contains(&"Int".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_the_arrow_offers_primitive_type_names() {
+        let text = "val f: (Int) -> Int = { x -> x + 1 }\n";
+        let names = labels(text, Position::new(0, 16)); // right after "val f: (Int) -> "
+        assert!(names.contains(&"Int".to_string()), "{names:?}");
+        assert!(!names.contains(&"fun".to_string()), "{names:?}");
     }
 
     #[test]
