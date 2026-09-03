@@ -4,6 +4,7 @@ use std::rc::Rc;
 use crate::environment::Env;
 use crate::error::{Flow, RuntimeError, Span};
 use crate::interpreter::Interpreter;
+use crate::types::Type;
 use crate::value::{NativeValue, Value};
 
 /// `(name, signature, one-line doc)` for every built-in registered by
@@ -112,6 +113,7 @@ fn register(
             func: Box::new(f),
         })),
         false,
+        Type::Unknown,
     );
 }
 
@@ -182,19 +184,36 @@ fn str_trim(s: &str) -> Value {
     Value::str(s.trim().to_string())
 }
 
-/// `(method name, signature, one-line doc)` for every builtin method
-/// `call_builtin_method` dispatches on — the `.`-syntax counterpart of
-/// `STDLIB_SIGNATURES`, used the same way for hover/completion in
-/// `ksl-lsp`. Every entry here is currently also reachable as a plain
-/// stdlib function (`"x".length()` and `length("x")` both work) — see
-/// `call_builtin_method`, which reuses the same `str_*` helpers as
-/// `populate_globals`'s registrations.
-pub const BUILTIN_METHOD_SIGNATURES: &[(&str, &str, &str)] = &[
-    ("length", "String.length(): Int", "Number of characters in the receiver."),
-    ("uppercase", "String.uppercase(): String", "Uppercases the receiver."),
-    ("lowercase", "String.lowercase(): String", "Lowercases the receiver."),
-    ("trim", "String.trim(): String", "Removes leading and trailing whitespace from the receiver."),
+/// `(receiver type, method name, signature, one-line doc)` for every
+/// builtin method `call_builtin_method` dispatches on — the `.`-syntax
+/// counterpart of `STDLIB_SIGNATURES`, used the same way for hover/
+/// completion in `ksl-lsp` (now filtered by receiver type — see
+/// `ksl-lsp`'s `completion.rs`/`hover.rs`). Every entry here is currently
+/// also reachable as a plain stdlib function (`"x".length()` and
+/// `length("x")` both work) — see `call_builtin_method`, which reuses the
+/// same `str_*` helpers as `populate_globals`'s registrations.
+pub const BUILTIN_METHOD_SIGNATURES: &[(&str, &str, &str, &str)] = &[
+    ("String", "length", "String.length(): Int", "Number of characters in the receiver."),
+    ("String", "uppercase", "String.uppercase(): String", "Uppercases the receiver."),
+    ("String", "lowercase", "String.lowercase(): String", "Lowercases the receiver."),
+    ("String", "trim", "String.trim(): String", "Removes leading and trailing whitespace from the receiver."),
 ];
+
+/// The static return type of a builtin `.`-method call, given its
+/// receiver's own statically known type — used by `resolver.rs`'s
+/// `walk_expr` (`MethodCall` inference) to type-check chained/nested
+/// method calls and their results. Hand-maintained separately from
+/// `BUILTIN_METHOD_SIGNATURES` (whose `signature` field is a free-text
+/// display string, not machine-readable); `(type, method)` pairs not
+/// listed here resolve to `Type::Unknown`, same as an unrecognized name
+/// anywhere else in this type system.
+pub fn builtin_method_return_type(receiver_type: &str, method: &str) -> Type {
+    match (receiver_type, method) {
+        ("String", "length") => Type::Int,
+        ("String", "uppercase" | "lowercase" | "trim") => Type::String,
+        _ => Type::Unknown,
+    }
+}
 
 /// Dispatches a `.`-call (`receiver.method(args)`) once `receiver` has
 /// already evaluated to a real value — the counterpart of `parse_postfix`
@@ -284,10 +303,24 @@ mod tests {
     /// `stdlib_signatures_match_populate_globals` for the `.`-method table.
     #[test]
     fn builtin_method_signatures_are_all_dispatchable_on_a_string() {
-        for (name, _, _) in BUILTIN_METHOD_SIGNATURES {
+        for (receiver_type, name, _, _) in BUILTIN_METHOD_SIGNATURES {
+            assert_eq!(*receiver_type, "String", "add a receiver-type-appropriate dispatch below if this changes");
             let result = call_builtin_method(Value::str("x"), name, vec![], Span::default());
             assert!(result.is_ok(), "'{name}' listed in BUILTIN_METHOD_SIGNATURES but not dispatchable: {:?}", result.err().map(|_| ()));
         }
+    }
+
+    #[test]
+    fn builtin_method_return_type_matches_signatures() {
+        for (receiver_type, name, _, _) in BUILTIN_METHOD_SIGNATURES {
+            assert_ne!(
+                builtin_method_return_type(receiver_type, name),
+                Type::Unknown,
+                "'{name}' listed in BUILTIN_METHOD_SIGNATURES but builtin_method_return_type doesn't know it"
+            );
+        }
+        assert_eq!(builtin_method_return_type("Int", "length"), Type::Unknown);
+        assert_eq!(builtin_method_return_type("String", "shout"), Type::Unknown);
     }
 
     #[test]

@@ -135,10 +135,14 @@ impl<'a> Interpreter<'a> {
                 ..
             } => {
                 let v = self.eval_expr(init, env)?;
-                if let Some(hint) = type_hint {
-                    check_type(hint, &v, stmt.span)?;
-                }
-                env.define(name, v, *mutable);
+                let declared_type = match type_hint {
+                    Some(hint) => {
+                        check_type(hint, &v, stmt.span)?;
+                        crate::types::resolve_type_hint(hint, &[], &std::collections::HashSet::new())
+                    }
+                    None => crate::types::Type::Unknown,
+                };
+                env.define(name, v, *mutable, declared_type);
                 Ok(())
             }
             StmtKind::Assign { name, op, value } => {
@@ -166,16 +170,22 @@ impl<'a> Interpreter<'a> {
                     AssignError::NotMutable => {
                         RuntimeError::new(format!("cannot reassign val '{name}'"), stmt.span).into()
                     }
+                    AssignError::TypeMismatch(actual, expected) => RuntimeError::new(
+                        format!("type mismatch: expected {}, got {}", expected.name(), actual.name()),
+                        stmt.span,
+                    )
+                    .into(),
                 })
             }
-            StmtKind::FunDecl { name, params, body, .. } => {
+            StmtKind::FunDecl { name, params, return_type, body, .. } => {
                 let f = Value::Function(Rc::new(FunctionValue {
                     name: Some(name.clone()),
                     params: params.clone(),
+                    return_type: return_type.clone(),
                     body: body.clone(),
                     closure: env.clone(),
                 }));
-                env.define(name, f, false);
+                env.define(name, f, false, crate::types::Type::Unknown);
                 Ok(())
             }
             StmtKind::While { cond, body } => {
@@ -200,7 +210,7 @@ impl<'a> Interpreter<'a> {
                 let items = iterate(it, stmt.span)?;
                 for item in items {
                     let loop_env = env.child();
-                    loop_env.define(var_name, item, false);
+                    loop_env.define(var_name, item, false, crate::types::Type::Unknown);
                     match self.exec_block(body, &loop_env) {
                         Ok(_) => {}
                         Err(Flow::Break) => break,
@@ -327,6 +337,7 @@ impl<'a> Interpreter<'a> {
             ExprKind::Lambda { params, body } => Ok(Value::Function(Rc::new(FunctionValue {
                 name: None,
                 params: params.clone(),
+                return_type: None,
                 body: FunBody::Block(body.clone()),
                 closure: env.clone(),
             }))),
@@ -400,7 +411,7 @@ impl<'a> Interpreter<'a> {
         // Implicit `it` parameter: a lambda declared with no explicit
         // parameter list, called with exactly one argument.
         if f.params.is_empty() && f.name.is_none() && args.len() == 1 {
-            call_env.define("it", args.into_iter().next().unwrap().1, false);
+            call_env.define("it", args.into_iter().next().unwrap().1, false, crate::types::Type::Unknown);
         } else {
             if args.len() > f.params.len() {
                 return Err(RuntimeError::new(
@@ -437,18 +448,25 @@ impl<'a> Interpreter<'a> {
                 } else {
                     return Err(RuntimeError::new(format!("missing argument '{}'", p.name), span).into());
                 };
-                call_env.define(&p.name, v, false);
+                if let Some(hint) = &p.type_hint {
+                    check_type(hint, &v, span)?;
+                }
+                call_env.define(&p.name, v, false, crate::types::Type::Unknown);
             }
         }
 
-        match &f.body {
+        let result = match &f.body {
             FunBody::Expr(e) => self.eval_expr(e, &call_env),
             FunBody::Block(stmts) => match self.exec_block(stmts, &call_env) {
                 Ok(v) => Ok(v),
                 Err(Flow::Return(v)) => Ok(v),
                 Err(e) => Err(e),
             },
+        }?;
+        if let Some(hint) = &f.return_type {
+            check_type(hint, &result, span)?;
         }
+        Ok(result)
     }
 }
 
@@ -475,20 +493,22 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
     }
 }
 
+/// Checks a value against a raw type-hint string — a thin wrapper over
+/// `types::resolve_type_hint`/`Type::from_value`/`is_assignable` shared with
+/// the resolver's static checks (see `docs/roadmap.md`'s type-system
+/// phase). No generic-parameter/known-class context is threaded through
+/// here (both always empty today, same as the resolver's — see
+/// `types::resolve_type_hint`'s doc comment), so this behaves exactly like
+/// the old hardcoded 5-entry whitelist it replaces: an unrecognized hint
+/// resolves to `Type::Unknown`, which `is_assignable` never rejects.
 fn check_type(hint: &str, v: &Value, span: Span) -> Result<(), Flow> {
-    let ok = match hint {
-        "Int" => matches!(v, Value::Int(_)),
-        "Double" => matches!(v, Value::Double(_)),
-        "Boolean" => matches!(v, Value::Bool(_)),
-        "String" => matches!(v, Value::Str(_)),
-        "Unit" => matches!(v, Value::Unit),
-        _ => true, // unknown/unsupported type annotations are not enforced in the MVP
-    };
-    if ok {
+    let expected = crate::types::resolve_type_hint(hint, &[], &std::collections::HashSet::new());
+    let actual = crate::types::Type::from_value(v);
+    if crate::types::is_assignable(&actual, &expected) {
         Ok(())
     } else {
         Err(RuntimeError::new(
-            format!("type mismatch: expected {hint}, got {}", v.type_name()),
+            format!("type mismatch: expected {}, got {}", expected.name(), actual.name()),
             span,
         )
         .into())
@@ -796,5 +816,48 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
         let err = run_err("\"hi\".length(1)");
         assert!(err.contains("length expects 0 argument(s), got 1"), "{err}");
         assert!(!err.contains("at 0:0"), "{err}");
+    }
+
+    // ---- runtime type enforcement ----
+
+    #[test]
+    fn call_function_rejects_a_wrongly_typed_argument() {
+        let err = run_err("fun add(a: Int, b: Int): Int { return a + b }\nadd(1, \"x\")");
+        assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
+    }
+
+    #[test]
+    fn call_function_accepts_a_correctly_typed_argument() {
+        assert_eq!(run("fun add(a: Int, b: Int): Int { return a + b }\nprintln(add(1, 2))"), "3\n");
+    }
+
+    #[test]
+    fn call_function_rejects_a_wrongly_typed_return_value() {
+        let err = run_err("fun f(): Int { return \"x\" }\nf()");
+        assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
+    }
+
+    #[test]
+    fn call_function_accepts_a_correctly_typed_return_value() {
+        assert_eq!(run("fun f(): Int = 5\nprintln(f())"), "5\n");
+    }
+
+    #[test]
+    fn declared_typed_var_reassignment_incompatibly_is_a_runtime_error() {
+        let err = run_err("var x: Int = 5\nx = \"hi\"\nprintln(x)");
+        assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
+    }
+
+    #[test]
+    fn untyped_var_reassignment_across_types_still_works() {
+        // Full backward-compatibility check: a `var` with no type hint at
+        // all keeps its pre-existing dynamic flexibility.
+        assert_eq!(run("var x = 5\nx = \"hi\"\nprintln(x)"), "hi\n");
+    }
+
+    #[test]
+    fn check_type_error_wording_is_unchanged_by_the_refactor() {
+        let err = run_err("val x: Double = 5");
+        assert!(err.contains("type mismatch: expected Double, got Int"), "{err}");
     }
 }

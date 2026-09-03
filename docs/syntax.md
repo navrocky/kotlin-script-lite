@@ -63,10 +63,50 @@ y = y + 1
 y += 5               // += -= *= /= %= are also supported
 ```
 
-Reassigning a `val` is a runtime error. A type annotation is checked at
-runtime against the initializer's value for `Int`, `Double`, `Boolean`,
-`String`, and `Unit`; any other annotation name is accepted but not
-enforced (there is no static type system).
+Reassigning a `val` is a runtime error. A type annotation (`Int`, `Double`,
+`Boolean`, `String`, `Unit`, or `List`) is checked against the
+initializer's value, and — for a `var` specifically — against every later
+reassignment too; a `var` with **no** annotation keeps its full dynamic
+flexibility (reassignable to any type, exactly as if this checking didn't
+exist). Any other annotation name (a typo, a not-yet-supported type) is
+accepted but not enforced. See [Types](#types) below for where this
+checking happens and how far it goes.
+
+## Types
+
+ksl has a small, best-effort type checker — not a full static type
+system, but real checking, both ahead of time and while a script runs:
+
+- **What's checked**: a `val`/`var`'s initializer against its type
+  annotation; a `var`'s reassignment against that same annotation (only
+  when one was given — see "Variables" above); a function call's
+  positional arguments against the callee's declared parameter types;
+  and a function's actual return value against its declared return type.
+- **What's never checked**: named arguments (checked positionally only,
+  for now); anything without a checkable type on both sides — an
+  annotation the checker doesn't recognize (a typo, or a real feature
+  this interpreter doesn't have yet, like a class name), a value whose
+  type can't be worked out without running the script (e.g. the result of
+  a package-qualified call), or a plain, unannotated `val`/`var`/parameter
+  used somewhere its type can't be inferred. These are always accepted,
+  never a false rejection.
+- **`Int`/`Double` mixing is not the same rule as arithmetic.** `1 + 2.0`
+  freely produces a `Double` (see "Operators" below) — but assigning,
+  passing, or returning an `Int` where a `Double` is explicitly expected
+  (or vice versa) *is* a type mismatch. The two rules don't interact.
+- **Where the check happens, twice**: the same checking runs statically
+  (as you type, in an editor connected to `ksl-lsp`, and once more when
+  the `ksl` CLI loads a script, *before* running it — a type problem here
+  means the script never runs at all, not even its first line) and again
+  at runtime inside the interpreter itself (so embedding `ksl-core`
+  directly, without going through the CLI's pre-check, still can't skip
+  it). A type-mismatch error looks like `type mismatch: expected Int, got
+  String`.
+- Only 6 annotation names are recognized today — `Int`, `Double`,
+  `Boolean`, `String`, `Unit`, `List` — no class/generic/nullable types
+  exist yet (see "Not supported" below). A lambda's own type is always
+  inferred as a plain "function" internally, but there's no `Function`
+  annotation to write down for it.
 
 ## Operators
 
@@ -173,12 +213,15 @@ add(1, b = 2)           // 3, named argument
 add(a = 1, b = 2)       // named arguments can be given in any order
 ```
 
-- Parameters may have a `: Type` annotation (unchecked, purely
-  documentation — see Variables above) and a default value.
+- Parameters may have a `: Type` annotation (see [Types](#types)) and a
+  default value. A positional argument's value is checked against its
+  parameter's annotation, when both are of a checkable type.
 - Positional and named arguments can be mixed; a named argument must
-  match a declared parameter name.
-- A declared `: ReturnType` after the parameter list is parsed but not
-  enforced.
+  match a declared parameter name. **Named arguments are not
+  type-checked** (checked positionally only, for now — see
+  [Types](#types)).
+- A declared `: ReturnType` after the parameter list is checked against
+  what the function actually returns.
 - Functions declared with `fun` inside another function's body are
   closures over that enclosing scope, and can be recursive.
 

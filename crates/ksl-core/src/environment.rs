@@ -2,11 +2,19 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::types::{self, Type};
 use crate::value::Value;
 
 struct Binding {
     value: Value,
     mutable: bool,
+    /// The variable's declared type, if it has one (`Type::Unknown`
+    /// otherwise) — checked on reassignment in `assign`. Only ever set to a
+    /// real type at the `val`/`var` declaration site that has an explicit
+    /// type-hint annotation (mirrors `resolver.rs`'s `Symbol::declared`
+    /// distinction: a hint-less `var`'s reassignments stay fully dynamic,
+    /// exactly as before this type system existed).
+    declared_type: Type,
 }
 
 struct EnvData {
@@ -22,6 +30,7 @@ pub struct Env(Rc<RefCell<EnvData>>);
 pub enum AssignError {
     Undefined,
     NotMutable,
+    TypeMismatch(Type, Type),
 }
 
 impl Env {
@@ -39,11 +48,14 @@ impl Env {
         })))
     }
 
-    pub fn define(&self, name: &str, value: Value, mutable: bool) {
+    /// `declared_type` is `Type::Unknown` for every binding except a
+    /// `val`/`var` with an explicit type-hint annotation — see
+    /// `Binding::declared_type`'s doc comment.
+    pub fn define(&self, name: &str, value: Value, mutable: bool, declared_type: Type) {
         self.0
             .borrow_mut()
             .vars
-            .insert(name.to_string(), Binding { value, mutable });
+            .insert(name.to_string(), Binding { value, mutable, declared_type });
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
@@ -59,6 +71,10 @@ impl Env {
         if let Some(b) = data.vars.get_mut(name) {
             if !b.mutable {
                 return Err(AssignError::NotMutable);
+            }
+            let actual = Type::from_value(&value);
+            if b.declared_type != Type::Unknown && !types::is_assignable(&actual, &b.declared_type) {
+                return Err(AssignError::TypeMismatch(actual, b.declared_type.clone()));
             }
             b.value = value;
             return Ok(());

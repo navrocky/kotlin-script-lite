@@ -24,6 +24,10 @@ pub enum Value {
 pub struct FunctionValue {
     pub name: Option<String>,
     pub params: Vec<Param>,
+    /// Raw return-type annotation, if any — always `None` for a lambda
+    /// (`ExprKind::Lambda` has no return-type syntax). Resolved into a real
+    /// `types::Type` by `check_type`, not here.
+    pub return_type: Option<String>,
     pub body: FunBody,
     pub closure: Env,
 }

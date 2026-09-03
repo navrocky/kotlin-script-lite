@@ -1,0 +1,30 @@
+// Static + runtime type system: correctly-typed val/var/fun end-to-end,
+// plus proof the existing dynamic-typing behaviors are unchanged.
+val name: String = "world"
+var count: Int = 0
+
+fun greet(who: String, times: Int): String {
+    var result = ""
+    var i = 0
+    while (i < times) {
+        result = result + "Hello, " + who + "! "
+        i = i + 1
+    }
+    return result
+}
+
+println(greet(name, 3))
+
+count = count + 1
+println(count)
+
+// Int/Double still mix freely in arithmetic (widening, not an assignment
+// rule) -- unaffected by the new type checks.
+val mixed = 1 + 2.5
+println(mixed)
+
+// An untyped `var` keeps its full pre-existing dynamic flexibility: it can
+// be reassigned across types freely, since it was never given a hint.
+var dynamic = 5
+dynamic = "now a string"
+println(dynamic)

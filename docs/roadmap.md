@@ -11,6 +11,18 @@ phases, grounded in the actual current shape of `Value`, `ExprKind`/`StmtKind`,
 `Flow`, and the parser.
 
 Decisions already made that shape this plan:
+- **A static + runtime type system was added as Phase 2**, ahead of every
+  feature phase below except the already-shipped Phases 0/1. It wasn't part
+  of the original 9-feature backlog — it surfaced from a completion bug
+  (LSP `.`-completion offering `String` methods after a non-`String`
+  receiver) that traced back to a real gap: type hints were parsed but
+  never resolved into anything checkable, function arguments/return values/
+  `var` reassignment were never type-checked at all, and there was no
+  structured type for the resolver or `ksl-lsp` to reason about. See Phase
+  2 below; every later phase in this document was written (or rewritten)
+  assuming it exists, in particular Phases 4 (null-safety), 6 (classes), 7
+  (inheritance), and 9 (generics), which each have a note on exactly how
+  they build on it.
 - **Coroutines are scoped down** to cooperative `sequence {}`/`yield()`
   generators only — no `launch`/`async`/`Deferred`/dispatchers. Real
   async/await-style concurrency conflicts with the interpreter's
@@ -20,7 +32,7 @@ Decisions already made that shape this plan:
   here.
 - **`try`/`catch` ships with a minimal `Value::Error{message, class_name}`**
   now, ahead of classes, rather than waiting for a general object system.
-  Phase 5 (classes) later reimplements it as sugar over `Value::Object`
+  Phase 6 (classes) later reimplements it as sugar over `Value::Object`
   without changing the `Flow::Throw` contract.
 - **No `{k: v}` map-literal syntax** — real Kotlin doesn't have one either
   (`{ }` is already lambdas/blocks in ksl, so reusing it would be
@@ -42,33 +54,36 @@ Decisions already made that shape this plan:
 Phase 0: tech-debt (NativeFn span, break/continue fix)
    |
    v
-Phase 1: `.` postfix member-access syntax  <-- blocks 5, 6, 7
-   |
-   +--> Phase 2: collection literals (list [1,2,3] + mapOf/pair)  [independent]
-   +--> Phase 3: null-safety (Value::Null, ?, ?., ?:, !!)          [independent]
+Phase 1: `.` postfix member-access syntax  <-- blocks 6, 7, 8
    |
    v
-Phase 4: try/catch (Flow::Throw, minimal Value::Error)
+Phase 2: static & runtime type system  <-- needs Phase 1 (type-aware completion hooks into MethodCall)
+   |
+   +--> Phase 3: collection literals (list [1,2,3] + mapOf/pair)  [independent]
+   +--> Phase 4: null-safety (Value::Null, ?, ?., ?:, !!)          [independent]
    |
    v
-Phase 5: classes/objects  <-- needs Phase 1
+Phase 5: try/catch (Flow::Throw, minimal Value::Error)
    |
    v
-Phase 6: inheritance  <-- needs Phase 5
+Phase 6: classes/objects  <-- needs Phase 1 (+ Phase 2 reserves Type::Class for it)
    |
    v
-Phase 7: extension functions  <-- needs Phase 1 (+ benefits from Phase 5's call_method path)
+Phase 7: inheritance  <-- needs Phase 6 (+ extends Phase 2's is_assignable for subtyping)
    |
    v
-Phase 8: generics (parsed, fully erased — no type checking exists to hook into)
+Phase 8: extension functions  <-- needs Phase 1 (+ benefits from Phase 6's call_method path)
    |
    v
-Phase 9: coroutines (sequence{}/yield() only) — separate design spike before committing
+Phase 9: generics (parsed, fully erased — Phase 2 reserves Type::Generic for it)
+   |
+   v
+Phase 10: coroutines (sequence{}/yield() only) — separate design spike before committing
 ```
 
-Phases 2 and 3 can be built in either order or interleaved with Phase 1's
-tail end — they don't depend on member-call syntax. Every other phase after
-Phase 1 does, directly or indirectly.
+Phases 3 and 4 can be built in either order or interleaved — they don't
+depend on each other. Every other phase after Phase 2 does, directly or
+indirectly.
 
 ---
 
@@ -139,14 +154,16 @@ this phase with real value: convert a handful of existing stdlib functions
 into a builtin-method dispatch table (`call_builtin_method(receiver,
 method, args, span)` matching on `(type_name(), method)`), e.g.
 `"x".length()`, `"x".uppercase()`. `FieldAccess` on primitives (no fields
-yet) is a clear runtime error until Phase 5.
+yet) is a clear runtime error until Phase 6.
 
 **LSP (do in the same phase, not a follow-up — matches existing repo
 pattern):** `resolver.rs` needs `FieldAccess`/`MethodCall` arms (recurse
 into receiver/args at minimum); `semantic_tokens.rs` classifies the new
 `method_span`/`field_span` spans; `completion.rs` offers the builtin-method
-table after `.` (document that it over-suggests until Phase 5 gives it
-real per-type member info); `hover.rs`/`goto_definition.rs` keep
+table after `.` (document that it over-suggests until Phase 6 gives it
+real per-type member info — Phase 2 later narrows this to the receiver's
+statically known primitive type, but a class/object receiver still shows
+everything until Phase 6); `hover.rs`/`goto_definition.rs` keep
 package-qualified hover/goto-def working, add hover for builtin methods.
 
 **Docs/tests:** update `docs/syntax.md`'s precedence table and "Not
@@ -155,7 +172,102 @@ unit tests per above; new `tests/examples/method_calls.ksl` + `.out`.
 
 ---
 
-## Phase 2 — Collection literals
+## Phase 2 — Static & runtime type system
+
+Requires Phase 1 (`MethodCall`/`FieldAccess` are what a receiver's static
+type needs to hook into for type-aware completion — the concrete bug this
+phase fixes). Best-effort and syntax-directed, deliberately not full
+whole-program unification — mirrors how this roadmap already scopes down
+coroutines and generics elsewhere. The rule that makes this tractable:
+**`Type::Unknown` is always compatible, on either side** — anything not
+statically inferable is never rejected, only left unchecked.
+
+**New module** `crates/ksl-core/src/types.rs`: `Type { Int, Double, Bool,
+String, Unit, List, Function, Class(Rc<str>), Generic(Rc<str>), Unknown }`.
+`Class`/`Generic` are reserved *now*, unconstructable until Phases 6/9
+exist, so those phases only ever need to populate a registry
+(`known_classes`/`generic_params`, both threaded through
+`resolve_type_hint` already, always empty until then) rather than change
+this enum's shape later. `resolve_type_hint(hint, generic_params,
+known_classes) -> Type` is the one place a raw annotation string becomes a
+`Type` (known primitive → that type; matches a generic param in scope →
+`Type::Generic`; matches a known class → `Type::Class`; else `Unknown`).
+`is_assignable(from, to) -> bool`: `Unknown`/`Generic` on either side ⇒
+`true`; `Class(a)`/`Class(b)` ⇒ exact name match only (no subtyping until
+Phase 7); everything else ⇒ exact equality — deliberately **no** numeric
+`Int`→`Double` widening here (that stays exactly where it already lived,
+arithmetic result-type inference, not assignment compatibility).
+
+**Inference** (`resolver.rs`'s existing `walk_expr`/`walk_stmt`/`walk_stmts`
+made to return the expression/statement-list's inferred `Type` alongside
+their existing side effects, rather than a separate second traversal):
+literals type themselves; a `Name` looks up its resolved `Symbol.ty`; a
+builtin `MethodCall`/`FieldAccess` on a concretely-typed receiver looks up
+`stdlib::builtin_method_return_type`; arithmetic follows the existing
+`Int`/`Double` widening rule, comparisons/`&&`/`||` are always `Bool`; a
+`Call` to a bare-`Name` `Fun` symbol yields its declared return type;
+`if`/`when`/`{}` join same-typed branches (a missing `else`/`else ->`
+implicitly joins with `Unit`, matching the runtime's own "no branch taken"
+rule) or fall back to `Unknown` on a mismatch. Everything else (package-
+qualified calls, stdlib calls, anything touching an already-`Unknown`
+value) is `Unknown`.
+
+**`Symbol` (`resolver.rs`) gains**: `ty: Type` (inferred/declared — for
+`Fun`, always `Type::Function`, not its return type), `declared: bool`
+(true only when an explicit type-hint annotation was present — see next
+paragraph), `return_type: Type` and `param_types: Vec<Type>` (`Fun` only).
+
+**Enforcement, both ways, per explicit product decision** (not a warning —
+a hard rejection, as close to Kotlin's compile-time behavior as a
+no-compile-step interpreter can get):
+- *Runtime* (`interpreter.rs`/`environment.rs`, always on): `call_function`
+  checks each bound argument against `Param.type_hint` and the result
+  against a new `FunDecl.return_type`/`FunctionValue.return_type` field
+  (the return-type annotation used to be parsed and thrown away —
+  `parse_fun_decl` now keeps it); `Env::Binding` gains a `declared_type`
+  field, checked in `Env::assign` (`AssignError::TypeMismatch`, mapped to a
+  `RuntimeError` in `interpreter.rs`'s `Assign` handler). **Critical
+  scoping rule**: only a `val`/`var` with an *explicit* type-hint sets
+  `declared_type`/`Symbol.declared` — a hint-less `var`'s type is still
+  inferred (useful for argument/join checks elsewhere) but never enforced
+  on reassignment, so untyped locals keep their full pre-existing dynamic
+  flexibility. Getting this wrong (enforcing inferred-but-undeclared types)
+  would silently make ordinary untyped scripts stricter than documented.
+- *Static* (`resolver.rs`): `ResolveResult` gains a `type_errors:
+  Vec<RuntimeError>` field, kept *separate* from the pre-existing
+  `diagnostics` (undefined-name, duplicate-declaration) — checked at `val`/
+  `var` initialization, `var` reassignment (same declared-only rule as
+  above), positional call arguments (named arguments are out of scope for
+  v1), and `return` vs. a function's declared return type.
+- *CLI* (`ksl-cli`): new `ksl-core::static_check(src)` (parse +
+  `resolver::resolve`, no execution) runs before `run_source`; any
+  `type_errors` abort the script with a non-zero exit and nothing from the
+  script body ever printed — this is the "reject before running" behavior
+  explicitly asked for. The pre-existing `diagnostics` list stays an
+  editor-only (LSP) concern for this phase, unchanged.
+
+**LSP:** `stdlib::BUILTIN_METHOD_SIGNATURES` grows a leading receiver-type
+field (3-tuple → 4-tuple); `completion.rs` filters it to the receiver's
+statically known type when the `.`-prefix is a single bare identifier
+(falls back to showing everything when the type is `Unknown`, unresolved,
+or the prefix looks package-shaped — never under-suggests); `hover.rs`
+requires a new `method_receiver_type_at` match (a new `resolver.rs`
+side-table, `method_receiver_types`) in addition to the method-name match,
+so a nonsensical `5.uppercase()` correctly shows no hover; `diagnostics.rs`
+merges `type_errors` into the diagnostics it already returns.
+
+**Docs/tests:** unit tests in `types.rs`/`resolver.rs`/`interpreter.rs`
+(including forward-compat contract tests for `Type::Class`/`Generic` via
+direct calls with synthetic context, since no real syntax reaches them
+yet); new `tests/examples/type_checking.ksl` + `.out` (a passing-only
+script — the harness treats any `Err` as failure — demonstrating correctly
+typed code end-to-end, plus proof the existing dynamic-typing behaviors
+are unchanged); `completion.rs`/`hover.rs`/`diagnostics.rs` tests for the
+type-aware filtering.
+
+---
+
+## Phase 3 — Collection literals
 
 Independent of Phase 1; can land any time after Phase 0.
 
@@ -185,11 +297,13 @@ map equality, `for (entry in map)`. New `tests/examples/collections.ksl`.
 
 ---
 
-## Phase 3 — Null-safety
+## Phase 4 — Null-safety
 
-Independent of Phase 1. No `null` concept exists at all today (confirmed:
-no `Value::Null`, no nullable-hint handling in `check_type`,
-`interpreter.rs:408-426`) — this is from-scratch, not an extension.
+Independent of Phase 1 and Phase 3; requires Phase 2 (its `Type`/
+`is_assignable` machinery is what makes nullability checkable both
+statically and at runtime — see below). No `null` concept exists at all
+today (confirmed: no `Value::Null`, no nullable-hint handling in
+`check_type`) — this is from-scratch, not an extension.
 
 - **`Value::Null`** — new variant, touches every exhaustive match over
   `Value` (`type_name`, `is_truthy`, `values_equal`, `Display` in
@@ -204,9 +318,17 @@ no `Value::Null`, no nullable-hint handling in `check_type`,
 - **Nullable type hints** (`String?`): add a `nullable: bool` field
   alongside existing `type_hint: Option<String>` on `Param`/`ValDecl`
   rather than string-suffix-hacking `"String?"` everywhere it's read.
-  `check_type` allows `Null` only when `nullable` is set — this is a
-  **runtime** check, not compile-time (ksl has no static type checking at
-  all), a real, documented divergence from actual Kotlin null-safety.
+  `check_type` allows `Null` only when `nullable` is set. Unlike when this
+  phase was originally scoped, this is now enforced **both ways**, same as
+  every other type rule since Phase 2 landed: at runtime (the existing
+  `check_type` extension) *and* statically, by `resolver.rs`'s inference —
+  a `val x: String = null` (or a provably-`Null`-typed expression assigned
+  to a non-nullable hint) is flagged in `type_errors` under the same "both
+  sides statically known" gate as everything else. This is still
+  best-effort, not full Kotlin-grade flow-sensitive null tracking (e.g. no
+  smart-casting after an `if (x != null)` check) — a real, documented
+  divergence from actual Kotlin null-safety, just a narrower one than "no
+  static checking at all."
 - **`?.` safe call**: `safe: bool` flag on `FieldAccess`/`MethodCall`
   (Phase 1), set by a dedicated `?.` token. Short-circuits the whole chain
   to `Value::Null` if receiver is `Null`, without evaluating the member.
@@ -224,14 +346,15 @@ no `Value::Null`, no nullable-hint handling in `check_type`,
 `semantic_tokens.rs` classifies `null`/`?.`/`?:`/`!!`.
 
 **Docs/tests:** new "Null safety" section in `docs/syntax.md` with the
-runtime-not-compile-time caveat spelled out explicitly; remove from "Not
-supported." Tests: `x?.length()` on null receiver, `?:` fallback and
-short-circuit, `!!` error + span, non-nullable assigned `null` errors,
-`null == null`, chained `a?.b?.c`. New `tests/examples/null_safety.ksl`.
+best-effort (not full flow-sensitive) caveat spelled out explicitly;
+remove from "Not supported." Tests: `x?.length()` on null receiver, `?:`
+fallback and short-circuit, `!!` error + span, non-nullable assigned
+`null` errors both statically and at runtime, `null == null`, chained
+`a?.b?.c`. New `tests/examples/null_safety.ksl`.
 
 ---
 
-## Phase 4 — `try`/`catch`
+## Phase 5 — `try`/`catch`
 
 **`Flow::Throw(Value)`** — new variant on `Flow` (`error.rs:90-95`),
 exactly the extension point AGENTS.md calls for. `throw expr` is an
@@ -256,11 +379,11 @@ only `Throw`.
 a stdlib `Exception(message)`/`RuntimeException(message)`), with
 `class_name` defaulting to something like `"Exception"`. `catch (e: T)`
 matches by string-comparing `class_name` (`"Exception"`/`"Throwable"`
-matching everything, hard-coded, non-extensible until Phase 5).
+matching everything, hard-coded, non-extensible until Phase 6).
 **Existing `RuntimeError`/`Flow::Error` stays fatal and uncatchable** in
 this phase — only explicitly-`throw`n values are catchable. Making
 built-in runtime errors catchable is a separate, bigger semantic decision
-left for later. Design `Value::Error`'s shape so Phase 5 can later
+left for later. Design `Value::Error`'s shape so Phase 6 can later
 reimplement it as sugar over `Value::Object` (an instance of a builtin
 `Exception` class) without changing the `Flow::Throw(Value)` contract.
 
@@ -278,7 +401,7 @@ New `tests/examples/exceptions.ksl`.
 
 ---
 
-## Phase 5 — Classes/objects
+## Phase 6 — Classes/objects
 
 The largest phase. Requires Phase 1.
 
@@ -294,7 +417,7 @@ further, matching the existing one-concern-per-file layout).
   `ClassValue { name, fields: Vec<FieldDecl>, methods:
   HashMap<String, Rc<FunctionValue>>, constructor_params: Vec<ClassParam>,
   superclass: Option<Rc<ClassValue>> }` (superclass field reserved now for
-  Phase 6).
+  Phase 7).
 - **`this` binding**: new `call_method` path (parallel to
   `call_function`, sharing its body-execution tail) that additionally
   binds `this` in the call env before parameter binding.
@@ -310,34 +433,46 @@ further, matching the existing one-concern-per-file layout).
   (`interpreter.rs:322-336`) builds a fresh `ObjectValue`, runs
   field-promotion + `init` blocks, returns `Value::Object`.
 - **Method dispatch**: pure runtime `HashMap` lookup on the value's actual
-  class (no static-dispatch complexity needed, since there's no static
-  type system to reconcile). `MethodCall` (Phase 1) gains a branch: if
-  receiver is `Value::Object`, look up on its class; if not found, fall
-  through to Phase 1's builtin-method table, then (Phase 7) extension
-  functions.
+  class — still no static-dispatch complexity, but now because ksl has no
+  method *overloading* for a type system to disambiguate between, not
+  because there's no type system at all (Phase 2 added one). `MethodCall`
+  (Phase 1) gains a branch: if receiver is `Value::Object`, look up on its
+  class; if not found, fall through to Phase 1's builtin-method table, then
+  (Phase 8) extension functions.
 - **Equality**: `values_equal` needs a `Value::Object` arm — reference
   equality (`Rc::ptr_eq`) by default, matching Kotlin's default `==`
   without an `equals()` override.
+- **Type system integration**: `types::Type::Class(Rc<str>)` is already
+  reserved (Phase 2) for exactly this — this phase's job is only to
+  populate `Resolver::known_classes` by scanning top-level `class`
+  declarations (mirroring how top-level `fun`/`val` names are already
+  collected) and give `ObjectValue`/`ClassValue` a way to report their
+  class name to `Type::from_value`. No changes to `types.rs`'s enum shape
+  or `resolve_type_hint`'s signature are needed. `is_assignable`'s
+  `(Class, Class)` arm still only does exact-name equality — real
+  inheritance-aware subtyping (`Dog` assignable to `val x: Animal`) is
+  Phase 7's job, not this one's.
 
 **LSP — substantial, not mechanical**: `resolver.rs` needs a new
 class/member side-table (`HashMap<String, ClassInfo>`) so `this.field`/
 `obj.method()` resolve for goto-def/hover; `completion.rs` needs the same
 table to finally offer real post-`.` member completion (resolving Phase
-1's "over-suggests" limitation); `semantic_tokens.rs` needs token
-categories for class names/`this`/field/method names if not already
+1's "over-suggests" limitation, and superseding Phase 2's type-name-based
+filtering for object receivers specifically); `semantic_tokens.rs` needs
+token categories for class names/`this`/field/method names if not already
 present. Budget real time here.
 
 **Docs/tests:** big "Classes" section in `docs/syntax.md`, explicitly
 noting `open`/`override`/`:` superclass syntax isn't supported yet if
-Phase 6 hasn't landed. Tests: field read/write, constructor defaults,
+Phase 7 hasn't landed. Tests: field read/write, constructor defaults,
 method-calling-method via `this`, builder-style chaining, object identity.
 New `tests/examples/classes.ksl`.
 
 ---
 
-## Phase 6 — Inheritance
+## Phase 7 — Inheritance
 
-Requires Phase 5 (`superclass` field already reserved on `ClassValue`).
+Requires Phase 6 (`superclass` field already reserved on `ClassValue`).
 
 - `class Dog : Animal(name) { override fun speak() { } }` — new `:` class
   header syntax (reuses existing `Colon` token), superclass name +
@@ -347,15 +482,21 @@ Requires Phase 5 (`superclass` field already reserved on `ClassValue`).
   but-not-enforcing unknown type annotations) — document as a deliberate
   simplification.
 - Method lookup walks `class.superclass` when not found on the immediate
-  class — small, mechanical extension of Phase 5's lookup helper.
+  class — small, mechanical extension of Phase 6's lookup helper.
 - `super.method()`: new `ExprKind::Super`, legal only as a
   `MethodCall`/`FieldAccess` receiver, skips straight to
   `class.superclass.methods` regardless of the object's actual runtime
   class.
 - Constructor chaining: superclass fields/constructor run before the
   subclass's own field init/`init` blocks (matches Kotlin's init order).
+- **Type system integration**: extend `types::is_assignable`'s
+  `(Class(a), Class(b))` arm to walk `a`'s superclass chain looking for
+  `b` (using whatever class-hierarchy side table this phase already builds
+  for method-override lookup), instead of Phase 6's exact-name-only
+  equality — this is what makes `val x: Animal = Dog()` correctly
+  type-check. No `types.rs`/`resolve_type_hint` signature changes.
 
-**LSP:** `resolver.rs`'s Phase 5 class-info table gains a `superclass`
+**LSP:** `resolver.rs`'s Phase 6 class-info table gains a `superclass`
 link so goto-def/hover resolve inherited fields and overridden methods;
 `completion.rs` walks the superclass chain too, so post-`.` completion
 includes inherited members; `semantic_tokens.rs` classifies `open`/
@@ -363,14 +504,15 @@ includes inherited members; `semantic_tokens.rs` classifies `open`/
 
 **Docs/tests:** inheritance section in `docs/syntax.md`; tests for
 override dispatch (always the *runtime* class's method wins),
-`super.method()`, multi-level inheritance.
+`super.method()`, multi-level inheritance, subtype-compatible assignment
+(`val x: Animal = Dog()` type-checks; the reverse doesn't).
 
 ---
 
-## Phase 7 — Extension functions
+## Phase 8 — Extension functions
 
 Requires Phase 1 (dot-call syntax is the extension-function call site);
-benefits from Phase 5's `call_method`-style `this`-binding path, which is
+benefits from Phase 6's `call_method`-style `this`-binding path, which is
 reused as-is here.
 
 - `fun String.shout(): String = uppercase(this) + "!"` — new optional
@@ -380,10 +522,10 @@ reused as-is here.
   alongside normal `Env` bindings) keyed by `(receiver_type_name,
   function_name)`.
 - **Dispatch precedence** (document explicitly): real object methods
-  (Phase 5) > builtin methods (Phase 1) > extension functions — matches
+  (Phase 6) > builtin methods (Phase 1) > extension functions — matches
   Kotlin's rule that members always beat extensions with the same name.
 - `this` inside the extension body refers to the receiver, via the same
-  binding mechanism Phase 5 built for methods.
+  binding mechanism Phase 6 built for methods.
 
 **LSP:** `resolver.rs` needs to track in-scope extension-function
 declarations (keyed by receiver type) the same way it already tracks
@@ -399,12 +541,12 @@ confirming real-method-over-extension precedence.
 
 ---
 
-## Phase 8 — Generics (parsed, fully erased)
+## Phase 9 — Generics (parsed, fully erased)
 
-Requires Phase 5 (class headers are the primary place `<T>` appears).
-Given there's no static type system anywhere, this phase is **syntax-only
-erasure** — `<T>` is parsed and stored (for hover text) but never checked
-or specialized.
+Requires Phase 6 (class headers are the primary place `<T>` appears).
+Erasure here is a **deliberate, sound design choice**, not an accident of
+there being no type system to hook into (Phase 2 added one) — `<T>` is
+parsed and stored (for hover text) but never checked or specialized.
 
 - **Grammar-ambiguity constraint**: `<`/`>` are already `Lt`/`Gt`
   comparison tokens — `Box<T>` vs. `a < b` is ambiguous in a
@@ -416,17 +558,21 @@ or specialized.
   expression position for zero runtime benefit, since there's nothing to
   specialize against anyway.
 - `ClassDecl`/`FunDecl` gain an optional `type_params: Vec<String>` (names
-  + spans, for hover only). A type-hint like `x: T` already falls into
-  `check_type`'s existing "unknown annotation, unenforced" catch-all
-  (`interpreter.rs:415`) with **zero interpreter changes needed** — a
-  useful confirmation that erased generics fit the existing runtime-typing
-  model.
+  + spans, for hover only). Push this list onto `Resolver::generic_params`
+  (Phase 2, always empty until now) while walking the declaration's body,
+  so a type-hint like `x: T` resolves to `types::Type::Generic("T")` —
+  reserved back in Phase 2 for exactly this — instead of an accidental
+  `Unknown`. `Generic` behaves identically to `Unknown` in `is_assignable`,
+  so **zero interpreter changes are needed** — a useful confirmation that
+  erased generics fit the type system's existing rules; only `resolver.rs`
+  needs the `type_params` plumbing.
 
 **LSP:** `resolver.rs`/`hover.rs` show the declared `type_params` names in
 hover text for `class`/`fun` declarations (documentation value only, no
-type-checking implied); `semantic_tokens.rs` classifies type-parameter
-names distinctly from ordinary identifiers so they read as generic
-placeholders in the editor.
+type-checking implied — hover for a `Type::Generic("T")`-typed symbol
+should read as "T", not "Unknown"); `semantic_tokens.rs` classifies
+type-parameter names distinctly from ordinary identifiers so they read as
+generic placeholders in the editor.
 
 **Docs/tests:** `docs/syntax.md` must be explicit that this is purely
 syntactic — no checking, no specialization. Tests: `class Box<T>(val
@@ -436,7 +582,7 @@ position is unaffected.
 
 ---
 
-## Phase 9 — Coroutines (`sequence {}` / `yield()` only)
+## Phase 10 — Coroutines (`sequence {}` / `yield()` only)
 
 Scoped down per the decision above — no `launch`/`async`/dispatchers, only
 cooperative single-threaded generators, matching what Kotlin itself calls
@@ -456,7 +602,7 @@ strategy for resumability (architecturally a different interpreter, not
 an incremental feature).
 
 **Recommendation**: treat this phase as a standalone prototype/spike
-*after* Phases 0–8 land, to pick between (a)/(b) with actual code in hand,
+*after* Phases 0–9 land, to pick between (a)/(b) with actual code in hand,
 rather than committing to an approach up front. Do not block any other
 phase on it — it's placed last and nothing else in this roadmap depends
 on it.
@@ -501,7 +647,8 @@ better, capturing) the `.out` fixture.
 
 - `crates/ksl-core/src/parser.rs`, `ast.rs`, `interpreter.rs`, `value.rs`,
   `error.rs`, `stdlib.rs`, `resolver.rs` — core language work.
-- `crates/ksl-core/src/class.rs` — new module for Phase 5/6.
+- `crates/ksl-core/src/types.rs` — the static/runtime type system (Phase 2).
+- `crates/ksl-core/src/class.rs` — new module for Phase 6/7.
 - `crates/ksl-lsp/src/*.rs` — LSP-side updates, per phase, in lockstep.
 - `docs/syntax.md`, `docs/stdlib.md` — spec updates per phase.
 - `AGENTS.md` — update "Explicitly out of scope" as each item lands.

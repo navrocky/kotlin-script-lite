@@ -2,19 +2,24 @@ use ksl_core::error::Span;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 /// Cheap, always-safe diagnostics: parsing plus static resolver checks
-/// (undefined names, duplicate declarations — see `ksl_core::resolver`),
-/// no execution, no file I/O. Safe to run on every `didChange`, including
-/// on syntactically incomplete (mid-typing) buffers — if `text` doesn't
-/// parse, only the parse error is reported (resolver checks need a tree to
-/// run against, and reflect `text` itself, never a last-good fallback:
-/// that fallback is only for hover/goto-definition, see `analysis.rs`).
+/// (undefined names, duplicate declarations, and type-compatibility
+/// problems — see `ksl_core::resolver`), no execution, no file I/O. Safe to
+/// run on every `didChange`, including on syntactically incomplete
+/// (mid-typing) buffers — if `text` doesn't parse, only the parse error is
+/// reported (resolver checks need a tree to run against, and reflect `text`
+/// itself, never a last-good fallback: that fallback is only for hover/
+/// goto-definition, see `analysis.rs`).
 pub fn static_diagnostics(text: &str) -> Vec<Diagnostic> {
     match ksl_core::parse_only(text) {
-        Ok(program) => ksl_core::resolver::resolve(&program)
-            .diagnostics
-            .into_iter()
-            .map(|e| new_diagnostic(span_to_range(e.span), e.message))
-            .collect(),
+        Ok(program) => {
+            let resolved = ksl_core::resolver::resolve(&program);
+            resolved
+                .diagnostics
+                .into_iter()
+                .chain(resolved.type_errors)
+                .map(|e| new_diagnostic(span_to_range(e.span), e.message))
+                .collect()
+        }
         Err(e) => vec![new_diagnostic(span_to_range(e.span), e.message)],
     }
 }
@@ -79,6 +84,13 @@ mod tests {
         let diags = static_diagnostics("break\n");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("'break'"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn type_mismatch_is_flagged_live() {
+        let diags = static_diagnostics("val x: Int = \"hi\"\n");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("type mismatch"), "{}", diags[0].message);
     }
 
     #[test]

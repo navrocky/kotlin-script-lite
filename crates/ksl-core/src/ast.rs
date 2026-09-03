@@ -210,6 +210,9 @@ pub enum StmtKind {
         /// Span of just the function name, used for hover/goto-definition.
         name_span: Span,
         params: Vec<Param>,
+        /// Raw return-type annotation (`fun f(): Int`), if any — resolved
+        /// into a real `types::Type` by the resolver/interpreter, not here.
+        return_type: Option<String>,
         body: FunBody,
     },
     While {

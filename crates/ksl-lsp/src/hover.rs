@@ -29,10 +29,17 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
         // No qualified-name candidate at all at this position — either the
         // receiver is a real local (`s.uppercase()`) or not a dotted-name
         // chain to begin with (`"hi".uppercase()`); either way, try it as a
-        // builtin method instead of giving up.
+        // builtin method instead of giving up. When the receiver's type is
+        // concretely known, it must also match the candidate's receiver
+        // type — so a nonsensical `5.uppercase()` (an `Int` receiver)
+        // correctly finds nothing here, rather than describing
+        // `String.uppercase()` by name alone.
         None => {
             let method = analysis.resolved.table.method_ref_at(line, col)?;
-            let (_, signature, doc) = BUILTIN_METHOD_SIGNATURES.iter().find(|(name, ..)| *name == method)?;
+            let receiver_ty = analysis.resolved.table.method_receiver_type_at(line, col);
+            let (_, _, signature, doc) = BUILTIN_METHOD_SIGNATURES.iter().find(|(recv_ty, name, ..)| {
+                *name == method && receiver_ty.map(|t| t.name() == *recv_ty).unwrap_or(true)
+            })?;
             Some(build_builtin_method_hover(signature, doc))
         }
     }
@@ -112,6 +119,17 @@ mod tests {
         // "println(\"hi\"." is 13 chars, so "length" starts at column 14.
         let h = hover_at(text, 1, 14).expect("length should hover");
         assert!(markdown_value(&h).contains("length"), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_a_builtin_method_call_on_a_non_matching_receiver_type_stays_none() {
+        // `n` is a real local of type `Int` — `.length()`/`.uppercase()`
+        // etc. are `String`-only, so this must not show a misleading
+        // "String.uppercase()" hover just because the method name matches.
+        let text = "val n: Int = 5\nprintln(n.uppercase())\n";
+        // "println(n." is 10 chars, so "uppercase" starts at column 11.
+        let h = hover_at(text, 2, 11);
+        assert!(h.is_none(), "{h:?}");
     }
 
     #[test]

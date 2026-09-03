@@ -8,11 +8,12 @@ pub mod parser;
 pub mod resolver;
 pub mod stdlib;
 pub mod token;
+pub mod types;
 pub mod value;
 
 use std::path::Path;
 
-use error::{InterpError, ParseError};
+use error::{InterpError, ParseError, RuntimeError};
 use importer::Importer;
 use interpreter::Interpreter;
 
@@ -24,6 +25,31 @@ use interpreter::Interpreter;
 pub fn parse_only(src: &str) -> Result<ast::Program, ParseError> {
     let tokens = lexer::tokenize(src)?;
     parser::parse(&tokens)
+}
+
+/// Runs the static type checker (parse + `resolver::resolve`, no execution,
+/// no file I/O, no `@file:Import` resolution) and returns the type-
+/// compatibility problems found, if any — this is the closest ksl has to
+/// Kotlin's compile-time rejection of ill-typed code, since ksl has no
+/// separate compile step (see `docs/roadmap.md`'s type-system phase).
+/// `ksl-cli` calls this before `run_source` and refuses to run a script
+/// with any error in the returned list.
+///
+/// Returns `Ok(())` if `src` doesn't even parse — reporting a parse error
+/// is `run_source`'s own job, unchanged; this function only ever surfaces
+/// `resolver::ResolveResult::type_errors`, never `diagnostics` (undefined-
+/// name, duplicate-declaration stay an editor-only concern for now — see
+/// that field's doc comment).
+pub fn static_check(src: &str) -> Result<(), Vec<RuntimeError>> {
+    let Ok(program) = parse_only(src) else {
+        return Ok(());
+    };
+    let type_errors = resolver::resolve(&program).type_errors;
+    if type_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(type_errors)
+    }
 }
 
 /// Parses and runs a whole script, writing anything it `println`s/`print`s
@@ -49,7 +75,7 @@ pub fn run_source(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_only;
+    use super::{parse_only, static_check};
 
     /// `parse_only` is called on every keystroke by editor tooling, so the
     /// buffer is syntactically incomplete much of the time (mid-statement,
@@ -86,5 +112,28 @@ mod tests {
         for src in inputs {
             let _ = parse_only(src); // must not panic, Ok or Err both fine
         }
+    }
+
+    /// `ksl-cli` calls this before `run_source` and refuses to run the
+    /// script at all if it returns `Err` — see `main.rs`, verified manually
+    /// end-to-end (a script with a genuine type mismatch exits non-zero
+    /// and prints nothing from its body; a well-typed one runs normally).
+    /// This test covers the logic `static_check` itself is responsible for.
+    #[test]
+    fn static_check_rejects_a_genuine_type_mismatch() {
+        let errors = static_check("val x: Int = \"hi\"\n").unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("type mismatch: expected Int, got String"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn static_check_accepts_a_well_typed_script() {
+        assert!(static_check("fun add(a: Int, b: Int): Int { return a + b }\nprintln(add(1, 2))").is_ok());
+    }
+
+    #[test]
+    fn static_check_ignores_a_script_that_does_not_even_parse() {
+        // Reporting the parse error is `run_source`'s job, unchanged.
+        assert!(static_check("val x = ").is_ok());
     }
 }

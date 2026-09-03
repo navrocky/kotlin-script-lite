@@ -16,23 +16,49 @@ const KEYWORDS: &[&str] = &[
 /// `text` (needed, alongside `analysis`, to detect a package-qualified
 /// prefix already typed before the cursor — see `dotted_prefix_before_cursor`).
 ///
-/// If the cursor sits right after `a.b.`, two possibilities are offered
-/// together since there's no way to statically tell them apart (the same
-/// ambiguity `ExprKind::FieldAccess`/`MethodCall` defer to evaluation
-/// time, see `docs/syntax.md`'s "Packages" section): `a.b`'s members if
-/// it's a known package, and every builtin method (`BUILTIN_METHOD_SIGNATURES`)
-/// in case `a.b` is actually a real receiver value — this over-suggests
-/// (e.g. offering `.uppercase()` after a package prefix) until Phase 5
-/// gives real per-type member info. Otherwise: locals and outer-scope
-/// symbols visible there, every stdlib function, every known package's
-/// full name, and language keywords — merged in that order (most relevant
-/// first).
+/// If the cursor sits right after `a.b.`: when `a.b` is a single bare
+/// identifier that resolves to a local with a statically known type (e.g.
+/// `s` in `s.`, where `s: String`), only that type's builtin methods are
+/// offered — the concrete fix for the bug this filtering exists for
+/// (offering `.length()`/`.uppercase()` after a receiver that obviously
+/// isn't a `String`, e.g. a number). Otherwise (the type is `Unknown`, the
+/// name doesn't resolve, or the prefix has multiple segments and so looks
+/// package-shaped) there's no way to statically tell a local receiver from
+/// a package apart (the same ambiguity `ExprKind::FieldAccess`/`MethodCall`
+/// defer to evaluation time, see `docs/syntax.md`'s "Packages" section), so
+/// both possibilities are offered together: `a.b`'s members if it's a known
+/// package, and every builtin method in case `a.b` is actually a real
+/// receiver value — this over-suggests until classes give real per-type
+/// member info, but never under-suggests. Otherwise (no `.` prefix at all):
+/// locals and outer-scope symbols visible there, every stdlib function,
+/// every known package's full name, and language keywords — merged in that
+/// order (most relevant first).
 pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
     let (prefix_path, _partial) = dotted_prefix_before_cursor(&up_to_cursor);
 
     if !prefix_path.is_empty() {
+        // A single-segment prefix resolving to a local with a known
+        // concrete type narrows the builtin-method suggestions to that
+        // type; anything else (multi-segment, unresolved, or `Unknown`)
+        // falls back to the over-suggesting "show everything" behavior.
+        let receiver_type = match prefix_path.as_slice() {
+            [name] => {
+                let line = position.line + 1;
+                let col = position.character + 1;
+                analysis
+                    .resolved
+                    .table
+                    .symbols_in_scope(line, col)
+                    .into_iter()
+                    .find(|s| s.name == *name)
+                    .map(|s| s.ty.clone())
+                    .filter(|ty| *ty != ksl_core::types::Type::Unknown)
+            }
+            _ => None,
+        };
+
         let package_name = prefix_path.join(".");
         let mut items: Vec<CompletionItem> = analysis
             .packages
@@ -45,13 +71,21 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
                 ..Default::default()
             })
             .collect();
-        items.extend(BUILTIN_METHOD_SIGNATURES.iter().map(|(name, signature, doc)| CompletionItem {
-            label: name.to_string(),
-            kind: Some(CompletionItemKind::METHOD),
-            detail: Some(signature.to_string()),
-            documentation: Some(Documentation::String(doc.to_string())),
-            ..Default::default()
-        }));
+        items.extend(
+            BUILTIN_METHOD_SIGNATURES
+                .iter()
+                .filter(|(recv_ty, ..)| match &receiver_type {
+                    Some(ty) => ty.name() == *recv_ty,
+                    None => true,
+                })
+                .map(|(_, name, signature, doc)| CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(CompletionItemKind::METHOD),
+                    detail: Some(signature.to_string()),
+                    documentation: Some(Documentation::String(doc.to_string())),
+                    ..Default::default()
+                }),
+        );
         return items;
     }
 
@@ -185,17 +219,26 @@ mod tests {
 
     #[test]
     fn completion_after_a_dot_offers_builtin_methods() {
-        // `s` is a local, not a package — there's no way to tell statically
-        // (see the module doc comment), so builtin methods are offered
-        // after any `.`, package prefix or not. Uses a fully-typed line
-        // (`dotted_prefix_before_cursor` only reads up to `position`, so the
-        // cursor placed right after "s." still exercises the same prefix
-        // detection `s.` alone would, without needing an incomplete-parse
-        // fallback tree).
+        // `s` is a local `String` — its builtin methods are offered after
+        // `.`. Uses a fully-typed line (`dotted_prefix_before_cursor` only
+        // reads up to `position`, so the cursor placed right after "s."
+        // still exercises the same prefix detection `s.` alone would,
+        // without needing an incomplete-parse fallback tree).
         let text = "val s = \"hi\"\ns.uppercase()\n";
         let names = labels(text, Position::new(1, 2));
         assert!(names.contains(&"uppercase".to_string()), "{names:?}");
         assert!(names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_non_string_local_does_not_offer_string_methods() {
+        // Regression test for the bug this filtering exists to fix: `n` is
+        // a local of a statically known, non-`String` type — `.length()`/
+        // `.uppercase()` etc. must not be offered for it.
+        let text = "val n: Int = 5\nn.uppercase()\n";
+        let names = labels(text, Position::new(1, 2));
+        assert!(!names.contains(&"uppercase".to_string()), "{names:?}");
+        assert!(!names.contains(&"length".to_string()), "{names:?}");
     }
 
     #[test]

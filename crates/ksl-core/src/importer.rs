@@ -159,7 +159,7 @@ fn run_program(interp: &mut Interpreter, program: &Program) -> Result<(), Interp
             .map_err(InterpError::Runtime)?;
         // Checked by the parser (`parse_import_use`): at least 2 segments.
         let member_name = use_.path.last().expect("import path has a member segment");
-        target_env.define(member_name, value, false);
+        target_env.define(member_name, value, false, crate::types::Type::Unknown);
     }
 
     run_stmts_in(interp, &program.stmts, &target_env)

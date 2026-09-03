@@ -45,6 +45,13 @@ fn main() -> ExitCode {
             }
         };
 
+    if let Err(type_errors) = ksl_core::static_check(&source) {
+        for e in &type_errors {
+            eprintln!("error: {} at {}", e.message, e.span);
+        }
+        return ExitCode::FAILURE;
+    }
+
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     match ksl_core::run_source(&source, &mut handle, &base_dir, entry_path.as_deref()) {

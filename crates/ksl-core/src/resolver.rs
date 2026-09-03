@@ -25,9 +25,11 @@
 //!   than flagging ordinary, correct multi-file code as broken.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::ast::*;
 use crate::error::{RuntimeError, Span};
+use crate::types::{self, Type};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -48,6 +50,30 @@ pub struct Symbol {
     /// `val x: Int`. Built at definition time, where the declaration's
     /// params/type hint are directly at hand.
     pub signature: String,
+    /// Statically inferred/declared type of a plain reference to this
+    /// symbol. For `Fun`, this is always `Type::Function` (consistent with
+    /// `Type::from_value`'s collapse of a callable value) — the function's
+    /// own return type is `return_type`, not this field.
+    pub ty: Type,
+    /// True iff `ty` came from an explicit type-hint annotation on this
+    /// declaration, rather than being merely inferred from an initializer
+    /// with no hint. Only consulted for a `var`'s reassignment check (see
+    /// `walk_stmt`'s `Assign` arm) — a hint-less `var` keeps its full,
+    /// pre-existing dynamic flexibility (reassignable to any type), even
+    /// though `ty` still carries its best-effort inferred type for other
+    /// purposes (argument-type checking, `if`/`when` join inference, ...).
+    /// Without this distinction, inferring a type from `var x = 5`'s
+    /// initializer would silently start *enforcing* it on every later
+    /// reassignment — stricter than the language's documented untyped-`var`
+    /// semantics, which this type system deliberately never overrides.
+    pub declared: bool,
+    /// Only meaningful for `SymbolKind::Fun`: the function's declared
+    /// return type (`Type::Unknown` if unannotated). `Type::Unknown` for
+    /// every other kind.
+    pub return_type: Type,
+    /// Only meaningful for `SymbolKind::Fun`: one resolved type per
+    /// declared parameter, in order. Empty for every other kind.
+    pub param_types: Vec<Type>,
 }
 
 /// A `following` hint (see `Resolver::walk_stmt`) meaning "there's no
@@ -109,6 +135,13 @@ pub struct SymbolTable {
     /// `s.uppercase()`, where `s` resolves via `occurrences` but
     /// `uppercase` has no declaration site of its own to point at).
     method_refs: Vec<(Span, String)>,
+    /// Every `MethodCall`'s method-name span paired with its receiver's
+    /// statically inferred type — populated only when the receiver isn't a
+    /// package-qualified reference (i.e. exactly when `qualified_refs`
+    /// *isn't* populated for that same call), so a caller can additionally
+    /// require the receiver type to match a candidate builtin method,
+    /// rather than matching by method name alone.
+    method_receiver_types: Vec<(Span, Type)>,
 }
 
 impl SymbolTable {
@@ -134,6 +167,16 @@ impl SymbolTable {
             .iter()
             .find(|(span, _)| span.contains_line_col(line, col))
             .map(|(_, name)| name.as_str())
+    }
+
+    /// The statically known receiver type (if any) of the `MethodCall`
+    /// whose method-name span covers `(line, col)` — see
+    /// `method_receiver_types`'s doc comment.
+    pub fn method_receiver_type_at(&self, line: u32, col: u32) -> Option<&Type> {
+        self.method_receiver_types
+            .iter()
+            .find(|(span, _)| span.contains_line_col(line, col))
+            .map(|(_, ty)| ty)
     }
 
     /// Every symbol declared directly at this file's top level (scope 0,
@@ -196,6 +239,14 @@ impl SymbolTable {
 pub struct ResolveResult {
     pub table: SymbolTable,
     pub diagnostics: Vec<RuntimeError>,
+    /// Type-compatibility problems found by the static type checker
+    /// (initializer-vs-hint, reassignment-vs-declared-type, call-argument-
+    /// vs-param-type, return-vs-declared-return-type) — kept *separate*
+    /// from `diagnostics` (undefined-name, duplicate-declaration) so a
+    /// caller (e.g. `ksl-cli`) can treat type problems as fatal without
+    /// changing behavior for the pre-existing, deliberately-imprecise
+    /// diagnostics.
+    pub type_errors: Vec<RuntimeError>,
 }
 
 pub fn resolve(program: &Program) -> ResolveResult {
@@ -206,19 +257,25 @@ pub fn resolve(program: &Program) -> ResolveResult {
             occurrences: Vec::new(),
             qualified_refs: Vec::new(),
             method_refs: Vec::new(),
+            method_receiver_types: Vec::new(),
         },
         diagnostics: Vec::new(),
+        type_errors: Vec::new(),
         imported_names: program.imports_use.iter().map(|u| u.path.last().unwrap().clone()).collect(),
         has_file_imports: !program.imports.is_empty(),
+        generic_params: Vec::new(),
+        known_classes: HashSet::new(),
+        return_type_stack: Vec::new(),
     };
     let global = r.push_scope(None, 0, FILE_SPAN);
     r.walk_stmts(&program.stmts, global, FILE_END);
-    ResolveResult { table: r.table, diagnostics: r.diagnostics }
+    ResolveResult { table: r.table, diagnostics: r.diagnostics, type_errors: r.type_errors }
 }
 
 struct Resolver {
     table: SymbolTable,
     diagnostics: Vec<RuntimeError>,
+    type_errors: Vec<RuntimeError>,
     /// Bare names brought in by this file's own `import a.b.c` (the last
     /// segment of each path) — never flagged as undefined, since exactly
     /// which names these introduce is known precisely (unlike plain
@@ -235,6 +292,20 @@ struct Resolver {
     /// unflagged), but a undefined-name check that's wrong on ordinary,
     /// correct multi-file code is worse than one that's merely incomplete.
     has_file_imports: bool,
+    /// Names of generic type parameters in scope (from an enclosing
+    /// declaration's own `<T, ...>` list) — always empty today, since no
+    /// declaration has a `type_params` list yet; see
+    /// `types::resolve_type_hint`'s doc comment for why this is threaded
+    /// through now rather than added later.
+    generic_params: Vec<String>,
+    /// Class names known so far — always empty today, since no `class`
+    /// declaration is parsed yet; see `types::resolve_type_hint`'s doc
+    /// comment.
+    known_classes: HashSet<Rc<str>>,
+    /// Stack of enclosing functions' declared return types, pushed/popped
+    /// around walking a `FunDecl`'s body, so `Return` checks against the
+    /// right one even when a `fun` is declared inside another `fun`'s body.
+    return_type_stack: Vec<Type>,
 }
 
 impl Resolver {
@@ -269,6 +340,7 @@ impl Resolver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn define(
         &mut self,
         scope: usize,
@@ -277,6 +349,10 @@ impl Resolver {
         def_span: Span,
         mutable: bool,
         signature: String,
+        ty: Type,
+        declared: bool,
+        return_type: Type,
+        param_types: Vec<Type>,
     ) {
         if self.table.scopes[scope].names.contains_key(name) {
             self.diagnostics.push(RuntimeError::new(
@@ -285,31 +361,52 @@ impl Resolver {
             ));
         }
         let idx = self.table.symbols.len();
-        self.table.symbols.push(Symbol { name: name.to_string(), kind, def_span, mutable, signature });
+        self.table.symbols.push(Symbol {
+            name: name.to_string(),
+            kind,
+            def_span,
+            mutable,
+            signature,
+            ty,
+            declared,
+            return_type,
+            param_types,
+        });
         self.table.scopes[scope].names.insert(name.to_string(), idx);
         self.table.occurrences.push((def_span, idx));
         self.touch(scope, def_span);
     }
 
-    /// Resolves a use of `name` by walking up the scope chain from `scope`.
-    /// If nothing matches there, it's still not necessarily an error the
-    /// way it would be at runtime — stdlib functions like `println` are
-    /// never declared in the AST at all — so it's checked against the
-    /// known stdlib names too before being flagged as a diagnostic.
-    fn resolve_name(&mut self, scope: usize, name: &str, use_span: Span) {
+    /// Resolves a raw type-hint string (or `None`, meaning no annotation)
+    /// to a `Type` using this resolver's current generic-parameter/known-
+    /// class context (both always empty today — see `Resolver::generic_params`/
+    /// `known_classes`'s doc comments).
+    fn resolve_type_hint_here(&self, hint: Option<&str>) -> Type {
+        match hint {
+            Some(h) => types::resolve_type_hint(h, &self.generic_params, &self.known_classes),
+            None => Type::Unknown,
+        }
+    }
+
+    /// Resolves a use of `name` by walking up the scope chain from `scope`,
+    /// returning its statically known `Type` (`Unknown` if the name can't be
+    /// resolved at all — including the "suppressed" cases below, where it's
+    /// still not necessarily a real error). If nothing matches there, it's
+    /// still not necessarily an error the way it would be at runtime —
+    /// stdlib functions like `println` are never declared in the AST at all
+    /// — so it's checked against the known stdlib names too before being
+    /// flagged as a diagnostic.
+    fn resolve_name(&mut self, scope: usize, name: &str, use_span: Span) -> Type {
         self.touch(scope, use_span);
-        let mut cur = Some(scope);
-        while let Some(s) = cur {
-            if let Some(&idx) = self.table.scopes[s].names.get(name) {
-                self.table.occurrences.push((use_span, idx));
-                return;
-            }
-            cur = self.table.scopes[s].parent;
+        if let Some(idx) = self.resolve_symbol_index(scope, name) {
+            self.table.occurrences.push((use_span, idx));
+            return self.table.symbols[idx].ty.clone();
         }
         if crate::stdlib::is_known(name) || self.imported_names.contains(name) || self.has_file_imports {
-            return;
+            return Type::Unknown;
         }
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
+        Type::Unknown
     }
 
     /// If `expr` is a chain of bare-identifier `.` access (`a`, `a.b`,
@@ -324,7 +421,7 @@ impl Resolver {
     /// through (`f().g`).
     fn dotted_path_if_not_local(&self, expr: &Expr, scope: usize) -> Option<Vec<String>> {
         match &expr.kind {
-            ExprKind::Name(name) if !self.resolves_locally(scope, name) => Some(vec![name.clone()]),
+            ExprKind::Name(name) if self.resolve_symbol(scope, name).is_none() => Some(vec![name.clone()]),
             ExprKind::FieldAccess { receiver, field, .. } => {
                 let mut path = self.dotted_path_if_not_local(receiver, scope)?;
                 path.push(field.clone());
@@ -334,87 +431,201 @@ impl Resolver {
         }
     }
 
-    /// Read-only scope-chain lookup — like the first half of `resolve_name`,
-    /// but without recording an occurrence or a diagnostic on failure (used
-    /// by `dotted_path_if_not_local`, which needs to *ask* whether a name
-    /// is local without committing to either interpretation yet).
-    fn resolves_locally(&self, scope: usize, name: &str) -> bool {
+    /// Read-only scope-chain lookup by name, returning the matched `Symbol`
+    /// — like the first half of `resolve_name`, but without recording an
+    /// occurrence or a diagnostic on failure (used by
+    /// `dotted_path_if_not_local`, which needs to *ask* whether a name is
+    /// local without committing to either interpretation yet, and by
+    /// static type-checking call sites that need more than just the type,
+    /// e.g. a `Fun` symbol's `param_types`).
+    fn resolve_symbol(&self, scope: usize, name: &str) -> Option<&Symbol> {
+        self.resolve_symbol_index(scope, name).map(|idx| &self.table.symbols[idx])
+    }
+
+    fn resolve_symbol_index(&self, scope: usize, name: &str) -> Option<usize> {
         let mut cur = Some(scope);
         while let Some(s) = cur {
-            if self.table.scopes[s].names.contains_key(name) {
-                return true;
+            if let Some(&idx) = self.table.scopes[s].names.get(name) {
+                return Some(idx);
             }
             cur = self.table.scopes[s].parent;
         }
-        false
+        None
     }
 
     /// `following` is the span of whatever comes next, textually, after
     /// this whole statement list — used only to give the *last* statement
     /// in the list (if it opens a scope) a real upper bound; every earlier
     /// statement's own `following` is simply the next one in the list.
-    fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize, following: Span) {
+    ///
+    /// Returns the statement list's own statically inferred "value type" —
+    /// the last statement's type if it's a bare expression statement, else
+    /// `Type::Unit` (an empty list also yields `Unit`) — mirroring
+    /// `Interpreter::exec_block`'s identical runtime rule exactly, since
+    /// every non-`ExprStmt` arm of `walk_stmt` below returns `Type::Unit`
+    /// for itself.
+    fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize, following: Span) -> Type {
+        let mut last = Type::Unit;
         for (i, s) in stmts.iter().enumerate() {
             let next = stmts.get(i + 1).map(|s| s.span).unwrap_or(following);
-            self.walk_stmt(s, scope, next);
+            last = self.walk_stmt(s, scope, next);
         }
+        last
     }
 
     /// A block that opens its own child scope but declares nothing of its
     /// own beyond its statements (loop/branch/block bodies — contrast with
     /// `FunDecl`/`For`/`Lambda`, which also bind params/a loop variable
-    /// into the new scope before walking its body).
-    fn walk_block(&mut self, stmts: &[Stmt], parent: usize, open_at: Span, following: Span) {
+    /// into the new scope before walking its body). Returns the block's
+    /// value type, see `walk_stmts`.
+    fn walk_block(&mut self, stmts: &[Stmt], parent: usize, open_at: Span, following: Span) -> Type {
         let child = self.open_scope(parent, open_at, following);
-        self.walk_stmts(stmts, child, following);
+        self.walk_stmts(stmts, child, following)
     }
 
-    fn walk_stmt(&mut self, stmt: &Stmt, scope: usize, following: Span) {
+    /// Returns this statement's own "value type" for `walk_stmts`'s
+    /// last-statement rule: a bare expression statement yields its
+    /// expression's type; every other statement kind yields `Type::Unit`
+    /// (matching `exec_stmt`'s runtime shape — only `ExprStmt` ever
+    /// contributes a real value to an enclosing block).
+    fn walk_stmt(&mut self, stmt: &Stmt, scope: usize, following: Span) -> Type {
         self.touch(scope, stmt.span);
         match &stmt.kind {
             StmtKind::ExprStmt(e) => self.walk_expr(e, scope, following),
             StmtKind::ValDecl { name, name_span, init, mutable, type_hint } => {
-                self.walk_expr(init, scope, following);
+                let init_ty = self.walk_expr(init, scope, following);
                 let kind = if *mutable { SymbolKind::Var } else { SymbolKind::Val };
                 let keyword = if *mutable { "var" } else { "val" };
                 let sig = match type_hint {
                     Some(t) => format!("{keyword} {name}: {t}"),
                     None => format!("{keyword} {name}"),
                 };
-                self.define(scope, name, kind, *name_span, *mutable, sig);
+                let declared_ty = self.resolve_type_hint_here(type_hint.as_deref());
+                let has_hint = declared_ty != Type::Unknown;
+                let ty = if has_hint {
+                    if init_ty != Type::Unknown && !types::is_assignable(&init_ty, &declared_ty) {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("type mismatch: expected {}, got {}", declared_ty.name(), init_ty.name()),
+                            stmt.span,
+                        ));
+                    }
+                    declared_ty
+                } else {
+                    init_ty
+                };
+                self.define(scope, name, kind, *name_span, *mutable, sig, ty, has_hint, Type::Unknown, Vec::new());
+                Type::Unit
             }
-            StmtKind::Assign { name, value, .. } => {
-                self.walk_expr(value, scope, following);
+            StmtKind::Assign { name, op, value } => {
+                let value_ty = self.walk_expr(value, scope, following);
+                let target = self.resolve_symbol(scope, name);
+                let (target_ty, target_declared) =
+                    target.map(|s| (s.ty.clone(), s.declared)).unwrap_or((Type::Unknown, false));
                 self.resolve_name(scope, name, stmt.span);
+                // Compound assignment (`+=` etc.) is out of scope for v1 —
+                // its result type would need the same widening rules as
+                // arithmetic, and isn't a plain "is the RHS compatible"
+                // check the way `=` is. A hint-less `var` (`target_declared
+                // == false`) keeps its full, pre-existing dynamic
+                // flexibility — see `Symbol::declared`'s doc comment.
+                if *op == AssignOp::Set
+                    && target_declared
+                    && target_ty != Type::Unknown
+                    && value_ty != Type::Unknown
+                    && !types::is_assignable(&value_ty, &target_ty)
+                {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("cannot assign {} to var '{name}' of type {}", value_ty.name(), target_ty.name()),
+                        stmt.span,
+                    ));
+                }
+                Type::Unit
             }
-            StmtKind::FunDecl { name, name_span, params, body } => {
+            StmtKind::FunDecl { name, name_span, params, return_type, body } => {
+                let ret_ty = self.resolve_type_hint_here(return_type.as_deref());
+                let param_types: Vec<Type> =
+                    params.iter().map(|p| self.resolve_type_hint_here(p.type_hint.as_deref())).collect();
                 // Defined in the *outer* scope (not the function's own
                 // body scope) so both callers and recursive calls from
                 // within the body resolve it — matches how `FunDecl`'s
                 // runtime handler defines the function's name on the same
                 // `env` its closure captures, mutated after capture.
                 let sig = format!("fun {name}({})", param_list(params));
-                self.define(scope, name, SymbolKind::Fun, *name_span, false, sig);
+                self.define(
+                    scope,
+                    name,
+                    SymbolKind::Fun,
+                    *name_span,
+                    false,
+                    sig,
+                    Type::Function,
+                    true,
+                    ret_ty.clone(),
+                    param_types,
+                );
                 let fn_scope = self.open_scope(scope, stmt.span, following);
                 self.walk_params(params, fn_scope, following);
-                match body {
+                self.return_type_stack.push(ret_ty.clone());
+                let body_ty = match body {
                     FunBody::Expr(e) => self.walk_expr(e, fn_scope, following),
                     FunBody::Block(stmts) => self.walk_stmts(stmts, fn_scope, following),
+                };
+                self.return_type_stack.pop();
+                // An expression body (`fun f() = expr`) has no explicit
+                // `return` statement to check via the stack — the body's
+                // own type IS the return value, so check it directly here.
+                if matches!(body, FunBody::Expr(_))
+                    && body_ty != Type::Unknown
+                    && ret_ty != Type::Unknown
+                    && !types::is_assignable(&body_ty, &ret_ty)
+                {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("return type mismatch: expected {}, got {}", ret_ty.name(), body_ty.name()),
+                        stmt.span,
+                    ));
                 }
+                Type::Unit
             }
             StmtKind::While { cond, body } => {
                 self.walk_expr(cond, scope, following);
                 self.walk_block(body, scope, stmt.span, following);
+                Type::Unit
             }
             StmtKind::For { var_name, var_name_span, iterable, body } => {
                 self.walk_expr(iterable, scope, following);
                 let for_scope = self.open_scope(scope, stmt.span, following);
                 let sig = format!("val {var_name} (loop variable)");
-                self.define(for_scope, var_name, SymbolKind::Val, *var_name_span, false, sig);
+                self.define(
+                    for_scope,
+                    var_name,
+                    SymbolKind::Val,
+                    *var_name_span,
+                    false,
+                    sig,
+                    Type::Unknown,
+                    false,
+                    Type::Unknown,
+                    Vec::new(),
+                );
                 self.walk_stmts(body, for_scope, following);
+                Type::Unit
             }
-            StmtKind::Return(Some(e)) => self.walk_expr(e, scope, following),
-            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Return(value) => {
+                let ty = match value {
+                    Some(e) => self.walk_expr(e, scope, following),
+                    None => Type::Unit,
+                };
+                if let Some(expected) = self.return_type_stack.last().cloned() {
+                    if ty != Type::Unknown && expected != Type::Unknown && !types::is_assignable(&ty, &expected) {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("return type mismatch: expected {}, got {}", expected.name(), ty.name()),
+                            stmt.span,
+                        ));
+                    }
+                }
+                Type::Unit
+            }
+            StmtKind::Break | StmtKind::Continue => Type::Unit,
         }
     }
 
@@ -433,20 +644,31 @@ impl Resolver {
                 Some(t) => format!("param {}: {t}", p.name),
                 None => format!("param {}", p.name),
             };
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig);
+            let ty = self.resolve_type_hint_here(p.type_hint.as_deref());
+            let has_hint = ty != Type::Unknown;
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, has_hint, Type::Unknown, Vec::new());
         }
     }
 
-    fn walk_expr(&mut self, expr: &Expr, scope: usize, following: Span) {
+    /// Walks `expr` (recording occurrences/diagnostics as before) and
+    /// returns its statically inferred `Type` — syntax-directed and
+    /// single-pass, exhaustive over every `ExprKind` (no wildcard arm).
+    /// `Type::Unknown` covers anything not covered below (see
+    /// `types`'s module doc comment for the "Unknown is always compatible"
+    /// rule this feeds into).
+    fn walk_expr(&mut self, expr: &Expr, scope: usize, following: Span) -> Type {
         self.touch(scope, expr.span);
         match &expr.kind {
-            ExprKind::IntLit(_) | ExprKind::DoubleLit(_) | ExprKind::BoolLit(_) => {}
+            ExprKind::IntLit(_) => Type::Int,
+            ExprKind::DoubleLit(_) => Type::Double,
+            ExprKind::BoolLit(_) => Type::Bool,
             ExprKind::StringTemplate(parts) => {
                 for part in parts {
                     if let StringPart::Expr(e) = part {
                         self.walk_expr(e, scope, following);
                     }
                 }
+                Type::String
             }
             ExprKind::Name(name) => self.resolve_name(scope, name, expr.span),
             // `receiver.field` — this resolver has no notion of packages or
@@ -460,36 +682,125 @@ impl Resolver {
             // `qualified_refs` (never flagged as undefined — deferred to
             // `ksl-lsp`'s cross-file package index, or to the interpreter
             // at runtime) instead of walking it as an ordinary expression.
-            ExprKind::FieldAccess { receiver, .. } => match self.dotted_path_if_not_local(expr, scope) {
-                Some(path) => self.table.qualified_refs.push((expr.span, path)),
-                None => self.walk_expr(receiver, scope, following),
-            },
+            // Either way its own type is `Unknown` in this phase — no
+            // field ever has a known type until classes exist.
+            ExprKind::FieldAccess { receiver, .. } => {
+                match self.dotted_path_if_not_local(expr, scope) {
+                    Some(path) => self.table.qualified_refs.push((expr.span, path)),
+                    None => {
+                        self.walk_expr(receiver, scope, following);
+                    }
+                }
+                Type::Unknown
+            }
             ExprKind::MethodCall { receiver, method, method_span, args } => {
                 self.table.method_refs.push((*method_span, method.clone()));
-                match self.dotted_path_if_not_local(receiver, scope) {
+                let recv_ty = match self.dotted_path_if_not_local(receiver, scope) {
                     Some(mut path) => {
                         path.push(method.clone());
                         self.table.qualified_refs.push((expr.span, path));
+                        None
                     }
-                    None => self.walk_expr(receiver, scope, following),
+                    None => Some(self.walk_expr(receiver, scope, following)),
+                };
+                if let Some(t) = &recv_ty {
+                    self.table.method_receiver_types.push((*method_span, t.clone()));
                 }
                 for a in args {
                     self.walk_expr(&a.value, scope, following);
                 }
+                match &recv_ty {
+                    Some(t) => crate::stdlib::builtin_method_return_type(t.name(), method),
+                    None => Type::Unknown,
+                }
             }
-            ExprKind::Unary { expr: inner, .. } => self.walk_expr(inner, scope, following),
-            ExprKind::Binary { lhs, rhs, .. } => {
-                self.walk_expr(lhs, scope, following);
-                self.walk_expr(rhs, scope, following);
+            ExprKind::Unary { op, expr: inner } => {
+                let t = self.walk_expr(inner, scope, following);
+                match (op, &t) {
+                    (UnaryOp::Neg | UnaryOp::Pos, Type::Int) => Type::Int,
+                    (UnaryOp::Neg | UnaryOp::Pos, Type::Double) => Type::Double,
+                    (UnaryOp::Not, Type::Bool) => Type::Bool,
+                    _ => Type::Unknown,
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.walk_expr(lhs, scope, following);
+                let r = self.walk_expr(rhs, scope, following);
+                match op {
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Gt
+                    | BinaryOp::LtEq
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or => Type::Bool,
+                    BinaryOp::Add => match (&l, &r) {
+                        (Type::Int, Type::Int) => Type::Int,
+                        (Type::Double, Type::Double) | (Type::Double, Type::Int) | (Type::Int, Type::Double) => {
+                            Type::Double
+                        }
+                        (Type::String, _) | (_, Type::String) => Type::String,
+                        (Type::List, _) | (_, Type::List) => Type::List,
+                        _ => Type::Unknown,
+                    },
+                    BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => match (&l, &r) {
+                        (Type::Int, Type::Int) => Type::Int,
+                        (Type::Double, Type::Double) | (Type::Double, Type::Int) | (Type::Int, Type::Double) => {
+                            Type::Double
+                        }
+                        _ => Type::Unknown,
+                    },
+                }
             }
             ExprKind::Range { start, end } => {
                 self.walk_expr(start, scope, following);
                 self.walk_expr(end, scope, following);
+                Type::List
             }
             ExprKind::Call { callee, args } => {
                 self.walk_expr(callee, scope, following);
+                let mut arg_types: Vec<(bool, Type)> = Vec::with_capacity(args.len());
                 for a in args {
-                    self.walk_expr(&a.value, scope, following);
+                    let t = self.walk_expr(&a.value, scope, following);
+                    arg_types.push((a.name.is_some(), t));
+                }
+                // Only a bare-`Name` callee resolving to a `Fun` symbol has
+                // a known signature to check against; named-argument
+                // matching is skipped in v1 (positional only).
+                let fun_info = if let ExprKind::Name(name) = &callee.kind {
+                    self.resolve_symbol(scope, name)
+                        .filter(|s| s.kind == SymbolKind::Fun)
+                        .map(|s| (s.return_type.clone(), s.param_types.clone()))
+                } else {
+                    None
+                };
+                match fun_info {
+                    Some((ret_ty, param_types)) => {
+                        for (i, (is_named, arg_ty)) in arg_types.iter().enumerate() {
+                            if *is_named {
+                                continue;
+                            }
+                            if let Some(param_ty) = param_types.get(i) {
+                                if *arg_ty != Type::Unknown
+                                    && *param_ty != Type::Unknown
+                                    && !types::is_assignable(arg_ty, param_ty)
+                                {
+                                    self.type_errors.push(RuntimeError::new(
+                                        format!(
+                                            "argument {} has type {}, expected {}",
+                                            i + 1,
+                                            arg_ty.name(),
+                                            param_ty.name()
+                                        ),
+                                        expr.span,
+                                    ));
+                                }
+                            }
+                        }
+                        ret_ty
+                    }
+                    None => Type::Unknown,
                 }
             }
             ExprKind::Lambda { params, body } => {
@@ -506,33 +817,56 @@ impl Resolver {
                         expr.span,
                         false,
                         "param it (implicit lambda parameter)".to_string(),
+                        Type::Unknown,
+                        false,
+                        Type::Unknown,
+                        Vec::new(),
                     );
                 }
+                // The lambda body's own inferred type is discarded — a
+                // lambda's return type isn't tracked (no annotation syntax
+                // exists for one); the lambda value itself is always
+                // `Type::Function`.
                 self.walk_stmts(body, lambda_scope, following);
+                Type::Function
             }
             ExprKind::If { cond, then_branch, else_branch } => {
                 self.walk_expr(cond, scope, following);
-                self.walk_block(then_branch, scope, expr.span, following);
-                if let Some(eb) = else_branch {
-                    self.walk_block(eb, scope, expr.span, following);
-                }
+                let then_ty = self.walk_block(then_branch, scope, expr.span, following);
+                let else_ty = match else_branch {
+                    Some(eb) => self.walk_block(eb, scope, expr.span, following),
+                    None => Type::Unit,
+                };
+                if then_ty == else_ty { then_ty } else { Type::Unknown }
             }
             ExprKind::When { subject, arms } => {
                 if let Some(s) = subject {
                     self.walk_expr(s, scope, following);
                 }
+                // Join rule: same type on every arm (a missing `else`
+                // implicitly joins with `Unit`, matching the runtime's "no
+                // arm matched" fallthrough) → that type; any mismatch →
+                // `Unknown`. `WhenArm` has no span of its own, so the whole
+                // `when` expression's span is the anchor for each arm's
+                // block.
+                let has_else = arms.iter().any(|a| a.is_else);
+                let mut acc: Option<Type> = if has_else { None } else { Some(Type::Unit) };
                 for arm in arms {
                     for cond in &arm.conditions {
                         match cond {
                             WhenCondition::Equals(e) | WhenCondition::Bool(e) => {
-                                self.walk_expr(e, scope, following)
+                                self.walk_expr(e, scope, following);
                             }
                         }
                     }
-                    // `WhenArm` has no span of its own; the whole `when`
-                    // expression's is the best available anchor.
-                    self.walk_block(&arm.body, scope, expr.span, following);
+                    let arm_ty = self.walk_block(&arm.body, scope, expr.span, following);
+                    acc = Some(match acc {
+                        None => arm_ty,
+                        Some(prev) if prev == arm_ty => prev,
+                        Some(_) => Type::Unknown,
+                    });
                 }
+                acc.unwrap_or(Type::Unknown)
             }
             ExprKind::Block(stmts) => self.walk_block(stmts, scope, expr.span, following),
         }
@@ -778,5 +1112,144 @@ mod tests {
             result.table.symbols_in_scope(6, 5).into_iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains("onlyInB"), "{names:?}");
         assert!(!names.contains("onlyInA"), "{names:?}");
+    }
+
+    // ---- static type checking ----
+
+    #[test]
+    fn initializer_vs_hint_mismatch_is_a_type_error() {
+        let result = resolve_src("val x: Double = 5\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected Double, got Int"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn initializer_matching_hint_is_not_a_type_error() {
+        let result = resolve_src("val x: Int = 5\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn hintless_val_infers_type_from_initializer() {
+        let result = resolve_src("val x = 5\nprintln(x)\n");
+        assert!(result.type_errors.is_empty());
+        let sym = result.table.symbol_at(1, 5).unwrap();
+        assert_eq!(sym.ty, Type::Int);
+    }
+
+    #[test]
+    fn incompatible_var_reassignment_is_a_type_error() {
+        let result = resolve_src("var x: Int = 5\nx = \"hi\"\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("cannot assign String to var 'x' of type Int"));
+    }
+
+    #[test]
+    fn hintless_var_reassignment_across_types_is_never_flagged() {
+        // A `var` with no explicit type hint keeps its full, pre-existing
+        // dynamic flexibility (reassignable to any type) even though its
+        // initializer's type is still inferred for other purposes (e.g.
+        // `hintless_val_infers_type_from_initializer`) — enforcing it here
+        // too would be *stricter* than the language's documented untyped-
+        // `var` semantics, which this type system deliberately never
+        // overrides. See `Symbol::declared`'s doc comment.
+        let result = resolve_src("var x = 5\nx = \"hi\"\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn compatible_var_reassignment_is_not_a_type_error() {
+        let result = resolve_src("var x: Int = 5\nx = 10\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn positional_argument_type_mismatch_is_flagged() {
+        let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(1, \"x\")\n";
+        let result = resolve_src(src);
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("argument 2 has type String, expected Int"));
+    }
+
+    #[test]
+    fn unknown_typed_argument_is_never_flagged() {
+        // The argument's own type is Unknown (a package-qualified call
+        // result) — must never be flagged, matching the "Unknown is always
+        // compatible" rule.
+        let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(1, util.math.square(2))\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn named_arguments_are_not_checked_in_v1() {
+        // Deliberately out of scope for v1 (see resolver.rs's `Call` arm) —
+        // this must not be flagged even though it's a genuine mismatch, to
+        // avoid a half-implemented, easy-to-get-wrong named-arg matcher.
+        let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(a = 1, b = \"x\")\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn int_plus_double_infers_double() {
+        let result = resolve_src("val x = 1 + 2.0\n");
+        let sym = result.table.symbol_at(1, 5).unwrap();
+        assert_eq!(sym.ty, Type::Double);
+    }
+
+    #[test]
+    fn if_join_same_type_on_both_branches() {
+        let result = resolve_src("val x = if (true) 1 else 2\n");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().ty, Type::Int);
+    }
+
+    #[test]
+    fn if_join_mismatched_branches_is_unknown() {
+        let result = resolve_src("val x = if (true) 1 else \"two\"\n");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().ty, Type::Unknown);
+    }
+
+    #[test]
+    fn if_missing_else_joins_with_unit() {
+        // then-branch is Int, implicit else is Unit -> mismatched -> Unknown.
+        let result = resolve_src("val x = if (true) { 1 }\n");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().ty, Type::Unknown);
+        // then-branch is itself Unit (last stmt not a bare expr) -> matches implicit else.
+        let result2 = resolve_src("val x = if (true) { val y = 1 }\n");
+        assert_eq!(result2.table.symbol_at(1, 5).unwrap().ty, Type::Unit);
+    }
+
+    #[test]
+    fn return_type_mismatch_is_flagged() {
+        let result = resolve_src("fun f(): Int {\n    return \"x\"\n}\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("return type mismatch: expected Int, got String"));
+    }
+
+    #[test]
+    fn return_type_match_is_not_flagged() {
+        let result = resolve_src("fun f(): Int {\n    return 1\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn expression_body_return_type_mismatch_is_flagged() {
+        let result = resolve_src("fun f(): Int = \"x\"\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn preexisting_diagnostics_are_unaffected_by_type_checking() {
+        // undefined-name / duplicate-declaration diagnostics stay exactly
+        // as they were — in `diagnostics`, never `type_errors`.
+        let result = resolve_src("println(nope)\n");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.type_errors.is_empty());
+
+        let result2 = resolve_src("val x = 1\nval x = 2\n");
+        assert_eq!(result2.diagnostics.len(), 1);
+        assert!(result2.type_errors.is_empty());
     }
 }

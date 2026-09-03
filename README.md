@@ -84,7 +84,9 @@ This is a Cargo workspace with three crates:
 | `crates/ksl-core/src/stdlib.rs` | Built-in global functions |
 | `crates/ksl-core/src/importer.rs` | Resolves and runs `@file:Import(...)` local file imports |
 | `crates/ksl-core/src/error.rs` | `ParseError` / `RuntimeError` / `Flow` (control transfer) / `InterpError` |
-| `crates/ksl-core/src/lib.rs` | `run_source()` / `parse_only()` — entry points used by the CLI, tests, and the language server |
+| `crates/ksl-core/src/resolver.rs` | Static, single-file symbol resolution + type inference/checking — powers `ksl-lsp` and `static_check()` |
+| `crates/ksl-core/src/types.rs` | The `Type` representation and type-compatibility rules shared by `resolver.rs` and the interpreter |
+| `crates/ksl-core/src/lib.rs` | `run_source()` / `parse_only()` / `static_check()` — entry points used by the CLI, tests, and the language server |
 | `crates/ksl-core/tests/examples/` | End-to-end `.ksl` scripts + expected `.out` output |
 | `crates/ksl-cli/src/main.rs` | The `ksl` CLI binary — a thin wrapper over `ksl-core` |
 | `crates/ksl-lsp/` | The `ksl-lsp` language server binary (diagnostics; more editor features in progress) |

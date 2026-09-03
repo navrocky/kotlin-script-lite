@@ -364,9 +364,11 @@ impl<'a> Parser<'a> {
         self.advance(); // fun
         let (name, name_span) = self.expect_ident_spanned()?;
         let params = self.parse_params()?;
-        if self.matches(&TokenKind::Colon) {
-            self.expect_ident()?; // return type, parsed but not checked in the MVP
-        }
+        let return_type = if self.matches(&TokenKind::Colon) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         let body = if self.matches(&TokenKind::Assign) {
             self.parse_expr().map(|e| FunBody::Expr(Box::new(e)))
@@ -374,7 +376,10 @@ impl<'a> Parser<'a> {
             self.parse_block_stmts().map(FunBody::Block)
         };
         self.loop_depth = saved_loop_depth;
-        Ok(Stmt::new(StmtKind::FunDecl { name, name_span, params, body: body? }, span))
+        Ok(Stmt::new(
+            StmtKind::FunDecl { name, name_span, params, return_type, body: body? },
+            span,
+        ))
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
