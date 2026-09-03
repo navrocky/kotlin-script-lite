@@ -66,30 +66,47 @@ y += 5               // += -= *= /= %= are also supported
 Reassigning a `val` is a runtime error. A type annotation (`Int`, `Double`,
 `Boolean`, `String`, `Unit`, or `List`) is checked against the
 initializer's value, and — for a `var` specifically — against every later
-reassignment too; a `var` with **no** annotation keeps its full dynamic
-flexibility (reassignable to any type, exactly as if this checking didn't
-exist). Any other annotation name (a typo, a not-yet-supported type) is
-accepted but not enforced. See [Types](#types) below for where this
-checking happens and how far it goes.
+reassignment too. A `var` with **no** annotation is *not* exempt from this:
+its type is inferred from the initializer instead (`var y = 20` infers
+`Int` exactly as `var y: Int = 20` does) and enforced the same way from
+then on. Any other annotation name (a typo, a not-yet-supported type) is
+rejected outright as an unknown type. See [Types](#types) below for where
+this checking happens and how far it goes.
 
 ## Types
 
 ksl has a small, best-effort type checker — not a full static type
 system, but real checking, both ahead of time and while a script runs:
 
-- **What's checked**: a `val`/`var`'s initializer against its type
-  annotation; a `var`'s reassignment against that same annotation (only
-  when one was given — see "Variables" above); a function call's
-  positional arguments against the callee's declared parameter types;
-  and a function's actual return value against its declared return type.
+- **Every `val`/`var` has a type, annotation or not.** `var count: Int = 0`
+  and `var count = 0` end up with the exact same type — `Int` — the
+  second form just *infers* it from the initializer instead of reading it
+  off an annotation. Either way, that type is then enforced on every later
+  reassignment: `count = "hi"` is a type mismatch regardless of which form
+  declared `count`. There's no "dynamic by default" carve-out for the
+  unannotated form, matching Kotlin.
+- **What's checked**: a `val`/`var`'s initializer against its (explicit or
+  inferred) type; a `var`'s reassignment against that same type; a
+  function call's positional arguments against the callee's declared
+  parameter types; and a function's actual return value against its
+  declared return type.
+- **An annotation that doesn't name a real type is itself an error** —
+  `val x: Sting = 1` (a typo) or naming a feature this interpreter
+  doesn't have yet (a class, before classes exist) is rejected as
+  `unknown type 'Sting'`, not silently accepted. There is currently
+  nothing a type annotation can legitimately name besides the 6 listed
+  below, so an unrecognized one is never given the benefit of the doubt.
 - **What's never checked**: named arguments (checked positionally only,
-  for now); anything without a checkable type on both sides — an
-  annotation the checker doesn't recognize (a typo, or a real feature
-  this interpreter doesn't have yet, like a class name), a value whose
-  type can't be worked out without running the script (e.g. the result of
-  a package-qualified call), or a plain, unannotated `val`/`var`/parameter
-  used somewhere its type can't be inferred. These are always accepted,
-  never a false rejection.
+  for now); anything whose type genuinely can't be worked out without
+  running the script — most commonly the result of a package-qualified
+  call (`util.math.square(5)`), or anything derived from one. These are
+  always accepted, never a false rejection; but note this only applies
+  statically — at runtime every value is concrete, so a `var` initialized
+  from such a call still gets locked to whatever type that call's result
+  actually turns out to be, checked from then on (see "Where the check
+  happens" below for why the same script can behave slightly more
+  leniently in an editor's live diagnostics than it does when actually
+  run).
 - **`Int`/`Double` mixing is not the same rule as arithmetic.** `1 + 2.0`
   freely produces a `Double` (see "Operators" below) — but assigning,
   passing, or returning an `Int` where a `Double` is explicitly expected
@@ -100,8 +117,11 @@ system, but real checking, both ahead of time and while a script runs:
   means the script never runs at all, not even its first line) and again
   at runtime inside the interpreter itself (so embedding `ksl-core`
   directly, without going through the CLI's pre-check, still can't skip
-  it). A type-mismatch error looks like `type mismatch: expected Int, got
-  String`.
+  it). The runtime check is strictly more precise (it always has a
+  concrete value to work from, never "can't tell without running it"), so
+  it can catch a mismatch the static pass couldn't have. A type-mismatch
+  error looks like `type mismatch: expected Int, got String`; an
+  unrecognized annotation looks like `unknown type 'Sting'`.
 - Only 6 annotation names are recognized today — `Int`, `Double`,
   `Boolean`, `String`, `Unit`, `List` — no class/generic/nullable types
   exist yet (see "Not supported" below). A lambda's own type is always

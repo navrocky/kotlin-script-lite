@@ -1,5 +1,5 @@
 // Static + runtime type system: correctly-typed val/var/fun end-to-end,
-// plus proof the existing dynamic-typing behaviors are unchanged.
+// plus proof Int/Double arithmetic widening is unaffected.
 val name: String = "world"
 var count: Int = 0
 
@@ -23,8 +23,9 @@ println(count)
 val mixed = 1 + 2.5
 println(mixed)
 
-// An untyped `var` keeps its full pre-existing dynamic flexibility: it can
-// be reassigned across types freely, since it was never given a hint.
-var dynamic = 5
-dynamic = "now a string"
-println(dynamic)
+// A `var` with no explicit hint still infers its type from the
+// initializer (here, Int) and is enforced on reassignment exactly like an
+// explicitly annotated one -- reassigning it to another Int is fine.
+var inferred = 5
+inferred = inferred + 1
+println(inferred)

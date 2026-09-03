@@ -8,12 +8,14 @@ use crate::value::Value;
 struct Binding {
     value: Value,
     mutable: bool,
-    /// The variable's declared type, if it has one (`Type::Unknown`
-    /// otherwise) — checked on reassignment in `assign`. Only ever set to a
-    /// real type at the `val`/`var` declaration site that has an explicit
-    /// type-hint annotation (mirrors `resolver.rs`'s `Symbol::declared`
-    /// distinction: a hint-less `var`'s reassignments stay fully dynamic,
-    /// exactly as before this type system existed).
+    /// The variable's type, checked on reassignment in `assign`
+    /// (`Type::Unknown` is never enforced — see `types`'s module doc
+    /// comment). Set from an explicit type-hint annotation if the `val`/
+    /// `var` declaration has one, else inferred from the initial value
+    /// itself (`Type::from_value`) — matching Kotlin, where `var x = 5`
+    /// locks `x` to `Int` just as surely as `var x: Int = 5` does (see
+    /// `resolver.rs`'s identical `ValDecl` handling, which mirrors this at
+    /// the static-checking layer).
     declared_type: Type,
 }
 

@@ -311,10 +311,11 @@ impl<'a> Parser<'a> {
         let mutable = matches!(self.peek_kind(), TokenKind::Var);
         self.advance(); // val/var
         let (name, name_span) = self.expect_ident_spanned()?;
-        let type_hint = if self.matches(&TokenKind::Colon) {
-            Some(self.expect_ident()?)
+        let (type_hint, type_hint_span) = if self.matches(&TokenKind::Colon) {
+            let (t, s) = self.expect_ident_spanned()?;
+            (Some(t), Some(s))
         } else {
-            None
+            (None, None)
         };
         self.expect(TokenKind::Assign, "'='")?;
         let init = self.parse_expr()?;
@@ -323,6 +324,7 @@ impl<'a> Parser<'a> {
                 name,
                 name_span,
                 type_hint,
+                type_hint_span,
                 mutable,
                 init,
             },
@@ -335,10 +337,11 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen, "'('")?;
         while !matches!(self.peek_kind(), TokenKind::RParen) {
             let (name, name_span) = self.expect_ident_spanned()?;
-            let type_hint = if self.matches(&TokenKind::Colon) {
-                Some(self.expect_ident()?)
+            let (type_hint, type_hint_span) = if self.matches(&TokenKind::Colon) {
+                let (t, s) = self.expect_ident_spanned()?;
+                (Some(t), Some(s))
             } else {
-                None
+                (None, None)
             };
             let default = if self.matches(&TokenKind::Assign) {
                 Some(self.parse_expr()?)
@@ -349,6 +352,7 @@ impl<'a> Parser<'a> {
                 name,
                 name_span,
                 type_hint,
+                type_hint_span,
                 default,
             });
             if !self.matches(&TokenKind::Comma) {
@@ -364,10 +368,11 @@ impl<'a> Parser<'a> {
         self.advance(); // fun
         let (name, name_span) = self.expect_ident_spanned()?;
         let params = self.parse_params()?;
-        let return_type = if self.matches(&TokenKind::Colon) {
-            Some(self.expect_ident()?)
+        let (return_type, return_type_span) = if self.matches(&TokenKind::Colon) {
+            let (t, s) = self.expect_ident_spanned()?;
+            (Some(t), Some(s))
         } else {
-            None
+            (None, None)
         };
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         let body = if self.matches(&TokenKind::Assign) {
@@ -377,7 +382,7 @@ impl<'a> Parser<'a> {
         };
         self.loop_depth = saved_loop_depth;
         Ok(Stmt::new(
-            StmtKind::FunDecl { name, name_span, params, return_type, body: body? },
+            StmtKind::FunDecl { name, name_span, params, return_type, return_type_span, body: body? },
             span,
         ))
     }
@@ -777,6 +782,7 @@ impl<'a> Parser<'a> {
                         name,
                         name_span,
                         type_hint: None,
+                        type_hint_span: None,
                         default: None,
                     });
                 }

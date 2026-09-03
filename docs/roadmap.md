@@ -212,33 +212,55 @@ rule) or fall back to `Unknown` on a mismatch. Everything else (package-
 qualified calls, stdlib calls, anything touching an already-`Unknown`
 value) is `Unknown`.
 
-**`Symbol` (`resolver.rs`) gains**: `ty: Type` (inferred/declared — for
-`Fun`, always `Type::Function`, not its return type), `declared: bool`
-(true only when an explicit type-hint annotation was present — see next
-paragraph), `return_type: Type` and `param_types: Vec<Type>` (`Fun` only).
+**`Symbol` (`resolver.rs`) gains**: `ty: Type` (inferred or declared — for
+`Fun`, always `Type::Function`, not its return type), `return_type: Type`
+and `param_types: Vec<Type>` (`Fun` only).
 
 **Enforcement, both ways, per explicit product decision** (not a warning —
 a hard rejection, as close to Kotlin's compile-time behavior as a
 no-compile-step interpreter can get):
+- **No dynamic-by-default carve-out for a hint-less `val`/`var`** — this
+  was tried during implementation and reverted: `var x = 5` infers `Int`
+  from the initializer exactly as `var x: Int = 5` does, and both are
+  enforced on every later reassignment identically, matching Kotlin. There
+  is no "explicit annotation only" gate anywhere in the final design — a
+  type is a type, whether written down or inferred.
+- **An annotation that doesn't resolve to a known type is itself an
+  error** — `resolve_type_hint` returning `Unknown` for an *absent* hint
+  (`None`) is fine (genuinely dynamic), but returning `Unknown` for an
+  *explicitly given* one (a typo, or a name that would be valid once
+  classes/generics exist) is not: it's reported as `unknown type '<name>'`
+  at the hint's own span. This needed threading a `type_hint_span`/
+  `return_type_span: Option<Span>` alongside the existing raw hint strings
+  on `Param`/`ValDecl`/`FunDecl` (parser captures both together, mirroring
+  the existing `name`/`name_span` pattern), so the diagnostic can point at
+  the annotation itself rather than the whole declaration. Resolve each
+  hint exactly once per declaration site to avoid double-reporting the
+  same typo (a real bug hit during implementation: computing a function's
+  `param_types` *and* separately walking its params both naively called
+  the resolving/diagnosing function on the same hint).
 - *Runtime* (`interpreter.rs`/`environment.rs`, always on): `call_function`
   checks each bound argument against `Param.type_hint` and the result
   against a new `FunDecl.return_type`/`FunctionValue.return_type` field
   (the return-type annotation used to be parsed and thrown away —
   `parse_fun_decl` now keeps it); `Env::Binding` gains a `declared_type`
-  field, checked in `Env::assign` (`AssignError::TypeMismatch`, mapped to a
-  `RuntimeError` in `interpreter.rs`'s `Assign` handler). **Critical
-  scoping rule**: only a `val`/`var` with an *explicit* type-hint sets
-  `declared_type`/`Symbol.declared` — a hint-less `var`'s type is still
-  inferred (useful for argument/join checks elsewhere) but never enforced
-  on reassignment, so untyped locals keep their full pre-existing dynamic
-  flexibility. Getting this wrong (enforcing inferred-but-undeclared types)
-  would silently make ordinary untyped scripts stricter than documented.
+  field — set from the hint if there is one, else `Type::from_value` of
+  the initializer itself, never `Unknown` for a real local — checked in
+  `Env::assign` (`AssignError::TypeMismatch`, mapped to a `RuntimeError` in
+  `interpreter.rs`'s `Assign` handler); `check_type` itself now rejects an
+  unresolvable hint instead of treating it as always-compatible. Note
+  there's no "Unknown" escape hatch at this layer the way there is
+  statically — every runtime value is concrete — so a `var` initialized
+  from a statically-`Unknown` expression (e.g. a package-qualified call)
+  still ends up type-locked once actually run, even though the static
+  checker couldn't have predicted that; documented as an accepted,
+  inherent gap between the two layers' precision, not a bug.
 - *Static* (`resolver.rs`): `ResolveResult` gains a `type_errors:
   Vec<RuntimeError>` field, kept *separate* from the pre-existing
   `diagnostics` (undefined-name, duplicate-declaration) — checked at `val`/
-  `var` initialization, `var` reassignment (same declared-only rule as
-  above), positional call arguments (named arguments are out of scope for
-  v1), and `return` vs. a function's declared return type.
+  `var` initialization, `var` reassignment, positional call arguments
+  (named arguments are out of scope for v1), `return` vs. a function's
+  declared return type, and any unresolvable explicit annotation.
 - *CLI* (`ksl-cli`): new `ksl-core::static_check(src)` (parse +
   `resolver::resolve`, no execution) runs before `run_source`; any
   `type_errors` abort the script with a non-zero exit and nothing from the
@@ -259,11 +281,15 @@ merges `type_errors` into the diagnostics it already returns.
 **Docs/tests:** unit tests in `types.rs`/`resolver.rs`/`interpreter.rs`
 (including forward-compat contract tests for `Type::Class`/`Generic` via
 direct calls with synthetic context, since no real syntax reaches them
-yet); new `tests/examples/type_checking.ksl` + `.out` (a passing-only
-script — the harness treats any `Err` as failure — demonstrating correctly
-typed code end-to-end, plus proof the existing dynamic-typing behaviors
-are unchanged); `completion.rs`/`hover.rs`/`diagnostics.rs` tests for the
-type-aware filtering.
+yet; and both a static and a runtime test for a typo'd annotation being
+rejected as unknown); new `tests/examples/type_checking.ksl` + `.out` (a
+passing-only script — the harness treats any `Err` as failure —
+demonstrating correctly typed `val`/`var`/`fun` end-to-end, including a
+hint-less `var`'s inferred type still being enforced on a compatible
+reassignment; negative cases — a mismatch, an unknown annotation — belong
+in the unit tests above, not this fixture, since it can only ever
+demonstrate scripts that succeed); `completion.rs`/`hover.rs`/
+`diagnostics.rs` tests for the type-aware filtering.
 
 ---
 

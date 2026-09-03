@@ -105,6 +105,15 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_a_hintless_local_shows_its_inferred_type() {
+        // `count` has no type annotation — hover must still show the type
+        // worked out for it from the initializer, not a bare "var count".
+        let text = "var count = 0\nprintln(count)\n";
+        let h = hover_at(text, 1, 5).expect("count should hover");
+        assert!(markdown_value(&h).contains("var count: Int"), "{}", markdown_value(&h));
+    }
+
+    #[test]
     fn hover_on_a_builtin_method_call_on_a_local_receiver() {
         let text = "val s = \"hi\"\nprintln(s.uppercase())\n";
         // "println(s." is 10 chars, so "uppercase" starts at column 11.

@@ -51,22 +51,16 @@ pub struct Symbol {
     /// params/type hint are directly at hand.
     pub signature: String,
     /// Statically inferred/declared type of a plain reference to this
-    /// symbol. For `Fun`, this is always `Type::Function` (consistent with
+    /// symbol — from an explicit type-hint annotation if there is one,
+    /// else inferred from the initializer, matching Kotlin: `var x = 5`
+    /// infers `Int` just as surely as `var x: Int = 5` does, and a later
+    /// `x = "hi"` is a type error either way (see `walk_stmt`'s `Assign`
+    /// arm, which enforces this whenever `ty != Unknown`, with no
+    /// distinction between "explicitly annotated" and "merely inferred").
+    /// For `Fun`, this is always `Type::Function` (consistent with
     /// `Type::from_value`'s collapse of a callable value) — the function's
     /// own return type is `return_type`, not this field.
     pub ty: Type,
-    /// True iff `ty` came from an explicit type-hint annotation on this
-    /// declaration, rather than being merely inferred from an initializer
-    /// with no hint. Only consulted for a `var`'s reassignment check (see
-    /// `walk_stmt`'s `Assign` arm) — a hint-less `var` keeps its full,
-    /// pre-existing dynamic flexibility (reassignable to any type), even
-    /// though `ty` still carries its best-effort inferred type for other
-    /// purposes (argument-type checking, `if`/`when` join inference, ...).
-    /// Without this distinction, inferring a type from `var x = 5`'s
-    /// initializer would silently start *enforcing* it on every later
-    /// reassignment — stricter than the language's documented untyped-`var`
-    /// semantics, which this type system deliberately never overrides.
-    pub declared: bool,
     /// Only meaningful for `SymbolKind::Fun`: the function's declared
     /// return type (`Type::Unknown` if unannotated). `Type::Unknown` for
     /// every other kind.
@@ -350,7 +344,6 @@ impl Resolver {
         mutable: bool,
         signature: String,
         ty: Type,
-        declared: bool,
         return_type: Type,
         param_types: Vec<Type>,
     ) {
@@ -368,7 +361,6 @@ impl Resolver {
             mutable,
             signature,
             ty,
-            declared,
             return_type,
             param_types,
         });
@@ -381,11 +373,24 @@ impl Resolver {
     /// to a `Type` using this resolver's current generic-parameter/known-
     /// class context (both always empty today — see `Resolver::generic_params`/
     /// `known_classes`'s doc comments).
-    fn resolve_type_hint_here(&self, hint: Option<&str>) -> Type {
-        match hint {
-            Some(h) => types::resolve_type_hint(h, &self.generic_params, &self.known_classes),
-            None => Type::Unknown,
+    ///
+    /// An **absent** hint (`None`) is genuinely dynamic and never an error.
+    /// An explicitly-**given** hint that still resolves to `Unknown` — a
+    /// typo, or a name that would be a real type if a later phase (classes,
+    /// generics) had landed — has no legitimate meaning today, so it pushes
+    /// an "unknown type" diagnostic at `hint_span` (expected to be `Some`
+    /// exactly when `hint` is, since the parser always captures them
+    /// together — see `Param::type_hint_span`).
+    fn resolve_type_hint_here(&mut self, hint: Option<&str>, hint_span: Option<Span>) -> Type {
+        let Some(h) = hint else { return Type::Unknown };
+        let ty = types::resolve_type_hint(h, &self.generic_params, &self.known_classes);
+        if ty == Type::Unknown {
+            self.type_errors.push(RuntimeError::new(
+                format!("unknown type '{h}'"),
+                hint_span.unwrap_or_default(),
+            ));
         }
+        ty
     }
 
     /// Resolves a use of `name` by walking up the scope chain from `scope`,
@@ -492,17 +497,12 @@ impl Resolver {
         self.touch(scope, stmt.span);
         match &stmt.kind {
             StmtKind::ExprStmt(e) => self.walk_expr(e, scope, following),
-            StmtKind::ValDecl { name, name_span, init, mutable, type_hint } => {
+            StmtKind::ValDecl { name, name_span, init, mutable, type_hint, type_hint_span } => {
                 let init_ty = self.walk_expr(init, scope, following);
                 let kind = if *mutable { SymbolKind::Var } else { SymbolKind::Val };
                 let keyword = if *mutable { "var" } else { "val" };
-                let sig = match type_hint {
-                    Some(t) => format!("{keyword} {name}: {t}"),
-                    None => format!("{keyword} {name}"),
-                };
-                let declared_ty = self.resolve_type_hint_here(type_hint.as_deref());
-                let has_hint = declared_ty != Type::Unknown;
-                let ty = if has_hint {
+                let declared_ty = self.resolve_type_hint_here(type_hint.as_deref(), *type_hint_span);
+                let ty = if declared_ty != Type::Unknown {
                     if init_ty != Type::Unknown && !types::is_assignable(&init_ty, &declared_ty) {
                         self.type_errors.push(RuntimeError::new(
                             format!("type mismatch: expected {}, got {}", declared_ty.name(), init_ty.name()),
@@ -511,25 +511,39 @@ impl Resolver {
                     }
                     declared_ty
                 } else {
+                    // No hint — infer from the initializer, matching
+                    // Kotlin: `var x = 5` infers `Int` just as surely as
+                    // `var x: Int = 5` does, and both are enforced on
+                    // reassignment identically (see the `Assign` arm).
                     init_ty
                 };
-                self.define(scope, name, kind, *name_span, *mutable, sig, ty, has_hint, Type::Unknown, Vec::new());
+                // Hover text shows the type either way — explicitly
+                // annotated or merely inferred — so `var count = 0` reads
+                // as `var count: Int`, not a bare `var count` that hides
+                // what was actually worked out for it. Only a genuinely
+                // `Unknown` type (nothing could be inferred) falls back to
+                // the bare form.
+                let sig = match (type_hint, &ty) {
+                    (Some(t), _) => format!("{keyword} {name}: {t}"),
+                    (None, Type::Unknown) => format!("{keyword} {name}"),
+                    (None, inferred) => format!("{keyword} {name}: {}", inferred.name()),
+                };
+                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new());
                 Type::Unit
             }
             StmtKind::Assign { name, op, value } => {
                 let value_ty = self.walk_expr(value, scope, following);
-                let target = self.resolve_symbol(scope, name);
-                let (target_ty, target_declared) =
-                    target.map(|s| (s.ty.clone(), s.declared)).unwrap_or((Type::Unknown, false));
+                let target_ty =
+                    self.resolve_symbol(scope, name).map(|s| s.ty.clone()).unwrap_or(Type::Unknown);
                 self.resolve_name(scope, name, stmt.span);
                 // Compound assignment (`+=` etc.) is out of scope for v1 —
                 // its result type would need the same widening rules as
                 // arithmetic, and isn't a plain "is the RHS compatible"
-                // check the way `=` is. A hint-less `var` (`target_declared
-                // == false`) keeps its full, pre-existing dynamic
-                // flexibility — see `Symbol::declared`'s doc comment.
+                // check the way `=` is. `target_ty` is whatever the
+                // declaration's own type is — explicit hint or inferred
+                // from its initializer, no distinction (see `ValDecl`
+                // above) — so this enforces reassignment for both forms.
                 if *op == AssignOp::Set
-                    && target_declared
                     && target_ty != Type::Unknown
                     && value_ty != Type::Unknown
                     && !types::is_assignable(&value_ty, &target_ty)
@@ -541,10 +555,19 @@ impl Resolver {
                 }
                 Type::Unit
             }
-            StmtKind::FunDecl { name, name_span, params, return_type, body } => {
-                let ret_ty = self.resolve_type_hint_here(return_type.as_deref());
-                let param_types: Vec<Type> =
-                    params.iter().map(|p| self.resolve_type_hint_here(p.type_hint.as_deref())).collect();
+            StmtKind::FunDecl { name, name_span, params, return_type, return_type_span, body } => {
+                let ret_ty = self.resolve_type_hint_here(return_type.as_deref(), *return_type_span);
+                // Resolved quietly (no "unknown type" diagnostic here) —
+                // `walk_params` below resolves each param's hint again,
+                // at its own declaration site, which is where that
+                // diagnostic belongs; resolving twice would double it up.
+                let param_types: Vec<Type> = params
+                    .iter()
+                    .map(|p| match &p.type_hint {
+                        Some(h) => types::resolve_type_hint(h, &self.generic_params, &self.known_classes),
+                        None => Type::Unknown,
+                    })
+                    .collect();
                 // Defined in the *outer* scope (not the function's own
                 // body scope) so both callers and recursive calls from
                 // within the body resolve it — matches how `FunDecl`'s
@@ -559,7 +582,6 @@ impl Resolver {
                     false,
                     sig,
                     Type::Function,
-                    true,
                     ret_ty.clone(),
                     param_types,
                 );
@@ -603,7 +625,6 @@ impl Resolver {
                     false,
                     sig,
                     Type::Unknown,
-                    false,
                     Type::Unknown,
                     Vec::new(),
                 );
@@ -644,9 +665,8 @@ impl Resolver {
                 Some(t) => format!("param {}: {t}", p.name),
                 None => format!("param {}", p.name),
             };
-            let ty = self.resolve_type_hint_here(p.type_hint.as_deref());
-            let has_hint = ty != Type::Unknown;
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, has_hint, Type::Unknown, Vec::new());
+            let ty = self.resolve_type_hint_here(p.type_hint.as_deref(), p.type_hint_span);
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new());
         }
     }
 
@@ -818,7 +838,6 @@ impl Resolver {
                         false,
                         "param it (implicit lambda parameter)".to_string(),
                         Type::Unknown,
-                        false,
                         Type::Unknown,
                         Vec::new(),
                     );
@@ -1139,6 +1158,27 @@ mod tests {
     }
 
     #[test]
+    fn hintless_val_signature_shows_the_inferred_type_for_hover() {
+        // The whole point of inferring a hint-less val/var's type is that
+        // hover can show it — a bare "val x" would hide what was actually
+        // worked out for it.
+        let result = resolve_src("val x = 5\n");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().signature, "val x: Int");
+
+        let result = resolve_src("var y = \"hi\"\n");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().signature, "var y: String");
+    }
+
+    #[test]
+    fn genuinely_unknown_typed_val_signature_stays_bare() {
+        // Nothing could be inferred (a package-qualified call result) —
+        // the bare "val x" form is honest about that, not a fabricated
+        // "val x: Unknown".
+        let result = resolve_src("val x = util.math.square(1)\n");
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().signature, "val x");
+    }
+
+    #[test]
     fn incompatible_var_reassignment_is_a_type_error() {
         let result = resolve_src("var x: Int = 5\nx = \"hi\"\n");
         assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
@@ -1146,15 +1186,21 @@ mod tests {
     }
 
     #[test]
-    fn hintless_var_reassignment_across_types_is_never_flagged() {
-        // A `var` with no explicit type hint keeps its full, pre-existing
-        // dynamic flexibility (reassignable to any type) even though its
-        // initializer's type is still inferred for other purposes (e.g.
-        // `hintless_val_infers_type_from_initializer`) — enforcing it here
-        // too would be *stricter* than the language's documented untyped-
-        // `var` semantics, which this type system deliberately never
-        // overrides. See `Symbol::declared`'s doc comment.
+    fn hintless_var_reassignment_across_types_is_flagged_too() {
+        // Matching Kotlin: `var x = 5` infers `Int` just as surely as
+        // `var x: Int = 5` does, so a later `x = "hi"` is a type error
+        // either way — no special leniency for the hint-less form.
         let result = resolve_src("var x = 5\nx = \"hi\"\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn reassignment_of_a_var_with_unknown_inferred_type_is_never_flagged() {
+        // `x`'s initializer is a package-qualified call — statically
+        // `Unknown`, since this resolver can't know what it returns — so
+        // reassigning it to anything must never be flagged, matching the
+        // "Unknown is always compatible" rule.
+        let result = resolve_src("var x = util.math.square(1)\nx = \"hi\"\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 
@@ -1162,6 +1208,43 @@ mod tests {
     fn compatible_var_reassignment_is_not_a_type_error() {
         let result = resolve_src("var x: Int = 5\nx = 10\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn hintless_var_reassignment_that_matches_the_inferred_type_is_fine() {
+        let result = resolve_src("var x = 5\nx = 10\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    // ---- unknown/typo'd type annotations ----
+
+    #[test]
+    fn typo_d_val_type_hint_is_an_unknown_type_error() {
+        let result = resolve_src("val x: INt = 5\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("unknown type 'INt'"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn typo_d_param_type_hint_is_an_unknown_type_error() {
+        let result = resolve_src("fun f(x: Sting) { }\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("unknown type 'Sting'"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn typo_d_return_type_hint_is_an_unknown_type_error() {
+        let result = resolve_src("fun f(): Voidd { }\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("unknown type 'Voidd'"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn unknown_type_error_points_at_the_hint_not_the_whole_declaration() {
+        let result = resolve_src("val x: INt = 5\n");
+        // "val x: " is 7 chars, so the hint "INt" starts at column 8.
+        assert_eq!(result.type_errors[0].span.line, 1);
+        assert_eq!(result.type_errors[0].span.col, 8);
     }
 
     #[test]

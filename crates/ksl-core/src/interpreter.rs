@@ -130,6 +130,7 @@ impl<'a> Interpreter<'a> {
             StmtKind::ValDecl {
                 name,
                 type_hint,
+                type_hint_span,
                 mutable,
                 init,
                 ..
@@ -137,10 +138,15 @@ impl<'a> Interpreter<'a> {
                 let v = self.eval_expr(init, env)?;
                 let declared_type = match type_hint {
                     Some(hint) => {
-                        check_type(hint, &v, stmt.span)?;
+                        check_type(hint, &v, type_hint_span.unwrap_or(stmt.span))?;
                         crate::types::resolve_type_hint(hint, &[], &std::collections::HashSet::new())
                     }
-                    None => crate::types::Type::Unknown,
+                    // No hint — infer from the value itself, matching
+                    // Kotlin: `var x = 5` infers `Int` just as surely as
+                    // `var x: Int = 5` does, so `Env::assign` can enforce
+                    // it on every later reassignment (see
+                    // `resolver.rs`'s identical `ValDecl` handling).
+                    None => crate::types::Type::from_value(&v),
                 };
                 env.define(name, v, *mutable, declared_type);
                 Ok(())
@@ -498,11 +504,20 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
 /// the resolver's static checks (see `docs/roadmap.md`'s type-system
 /// phase). No generic-parameter/known-class context is threaded through
 /// here (both always empty today, same as the resolver's — see
-/// `types::resolve_type_hint`'s doc comment), so this behaves exactly like
-/// the old hardcoded 5-entry whitelist it replaces: an unrecognized hint
-/// resolves to `Type::Unknown`, which `is_assignable` never rejects.
+/// `types::resolve_type_hint`'s doc comment; once classes exist, the
+/// interpreter will need its own live class-name lookup to pass through
+/// here instead of an always-empty set, so a real class name doesn't
+/// start being rejected as "unknown" at runtime).
+///
+/// `hint` not resolving to anything known is itself an error here — a
+/// typo or a reference to a type this interpreter doesn't have yet has no
+/// legitimate meaning, mirroring `resolver.rs`'s `resolve_type_hint_here`
+/// (this is no longer the old "unenforced, always accepted" whitelist).
 fn check_type(hint: &str, v: &Value, span: Span) -> Result<(), Flow> {
     let expected = crate::types::resolve_type_hint(hint, &[], &std::collections::HashSet::new());
+    if expected == crate::types::Type::Unknown {
+        return Err(RuntimeError::new(format!("unknown type '{hint}'"), span).into());
+    }
     let actual = crate::types::Type::from_value(v);
     if crate::types::is_assignable(&actual, &expected) {
         Ok(())
@@ -849,10 +864,28 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
     }
 
     #[test]
-    fn untyped_var_reassignment_across_types_still_works() {
-        // Full backward-compatibility check: a `var` with no type hint at
-        // all keeps its pre-existing dynamic flexibility.
-        assert_eq!(run("var x = 5\nx = \"hi\"\nprintln(x)"), "hi\n");
+    fn hintless_var_reassignment_across_types_is_a_runtime_error() {
+        // Matching Kotlin: `var x = 5` infers `Int` from the initializer
+        // just as surely as `var x: Int = 5` does, so `x = "hi"` is a type
+        // error either way, not a special dynamic case for the hint-less
+        // form. At runtime there's no "Unknown" escape hatch the way there
+        // is statically — every value has a concrete `Type::from_value`,
+        // so a hint-less local is type-locked to its initial value's type
+        // from the moment it's first assigned.
+        let err = run_err("var x = 5\nx = \"hi\"\nprintln(x)");
+        assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
+    }
+
+    #[test]
+    fn typo_d_type_hint_is_an_unknown_type_runtime_error() {
+        let err = run_err("val x: INt = 5");
+        assert!(err.contains("unknown type 'INt'"), "{err}");
+    }
+
+    #[test]
+    fn typo_d_param_type_hint_is_an_unknown_type_runtime_error() {
+        let err = run_err("fun f(x: Sting) { }\nf(1)");
+        assert!(err.contains("unknown type 'Sting'"), "{err}");
     }
 
     #[test]

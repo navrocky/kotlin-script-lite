@@ -159,6 +159,10 @@ pub struct Param {
     /// used for hover/goto-definition.
     pub name_span: Span,
     pub type_hint: Option<String>,
+    /// Span of just the type-hint identifier, if there is one — used to
+    /// point an "unknown type" diagnostic at the annotation itself rather
+    /// than the whole parameter.
+    pub type_hint_span: Option<Span>,
     pub default: Option<Expr>,
 }
 
@@ -197,6 +201,9 @@ pub enum StmtKind {
         /// Span of just the declared name, used for hover/goto-definition.
         name_span: Span,
         type_hint: Option<String>,
+        /// Span of just the type-hint identifier, if there is one — see
+        /// `Param::type_hint_span`.
+        type_hint_span: Option<Span>,
         mutable: bool,
         init: Expr,
     },
@@ -213,6 +220,9 @@ pub enum StmtKind {
         /// Raw return-type annotation (`fun f(): Int`), if any — resolved
         /// into a real `types::Type` by the resolver/interpreter, not here.
         return_type: Option<String>,
+        /// Span of just the return-type identifier, if there is one — see
+        /// `Param::type_hint_span`.
+        return_type_span: Option<Span>,
         body: FunBody,
     },
     While {
