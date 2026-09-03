@@ -35,6 +35,31 @@ pub fn is_known(name: &str) -> bool {
     STDLIB_SIGNATURES.iter().any(|(n, _, _)| *n == name)
 }
 
+/// Real, machine-readable `(param types, return type)` for a stdlib
+/// function's call-site checking (`STDLIB_SIGNATURES`'s own `signature`
+/// field is a free-text display string, not this) — used by
+/// `resolver.rs`'s `Call` handling so `println`/`length`/etc. participate
+/// in the same argument/return type checking a user-defined `fun` gets,
+/// instead of staying permanently `Unknown`. `Type::Unknown` as a
+/// parameter's own type means "accepts anything" (never flagged
+/// incompatible), matching `println(value: Any?)` in real Kotlin.
+///
+/// Returns `None` for a name with no checkable signature — `listOf` is
+/// deliberately absent (variadic; every arg would need `Type::List`'s
+/// still-untracked element type to check meaningfully, and its return
+/// type is already just `Type::List` regardless) and so are `abs`/`max`/
+/// `min` (numeric-polymorphic — handled directly in `resolver.rs`'s
+/// `Call` arm instead, since their return type isn't one fixed `Type`).
+pub fn stdlib_call_types(name: &str) -> Option<(Vec<Type>, Type)> {
+    match name {
+        "println" | "print" => Some((vec![Type::Unknown], Type::Unit)),
+        "length" => Some((vec![Type::String], Type::Int)),
+        "uppercase" | "lowercase" | "trim" => Some((vec![Type::String], Type::String)),
+        "sqrt" => Some((vec![Type::Unknown], Type::Double)),
+        _ => None,
+    }
+}
+
 pub fn populate_globals(env: &Env) {
     register(env, "println", |interp, args, span| {
         match args.len() {
