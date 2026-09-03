@@ -151,12 +151,10 @@ for (item in listOf("a", "b")) { println(item) }
 ### `break` / `continue` / `return`
 
 `break` and `continue` behave as expected inside the body of the nearest
-`while`/`for` loop. **Known quirk:** they are implemented as a non-local
-control-transfer that unwinds through function calls, so calling a
-function that contains a bare `break`/`continue` from inside a loop will
-unwind to that loop even though the `break` isn't lexically inside it —
-unlike Kotlin, where this would be a compile error. Don't rely on this;
-only use `break`/`continue` directly inside a loop body.
+`while`/`for` loop. Using either outside a loop, or inside a `fun`/lambda
+body that is merely lexically nested inside a loop (they can't unwind
+through a function boundary to a loop in the caller), is a parse error,
+matching Kotlin's compile-time rejection of the same cases.
 
 `return` exits the enclosing function with a value (`return expr`) or
 `Unit` (bare `return`). At the top level of a script, `return` simply

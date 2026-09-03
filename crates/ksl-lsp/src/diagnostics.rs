@@ -75,6 +75,13 @@ mod tests {
     }
 
     #[test]
+    fn break_outside_a_loop_is_flagged_live() {
+        let diags = static_diagnostics("break\n");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("'break'"), "{}", diags[0].message);
+    }
+
+    #[test]
     fn span_to_range_converts_1_based_to_0_based_positions() {
         let range = span_to_range(Span::new(3, 5));
         assert_eq!(range.start, Position::new(2, 4));

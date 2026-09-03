@@ -3,13 +3,21 @@ use crate::error::{ParseError, Span};
 use crate::token::{Token, TokenKind};
 
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, pos: 0, loop_depth: 0 };
     p.parse_program()
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// Number of enclosing `while`/`for` bodies at the current parse
+    /// position — saved and reset to 0 around a `fun`/lambda body, since
+    /// `break`/`continue` can't unwind through a function boundary to a
+    /// loop in the *caller*. Checked when parsing `break`/`continue` to
+    /// reject them outside any loop, matching real Kotlin's compile-time
+    /// rejection (this interpreter has no type/scope checking otherwise,
+    /// so this is done at parse time instead).
+    loop_depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -275,10 +283,22 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Break => {
                 self.advance();
+                if self.loop_depth == 0 {
+                    return Err(ParseError {
+                        message: "'break' is only allowed inside a loop".into(),
+                        span,
+                    });
+                }
                 Ok(Stmt::new(StmtKind::Break, span))
             }
             TokenKind::Continue => {
                 self.advance();
+                if self.loop_depth == 0 {
+                    return Err(ParseError {
+                        message: "'continue' is only allowed inside a loop".into(),
+                        span,
+                    });
+                }
                 Ok(Stmt::new(StmtKind::Continue, span))
             }
             _ => self.parse_expr_or_assign_stmt(),
@@ -346,12 +366,14 @@ impl<'a> Parser<'a> {
         if self.matches(&TokenKind::Colon) {
             self.expect_ident()?; // return type, parsed but not checked in the MVP
         }
+        let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         let body = if self.matches(&TokenKind::Assign) {
-            FunBody::Expr(Box::new(self.parse_expr()?))
+            self.parse_expr().map(|e| FunBody::Expr(Box::new(e)))
         } else {
-            FunBody::Block(self.parse_block_stmts()?)
+            self.parse_block_stmts().map(FunBody::Block)
         };
-        Ok(Stmt::new(StmtKind::FunDecl { name, name_span, params, body }, span))
+        self.loop_depth = saved_loop_depth;
+        Ok(Stmt::new(StmtKind::FunDecl { name, name_span, params, body: body? }, span))
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
@@ -360,8 +382,10 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen, "'('")?;
         let cond = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
-        let body = self.parse_block_stmts()?;
-        Ok(Stmt::new(StmtKind::While { cond, body }, span))
+        self.loop_depth += 1;
+        let body = self.parse_block_stmts();
+        self.loop_depth -= 1;
+        Ok(Stmt::new(StmtKind::While { cond, body: body? }, span))
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
@@ -372,13 +396,15 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::In, "'in'")?;
         let iterable = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
-        let body = self.parse_block_stmts()?;
+        self.loop_depth += 1;
+        let body = self.parse_block_stmts();
+        self.loop_depth -= 1;
         Ok(Stmt::new(
             StmtKind::For {
                 var_name,
                 var_name_span,
                 iterable,
-                body,
+                body: body?,
             },
             span,
         ))
@@ -710,8 +736,10 @@ impl<'a> Parser<'a> {
 
         let params = self.try_parse_lambda_params();
 
-        let body = self.parse_stmts_until_rbrace()?;
-        Ok(Expr::new(ExprKind::Lambda { params, body }, span))
+        let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        let body = self.parse_stmts_until_rbrace();
+        self.loop_depth = saved_loop_depth;
+        Ok(Expr::new(ExprKind::Lambda { params, body: body? }, span))
     }
 
     /// Speculatively parses a `ident (, ident)* ->` parameter list at the
@@ -1074,5 +1102,44 @@ mod tests {
             },
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn break_and_continue_inside_loop_are_fine() {
+        parse_src("while (true) { break }");
+        parse_src("while (true) { continue }");
+        parse_src("for (i in 1..10) { if (i == 5) { break } }");
+    }
+
+    #[test]
+    fn break_outside_loop_is_rejected() {
+        let err = parse_err("break");
+        assert!(err.message.contains("'break'"), "{}", err.message);
+    }
+
+    #[test]
+    fn continue_outside_loop_is_rejected() {
+        let err = parse_err("continue");
+        assert!(err.message.contains("'continue'"), "{}", err.message);
+    }
+
+    #[test]
+    fn break_inside_fun_body_inside_loop_is_rejected() {
+        // A `break` in a nested `fun` can't reach the caller's loop, unlike
+        // a bare unwind through `Flow::Break` at runtime — this must be
+        // caught even though the `fun` itself is lexically inside a `while`.
+        let err = parse_err("while (true) { fun f() { break } }");
+        assert!(err.message.contains("'break'"), "{}", err.message);
+    }
+
+    #[test]
+    fn continue_inside_lambda_body_inside_loop_is_rejected() {
+        let err = parse_err("while (true) { val f = { continue } }");
+        assert!(err.message.contains("'continue'"), "{}", err.message);
+    }
+
+    #[test]
+    fn break_inside_loop_inside_fun_body_is_fine() {
+        parse_src("fun f() { while (true) { break } }");
     }
 }

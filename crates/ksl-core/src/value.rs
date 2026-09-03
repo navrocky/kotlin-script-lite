@@ -4,10 +4,10 @@ use std::rc::Rc;
 
 use crate::ast::{FunBody, Param};
 use crate::environment::Env;
-use crate::error::Flow;
+use crate::error::{Flow, Span};
 use crate::interpreter::Interpreter;
 
-pub type NativeFn = dyn Fn(&mut Interpreter, Vec<Value>) -> Result<Value, Flow>;
+pub type NativeFn = dyn Fn(&mut Interpreter, Vec<Value>, Span) -> Result<Value, Flow>;
 
 #[derive(Clone)]
 pub enum Value {

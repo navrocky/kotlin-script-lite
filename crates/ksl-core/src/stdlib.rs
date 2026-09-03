@@ -35,75 +35,75 @@ pub fn is_known(name: &str) -> bool {
 }
 
 pub fn populate_globals(env: &Env) {
-    register(env, "println", |interp, args| {
+    register(env, "println", |interp, args, span| {
         match args.len() {
             0 => write_out(interp, "\n"),
             1 => write_out(interp, &format!("{}\n", args[0])),
-            n => return Err(arity_error("println", "0 or 1", n)),
+            n => return Err(arity_error("println", "0 or 1", n, span)),
         }?;
         Ok(Value::Unit)
     });
 
-    register(env, "print", |interp, args| {
+    register(env, "print", |interp, args, span| {
         match args.len() {
             1 => write_out(interp, &format!("{}", args[0]))?,
-            n => return Err(arity_error("print", "1", n)),
+            n => return Err(arity_error("print", "1", n, span)),
         }
         Ok(Value::Unit)
     });
 
-    register(env, "listOf", |_interp, args| {
+    register(env, "listOf", |_interp, args, _span| {
         Ok(Value::List(Rc::new(RefCell::new(args))))
     });
 
-    register(env, "length", |_interp, args| {
-        let s = expect_str("length", &args, 0)?;
+    register(env, "length", |_interp, args, span| {
+        let s = expect_str("length", &args, 0, span)?;
         Ok(Value::Int(s.chars().count() as i64))
     });
 
-    register(env, "uppercase", |_interp, args| {
-        let s = expect_str("uppercase", &args, 0)?;
+    register(env, "uppercase", |_interp, args, span| {
+        let s = expect_str("uppercase", &args, 0, span)?;
         Ok(Value::str(s.to_uppercase()))
     });
 
-    register(env, "lowercase", |_interp, args| {
-        let s = expect_str("lowercase", &args, 0)?;
+    register(env, "lowercase", |_interp, args, span| {
+        let s = expect_str("lowercase", &args, 0, span)?;
         Ok(Value::str(s.to_lowercase()))
     });
 
-    register(env, "trim", |_interp, args| {
-        let s = expect_str("trim", &args, 0)?;
+    register(env, "trim", |_interp, args, span| {
+        let s = expect_str("trim", &args, 0, span)?;
         Ok(Value::str(s.trim().to_string()))
     });
 
-    register(env, "abs", |_interp, args| match args.get(0) {
+    register(env, "abs", |_interp, args, span| match args.get(0) {
         Some(Value::Int(i)) => Ok(Value::Int(i.wrapping_abs())),
         Some(Value::Double(d)) => Ok(Value::Double(d.abs())),
-        _ => Err(type_error("abs", "a number")),
+        _ => Err(type_error("abs", "a number", span)),
     });
 
-    register(env, "sqrt", |_interp, args| {
-        let x = expect_num("sqrt", &args, 0)?;
+    register(env, "sqrt", |_interp, args, span| {
+        let x = expect_num("sqrt", &args, 0, span)?;
         Ok(Value::Double(x.sqrt()))
     });
 
-    register(env, "max", |_interp, args| {
-        let a = args.get(0).ok_or_else(|| arity_error("max", "2", args.len()))?;
-        let b = args.get(1).ok_or_else(|| arity_error("max", "2", args.len()))?;
-        numeric_binary(a, b, f64::max)
+    register(env, "max", |_interp, args, span| {
+        let a = args.get(0).ok_or_else(|| arity_error("max", "2", args.len(), span))?;
+        let b = args.get(1).ok_or_else(|| arity_error("max", "2", args.len(), span))?;
+        numeric_binary(a, b, span, f64::max)
     });
 
-    register(env, "min", |_interp, args| {
-        let a = args.get(0).ok_or_else(|| arity_error("min", "2", args.len()))?;
-        let b = args.get(1).ok_or_else(|| arity_error("min", "2", args.len()))?;
-        numeric_binary(a, b, f64::min)
+    register(env, "min", |_interp, args, span| {
+        let a = args.get(0).ok_or_else(|| arity_error("min", "2", args.len(), span))?;
+        let b = args.get(1).ok_or_else(|| arity_error("min", "2", args.len(), span))?;
+        numeric_binary(a, b, span, f64::min)
     });
 }
 
 fn register(
     env: &Env,
     name: &str,
-    f: impl Fn(&mut Interpreter, Vec<Value>) -> Result<Value, Flow> + 'static,
+    f: impl Fn(&mut Interpreter, Vec<Value>, Span) -> Result<Value, Flow> + 'static,
 ) {
     env.define(
         name,
@@ -119,30 +119,30 @@ fn write_out(interp: &mut Interpreter, text: &str) -> Result<(), Flow> {
     write!(interp.out, "{text}").map_err(|e| RuntimeError::new(format!("io error: {e}"), Span::default()).into())
 }
 
-fn arity_error(name: &str, expected: &str, got: usize) -> Flow {
-    RuntimeError::new(format!("{name} expects {expected} argument(s), got {got}"), Span::default()).into()
+fn arity_error(name: &str, expected: &str, got: usize, span: Span) -> Flow {
+    RuntimeError::new(format!("{name} expects {expected} argument(s), got {got}"), span).into()
 }
 
-fn type_error(name: &str, expected: &str) -> Flow {
-    RuntimeError::new(format!("{name} expects {expected}"), Span::default()).into()
+fn type_error(name: &str, expected: &str, span: Span) -> Flow {
+    RuntimeError::new(format!("{name} expects {expected}"), span).into()
 }
 
-fn expect_str(name: &str, args: &[Value], idx: usize) -> Result<Rc<str>, Flow> {
+fn expect_str(name: &str, args: &[Value], idx: usize, span: Span) -> Result<Rc<str>, Flow> {
     match args.get(idx) {
         Some(Value::Str(s)) => Ok(s.clone()),
-        _ => Err(type_error(name, "a String argument")),
+        _ => Err(type_error(name, "a String argument", span)),
     }
 }
 
-fn expect_num(name: &str, args: &[Value], idx: usize) -> Result<f64, Flow> {
+fn expect_num(name: &str, args: &[Value], idx: usize, span: Span) -> Result<f64, Flow> {
     match args.get(idx) {
         Some(Value::Int(i)) => Ok(*i as f64),
         Some(Value::Double(d)) => Ok(*d),
-        _ => Err(type_error(name, "a numeric argument")),
+        _ => Err(type_error(name, "a numeric argument", span)),
     }
 }
 
-fn numeric_binary(a: &Value, b: &Value, f: impl Fn(f64, f64) -> f64) -> Result<Value, Flow> {
+fn numeric_binary(a: &Value, b: &Value, span: Span, f: impl Fn(f64, f64) -> f64) -> Result<Value, Flow> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => {
             let xf = *x as f64;
@@ -154,12 +154,12 @@ fn numeric_binary(a: &Value, b: &Value, f: impl Fn(f64, f64) -> f64) -> Result<V
             let xf = match a {
                 Value::Int(x) => *x as f64,
                 Value::Double(x) => *x,
-                _ => return Err(type_error("max/min", "numeric arguments")),
+                _ => return Err(type_error("max/min", "numeric arguments", span)),
             };
             let yf = match b {
                 Value::Int(y) => *y as f64,
                 Value::Double(y) => *y,
-                _ => return Err(type_error("max/min", "numeric arguments")),
+                _ => return Err(type_error("max/min", "numeric arguments", span)),
             };
             Ok(Value::Double(f(xf, yf)))
         }
@@ -185,6 +185,26 @@ mod tests {
                 matches!(env.get(name), Some(Value::Native(_))),
                 "'{name}' is in STDLIB_SIGNATURES but not registered by populate_globals"
             );
+        }
+    }
+
+    /// A stdlib type error must report the call-site span passed to the
+    /// native function, not a default `0:0` — regression test for the
+    /// `NativeFn` span threading fix.
+    #[test]
+    fn stdlib_error_reports_call_site_span() {
+        let env = Env::new();
+        populate_globals(&env);
+        let mut sink = Vec::new();
+        let mut interp = Interpreter::new(&mut sink);
+        let f = match env.get("length") {
+            Some(Value::Native(n)) => n,
+            _ => panic!("length not registered"),
+        };
+        let span = Span::new(7, 3);
+        match (f.func)(&mut interp, vec![Value::Int(1)], span) {
+            Err(Flow::Error(e)) => assert_eq!(e.span, span),
+            _ => panic!("expected Flow::Error"),
         }
     }
 }

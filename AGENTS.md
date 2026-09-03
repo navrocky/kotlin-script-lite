@@ -40,11 +40,11 @@ sequence) that the end-to-end examples don't check.
 - **`Span` on every `Expr`/`Stmt`.** Runtime errors need a source location.
   When adding a new `ExprKind`/`StmtKind` variant, thread a real `Span`
   through it (from the token that starts the construct), not
-  `Span::default()`. `Span::default()` is currently only used in
-  `stdlib.rs` native functions, which don't receive a call-site span — if
-  you need accurate spans in stdlib error messages, that's a real gap to
-  fix by extending `NativeFn`'s signature, not something to imitate
-  elsewhere.
+  `Span::default()`. `NativeFn` (`value.rs`) receives the call-site `Span`
+  as its third argument — stdlib functions in `stdlib.rs` must thread it
+  into their error helpers (`arity_error`/`type_error`/etc.) rather than
+  falling back to `Span::default()`, which remains reserved for cases with
+  genuinely no call site (e.g. an internal io error in `write_out`).
 - **Int arithmetic wraps**, matching Kotlin's `Int` overflow semantics —
   use `wrapping_add`/`wrapping_sub`/`wrapping_mul`/`wrapping_neg`, never
   bare `+`/`-`/`*` on `i64` values in `interpreter.rs`. Integer division

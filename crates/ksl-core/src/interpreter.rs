@@ -328,7 +328,7 @@ impl<'a> Interpreter<'a> {
         match callee {
             Value::Native(n) => {
                 let positional: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
-                (n.func)(self, positional)
+                (n.func)(self, positional, span)
             }
             Value::Function(f) => self.call_function(&f, args, span),
             other => Err(RuntimeError::new(format!("'{}' is not callable", other.type_name()), span).into()),
