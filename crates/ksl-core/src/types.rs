@@ -123,25 +123,43 @@ impl Type {
             Value::Null => Type::Null,
             Value::List(_) => Type::List,
             Value::Function(f) => {
-                let empty_params: Vec<String> = Vec::new();
-                let empty_classes: HashSet<Rc<str>> = HashSet::new();
-                let param_types = f
-                    .params
-                    .iter()
-                    .map(|p| match &p.type_annotation {
-                        Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
-                        None => Type::Unknown,
-                    })
-                    .collect();
-                let ret_ty = match &f.return_type {
-                    Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
-                    None => Type::Unknown,
-                };
+                let (param_types, ret_ty) = function_signature_types(f);
                 Type::Function(param_types, Box::new(ret_ty))
             }
             Value::Native(_) => Type::Function(Vec::new(), Box::new(Type::Unknown)),
+            // No one fixed function type to report — real per-candidate
+            // types live in `Interpreter::call_value`'s own overload
+            // resolution, which needs the actual argument types anyway
+            // and doesn't go through `Type::from_value` for this.
+            Value::Overload(_) => Type::Unknown,
         }
     }
+}
+
+/// A `FunctionValue`'s real, checkable `(param types, return type)` —
+/// shared by `Type::from_value`'s `Function` arm and
+/// `Interpreter::call_value`'s runtime overload dispatch (`Value::Overload`),
+/// so both derive a function's static shape the same one way.
+/// `generic_params`/`known_classes` are always empty here (same as
+/// everywhere else a `FunctionValue`'s own annotations are resolved
+/// outside of a real enclosing declaration's own generic/class context —
+/// see `resolve_type_annotation`'s doc comment).
+pub fn function_signature_types(f: &crate::value::FunctionValue) -> (Vec<Type>, Type) {
+    let empty_params: Vec<String> = Vec::new();
+    let empty_classes: HashSet<Rc<str>> = HashSet::new();
+    let param_types = f
+        .params
+        .iter()
+        .map(|p| match &p.type_annotation {
+            Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
+            None => Type::Unknown,
+        })
+        .collect();
+    let ret_ty = match &f.return_type {
+        Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
+        None => Type::Unknown,
+    };
+    (param_types, ret_ty)
 }
 
 /// Resolves a raw type-hint name (`Param.type_annotation`/`ValDecl.type_annotation`/a
@@ -262,6 +280,84 @@ pub fn is_assignable(from: &Type, to: &Type) -> bool {
     }
 }
 
+/// The outcome of resolving a call's real argument types against a set of
+/// candidate overloads' parameter types — see `resolve_overload`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverloadResolution {
+    /// Exactly one candidate (by index into the input slice) is compatible.
+    Unique(usize),
+    /// More than one candidate is still possible — typically because some
+    /// argument's own type is `Unknown`, so it can't rule any of them out.
+    /// The caller decides what to do with this (e.g. use a shared return
+    /// type if every still-possible candidate agrees on one, else treat
+    /// the whole call as `Unknown`).
+    Ambiguous(Vec<usize>),
+    /// No candidate accepts this many arguments at all — arity is a
+    /// syntactic fact, so this is always a real mismatch, regardless of
+    /// whether any argument's own type is `Unknown`.
+    ArityMismatch,
+    /// At least one candidate accepts this many arguments, but none of
+    /// those is type-compatible with the given argument types.
+    NoMatch,
+}
+
+/// Real, Kotlin-style overload resolution by arity and argument type —
+/// generic over *any* set of candidate signatures (stdlib functions, user-
+/// declared `fun` overloads, or anything else with a parameter-type list),
+/// so the exact same mechanism applies whether the function being called is
+/// a builtin or user-defined; callers just need to line their own candidate
+/// list up with `candidate_params`.
+///
+/// `candidate_params[i]` is candidate `i`'s parameter types, in declaration
+/// order. Resolution: filter to the candidates whose arity matches
+/// `arg_types.len()` (`ArityMismatch` if none do — a real error regardless
+/// of `Unknown`, since argument *count* is never ambiguous); among those,
+/// prefer any candidate that's an **exact** type match at every position
+/// (so a specific `Int` overload wins over a same-arity `Any`/generic
+/// overload when called with a concrete `Int`, without needing a full
+/// Kotlin-style most-specific-overload ranking); otherwise fall back to
+/// plain assignability (`is_assignable`, with `Type::Unknown` — on either
+/// side — treated as compatible with anything, same as everywhere else
+/// `Unknown` appears). Exactly one compatible candidate is `Unique`; more
+/// than one is `Ambiguous` (letting the caller decide, e.g. by checking
+/// whether they all agree on a return type anyway); none is `NoMatch`.
+pub fn resolve_overload(candidate_params: &[&[Type]], arg_types: &[Type]) -> OverloadResolution {
+    let arity_matches: Vec<usize> = candidate_params
+        .iter()
+        .enumerate()
+        .filter(|(_, params)| params.len() == arg_types.len())
+        .map(|(i, _)| i)
+        .collect();
+    if arity_matches.is_empty() {
+        return OverloadResolution::ArityMismatch;
+    }
+
+    let exact: Vec<usize> = arity_matches
+        .iter()
+        .copied()
+        .filter(|&i| candidate_params[i].iter().zip(arg_types).all(|(p, a)| p == a))
+        .collect();
+    let compatible = if !exact.is_empty() {
+        exact
+    } else {
+        arity_matches
+            .into_iter()
+            .filter(|&i| {
+                candidate_params[i]
+                    .iter()
+                    .zip(arg_types)
+                    .all(|(p, a)| *a == Type::Unknown || *p == Type::Unknown || is_assignable(a, p))
+            })
+            .collect()
+    };
+
+    match compatible.len() {
+        1 => OverloadResolution::Unique(compatible[0]),
+        0 => OverloadResolution::NoMatch,
+        _ => OverloadResolution::Ambiguous(compatible),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +450,9 @@ mod tests {
             return_type: None,
             body: crate::ast::FunBody::Block(Vec::new()),
             closure: crate::environment::Env::new(),
+            file: std::sync::Arc::from(std::path::Path::new("<test>")),
+            decl_span: crate::error::Span::default(),
+            resolved_calls: std::rc::Rc::new(std::collections::HashMap::new()),
         }));
         assert_eq!(f.type_name(), "Function");
         assert_ne!(Type::from_value(&f).name(), f.type_name());
@@ -594,5 +693,58 @@ mod tests {
             resolved,
             Type::Nullable(Box::new(Type::Function(vec![Type::Int], Box::new(Type::String))))
         );
+    }
+
+    // ---- resolve_overload ----
+
+    #[test]
+    fn resolve_overload_no_candidate_accepts_this_arity() {
+        let candidates: &[&[Type]] = &[&[Type::Int], &[Type::Int, Type::Int]];
+        assert_eq!(resolve_overload(candidates, &[]), OverloadResolution::ArityMismatch);
+    }
+
+    #[test]
+    fn resolve_overload_arity_matches_but_no_type_matches() {
+        let candidates: &[&[Type]] = &[&[Type::Int], &[Type::Double]];
+        assert_eq!(resolve_overload(candidates, &[Type::String]), OverloadResolution::NoMatch);
+    }
+
+    #[test]
+    fn resolve_overload_unique_exact_match() {
+        let candidates: &[&[Type]] = &[&[Type::Int], &[Type::Double]];
+        assert_eq!(resolve_overload(candidates, &[Type::Int]), OverloadResolution::Unique(0));
+        assert_eq!(resolve_overload(candidates, &[Type::Double]), OverloadResolution::Unique(1));
+    }
+
+    #[test]
+    fn resolve_overload_unknown_argument_is_ambiguous_across_disagreeing_candidates() {
+        let candidates: &[&[Type]] = &[&[Type::Int], &[Type::Double]];
+        match resolve_overload(candidates, &[Type::Unknown]) {
+            OverloadResolution::Ambiguous(mut is) => {
+                is.sort();
+                assert_eq!(is, vec![0, 1]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_overload_specific_type_beats_a_same_arity_any_overload() {
+        // A concrete `Int` overload must win over a same-arity `Any`
+        // overload when called with a real `Int` — real Kotlin picks the
+        // most specific applicable overload, not an arbitrary one.
+        let candidates: &[&[Type]] = &[&[Type::Any], &[Type::Int]];
+        assert_eq!(resolve_overload(candidates, &[Type::Int]), OverloadResolution::Unique(1));
+    }
+
+    #[test]
+    fn resolve_overload_not_limited_to_numeric_types() {
+        // The whole point of replacing the old numeric-only special case:
+        // this must work for any argument types, not just Int/Double.
+        let candidates: &[&[Type]] = &[&[Type::String], &[Type::Bool], &[Type::String, Type::Bool]];
+        assert_eq!(resolve_overload(candidates, &[Type::String]), OverloadResolution::Unique(0));
+        assert_eq!(resolve_overload(candidates, &[Type::Bool]), OverloadResolution::Unique(1));
+        assert_eq!(resolve_overload(candidates, &[Type::String, Type::Bool]), OverloadResolution::Unique(2));
+        assert_eq!(resolve_overload(candidates, &[Type::Int]), OverloadResolution::NoMatch);
     }
 }

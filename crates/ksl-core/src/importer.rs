@@ -1,6 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{ImportDecl, Program, Stmt};
 use crate::environment::Env;
@@ -41,7 +43,7 @@ impl Importer {
         entry_path: Option<&Path>,
         interp: &mut Interpreter,
     ) -> Result<(), InterpError> {
-        let program = parse_program(src)?;
+        let (program, resolved_calls) = parse_and_resolve(src)?;
 
         let entry_canonical = match entry_path {
             Some(p) => Some(fs::canonicalize(p).map_err(|e| {
@@ -62,6 +64,15 @@ impl Importer {
             self.stack.pop();
         }
         result?;
+
+        // Stamped onto every `FunctionValue` declared while this file's
+        // own top-level statements run (see `Interpreter::current_file`) —
+        // left at its `Interpreter::new` default (`<script>`) when there's
+        // no real backing file (e.g. `ksl -` from stdin).
+        if let Some(canonical) = &entry_canonical {
+            interp.current_file = Arc::from(canonical.as_path());
+        }
+        interp.current_resolved = Rc::new(resolved_calls);
 
         run_program(interp, &program)
     }
@@ -118,17 +129,31 @@ impl Importer {
                 import.span,
             )))
         })?;
-        let program = parse_program(&source).map_err(|e| wrap(&canonical, e))?;
+        let (program, resolved_calls) = parse_and_resolve(&source).map_err(|e| wrap(&canonical, e))?;
 
         self.stack.push(canonical.clone());
         let child_base_dir = canonical
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        // Save/restore the caller's file identity (and its resolved-
+        // overload decisions) around this file's own run — a function
+        // declared in `canonical` must be stamped with *its* file (see
+        // `Interpreter::current_file`) and see *its own* file's overload
+        // resolutions (see `Interpreter::current_resolved`), but once this
+        // import returns, the importing file's own subsequent top-level
+        // statements (and any further sibling imports) need their own
+        // identity back, not whichever file was loaded last.
+        let caller_file = interp.current_file.clone();
+        let caller_resolved = interp.current_resolved.clone();
         let result: Result<(), InterpError> = (|| {
             self.run_imports(&program, &child_base_dir, interp)?;
+            interp.current_file = Arc::from(canonical.as_path());
+            interp.current_resolved = Rc::new(resolved_calls);
             run_program(interp, &program).map_err(|e| wrap(&canonical, e))
         })();
+        interp.current_file = caller_file;
+        interp.current_resolved = caller_resolved;
         self.stack.pop();
         result?;
 
@@ -137,8 +162,22 @@ impl Importer {
     }
 }
 
-fn parse_program(src: &str) -> Result<Program, InterpError> {
-    crate::parse_only(src).map_err(InterpError::Parse)
+/// Parses `src` and statically resolves it, in one pass, refusing to
+/// return a usable `Program` at all if `resolver::resolve` found any real
+/// type error — this is what removes the old separate `static_check`
+/// (its own independent re-parse+re-resolve of the same source) in favor
+/// of one shared analysis feeding both the "reject before running" check
+/// and execution itself. Returns the resolver's own `resolved_calls` map
+/// (call-site span → the one local-overload candidate it resolved to)
+/// alongside the `Program`, for the caller to hand to `Interpreter` before
+/// running these statements — see `Interpreter::current_resolved`.
+fn parse_and_resolve(src: &str) -> Result<(Program, HashMap<Span, Span>), InterpError> {
+    let program = crate::parse_only(src).map_err(InterpError::Parse)?;
+    let resolved = crate::resolver::resolve(&program);
+    if !resolved.type_errors.is_empty() {
+        return Err(InterpError::TypeErrors(resolved.type_errors));
+    }
+    Ok((program, resolved.resolved_calls))
 }
 
 /// Resolves `program`'s `import a.b.c` declarations (bringing each into
@@ -453,5 +492,30 @@ mod tests {
 
         let err = run_in(&dir, "main.ksl").unwrap_err();
         assert!(err.contains("unknown package 'a.b'"), "{err}");
+    }
+
+    /// A function declared in one file, called from another, must be
+    /// credited to *its own* file in a stack trace — not the calling
+    /// file's — and the calling function's own frame must show *its* own
+    /// file at the point it made the call. Regression test for a bug
+    /// where a frame's file and its printed position came from two
+    /// different files' coordinate spaces.
+    #[test]
+    fn cross_file_call_credits_each_frame_to_its_own_file() {
+        let dir = TempDir::new("cross_file_stack_trace");
+        dir.write(
+            "lib.ksl",
+            "import kotlin.test.*\nfun failing() {\n    assertTrue(1 > 2)\n}\n",
+        );
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"lib.ksl\")\nfun caller(): Unit {\n    failing()\n}\ncaller()\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        let lines: Vec<&str> = err.lines().collect();
+        assert!(lines[1].trim_start().starts_with("at assertTrue ("), "{err}");
+        assert!(lines[2].trim_start().contains("at failing() (") && lines[2].contains("lib.ksl:3"), "{err}");
+        assert!(lines[3].trim_start().contains("at caller() (") && lines[3].contains("main.ksl:3"), "{err}");
     }
 }

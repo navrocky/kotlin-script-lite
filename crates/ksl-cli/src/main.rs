@@ -45,13 +45,13 @@ fn main() -> ExitCode {
             }
         };
 
-    if let Err(type_errors) = ksl_core::static_check(&source) {
-        for e in &type_errors {
-            eprintln!("error: {} at {}", e.message, e.span);
-        }
-        return ExitCode::FAILURE;
-    }
-
+    // `run_source` now statically checks (and refuses to run) an ill-typed
+    // script itself, in the same pass that parses it — see
+    // `importer.rs`'s unified parse-resolve-then-run flow — so there's no
+    // separate `static_check` call needed here anymore; a type error
+    // surfaces through the same `Err(e)` branch below as any other error,
+    // via `InterpError::TypeErrors`'s own `Display` (one line per error,
+    // same wording this used to print by hand).
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     match ksl_core::run_source(&source, &mut handle, &base_dir, entry_path.as_deref()) {

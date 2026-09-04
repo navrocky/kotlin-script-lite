@@ -1,6 +1,9 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{FunBody, Param, TypeAnnotation};
 use crate::environment::Env;
@@ -20,6 +23,15 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     Function(Rc<FunctionValue>),
     Native(Rc<NativeValue>),
+    /// Real user-defined function overloading: a second (or later) `fun`
+    /// sharing a name already bound to a `Function`/`Overload` in the same
+    /// `Env` groups with it here instead of overwriting it (see
+    /// `Env::define`'s doc comment) — resolved to one specific candidate
+    /// by real argument type at the call site (`Interpreter::call_value`),
+    /// the exact same `types::resolve_overload` core the *static* checker
+    /// already uses for this. Never produced for a lambda (anonymous,
+    /// never shares a name with anything to group with).
+    Overload(Rc<Vec<Rc<FunctionValue>>>),
 }
 
 pub struct FunctionValue {
@@ -31,6 +43,59 @@ pub struct FunctionValue {
     pub return_type: Option<TypeAnnotation>,
     pub body: FunBody,
     pub closure: Env,
+    /// Which file this function was declared in — `Interpreter`'s
+    /// `current_file` at the moment the `fun`/lambda was evaluated. Used
+    /// for stack-trace frames (`error::StackFrame`) and, once a call site
+    /// is statically pre-resolved, to find the right runtime function
+    /// again by matching `decl_span` regardless of which file the call
+    /// happens to run from.
+    pub file: Arc<Path>,
+    /// The span of the `fun`/lambda declaration itself (not a call site) —
+    /// stable identity for "this exact declared function", used to match
+    /// a statically pre-resolved overload decision back to the concrete
+    /// `FunctionValue` built for it at runtime.
+    pub decl_span: Span,
+    /// This function's own file's resolver-computed overload decisions —
+    /// `Interpreter::current_resolved` at the moment this `fun`/lambda was
+    /// evaluated (same moment `file`/`decl_span` are captured). Restored
+    /// onto `Interpreter::current_resolved` for the duration of a call to
+    /// this function (see `call_function`), so a call site *inside* this
+    /// function's own body resolves against *its* file's decisions even
+    /// when called from a different file's code — without this, `Span`
+    /// having no file component would let two different files' call-site
+    /// spans collide in one shared table.
+    pub resolved_calls: Rc<HashMap<Span, Span>>,
+}
+
+/// A human-readable rendering of a function's call signature for stack
+/// traces, e.g. `"add(a: Int, b: Int)"` or `"<lambda>(x)"` for an
+/// unnamed/unannotated one — independent of `resolver.rs`'s own
+/// (differently-scoped) signature text, since `value.rs` must not depend
+/// on the resolver (see the interpreter/resolver independence this crate
+/// otherwise relies on).
+pub fn function_signature(f: &FunctionValue) -> String {
+    let name = f.name.as_deref().unwrap_or("<lambda>");
+    let params = f
+        .params
+        .iter()
+        .map(|p| match &p.type_annotation {
+            Some(ann) => format!("{}: {}", p.name, type_annotation_text(ann)),
+            None => p.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({params})")
+}
+
+fn type_annotation_text(ann: &TypeAnnotation) -> String {
+    match ann {
+        TypeAnnotation::Named(name, _) => name.clone(),
+        TypeAnnotation::Function(params, ret, _) => {
+            let params = params.iter().map(type_annotation_text).collect::<Vec<_>>().join(", ");
+            format!("({params}) -> {}", type_annotation_text(ret))
+        }
+        TypeAnnotation::Nullable(inner, _) => format!("{}?", type_annotation_text(inner)),
+    }
 }
 
 pub struct NativeValue {
@@ -52,7 +117,7 @@ impl Value {
             Value::Unit => "Unit",
             Value::Null => "Null",
             Value::List(_) => "List",
-            Value::Function(_) | Value::Native(_) => "Function",
+            Value::Function(_) | Value::Native(_) | Value::Overload(_) => "Function",
         }
     }
 
@@ -106,6 +171,9 @@ impl fmt::Display for Value {
                 write!(f, "<function {}>", func.name.as_deref().unwrap_or("lambda"))
             }
             Value::Native(n) => write!(f, "<function {}>", n.name),
+            Value::Overload(group) => {
+                write!(f, "<function {}>", group[0].name.as_deref().unwrap_or("lambda"))
+            }
         }
     }
 }

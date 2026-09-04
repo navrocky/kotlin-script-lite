@@ -688,6 +688,150 @@ duplicated here, so it doesn't go stale.
 
 ---
 
+## Phase 0.6 — Real overload resolution, function overloading, resolver/interpreter unification, and stack traces [DONE]
+
+Not part of the original 9-feature backlog — grew out of a user objection
+to `resolver.rs`'s `is_numeric_polymorphic` special case (a hardcoded
+`"abs" | "max" | "min"` match picking a call's return type from its first
+argument's numeric type): a patch, not real overload resolution, unable to
+handle non-numeric types, wrong arity, or any future overload shaped
+differently. The user's ask, generalized: overload resolution must work
+identically whether the function is a stdlib builtin or user-declared —
+which meant first *building* user-defined function overloading as a real
+language feature (it didn't exist at all before this phase: a second `fun
+foo` with the same name was unconditionally "already declared"). A
+follow-up question about avoiding redundant per-call dispatch cost then
+surfaced a deeper architectural fact: **the resolver and interpreter were
+two fully independent passes**, each re-parsing the same source separately
+(`run_source` never called `resolver::resolve` at all; the old
+`static_check` did, but never touched `Interpreter`). Real once-per-call-
+site resolution needed those two passes bridged for real — parse once,
+resolve once, and hand execution the resolver's own decisions — which is
+also exactly the infrastructure (each function value knowing its own home
+file) needed for real stack traces, so both landed together.
+
+**1. `types::resolve_overload`** — one generic, source-agnostic overload-
+resolution core (`OverloadResolution::{Unique, Ambiguous, ArityMismatch,
+NoMatch}`), taking only `candidate_params: &[&[Type]]` and `arg_types:
+&[Type]`. Filters by arity first (always a hard error if none match,
+`Unknown` or not), then prefers an *exact* type match at every position
+over plain assignability (so a concrete `Int` overload wins over a same-
+arity `Any` overload), and reports `Ambiguous` (not `Unknown`-flattened)
+when more than one candidate remains possible — letting each caller decide
+whether ambiguous-but-agreeing candidates are still safe to report a
+return type for. This one function is reused, unmodified, by every layer
+below.
+
+**2. Stdlib overload resolution** (resolver-only — stdlib native closures
+already dispatched correctly at runtime, e.g. `abs`'s closure pattern-
+matching on the real `Value`; only the *static* checker was wrong).
+`stdlib::is_numeric_polymorphic` is deleted; `stdlib_overloads`/
+`stdlib_qualified_overloads` (new) list every `BuiltinSymbol` sharing a
+name, and `resolver.rs`'s `Call`/`MethodCall` arms run `resolve_overload`
+over them whenever there's more than one — a genuinely new capability for
+the qualified form too (`kotlin.math.abs(-5)` gets real resolution for the
+first time; previously only the bare, imported form did). Concretely fixed
+gaps the old special case had: `abs("hello")` is now a real type error
+(`no overload of 'abs' matches argument types (String)`) instead of
+silently `Unknown`/no error; `abs(1, 2)` (wrong arity) is now flagged too.
+**One accepted behavior change**: ksl's own `max(anInt, aDouble)`/`min(...)`
+mixed-type convenience (documented as a ksl-only extra beyond real Kotlin)
+no longer type-checks — a mixed call needs an explicit conversion now,
+exactly like real Kotlin; `docs/stdlib.md`'s Math section and
+`tests/examples/closures.ksl` updated accordingly. The runtime's own
+`numeric_binary` widening fallback is left in place as defense-in-depth for
+a genuinely `Unknown`-typed dynamic call, documented as no longer a
+user-facing feature.
+
+**3. File identity + call stacks** (foundation for 4/5). `FunctionValue`
+gains `file: Arc<Path>` (`Arc`, not `Rc` — `ksl-lsp`'s runtime-diagnostics
+pass runs `run_source` on a background thread and needs the error type to
+stay `Send`) and `decl_span: Span` (the `fun`/lambda declaration's own
+span — must exactly match `resolver.rs`'s own `Symbol.def_span`, i.e. the
+*name's* span, not the whole statement's; got this wrong once during
+implementation — using the statement's span — and it silently broke fast-
+path matching in 5 below until caught by a dedicated counter-based test).
+`Interpreter` gains `current_file` (stamped onto every function/lambda
+created while it's the active file — swapped, save-and-restore, around
+`call_function` so a nested declaration inside a cross-file-called
+function gets *that* function's file, not the caller's) and `call_stack:
+Vec<StackFrame>` (pushed on entry, popped only on success, so an error in
+progress leaves the whole chain in place until `run_in_env` reads it off
+into the error itself and clears it). `RuntimeError` gains `stack:
+Vec<StackFrame>`; `InterpError::Runtime`'s `Display` prints one `    at
+<signature> (<file>:<line>:<col>)` line per frame, innermost first. Each
+frame's printed position is that frame's *own* file's coordinates (the
+span of whatever call *it* made further in) — not the caller's coordinates
+paired with the callee's file, a real bug caught and fixed during
+implementation by reasoning through a cross-file example by hand.
+
+**4. Real user-defined function overloading.** `resolver.rs`:
+`ScopeData::names` becomes `HashMap<String, Vec<usize>>` (was `HashMap<String,
+usize>`); `define()` now only flags a same-name `Fun` redeclaration as a
+conflict when either something non-`Fun` shares the name, or an existing
+`Fun` has the *exact* same parameter types (worded `"conflicting overload
+of '{name}'"`, distinct from plain `"already declared"`) — otherwise it's
+legal, appended to the group. New `resolve_symbols` (plural) returns the
+whole group for `Call` to run `resolve_overload` over; `resolve_symbol`
+(singular) keeps returning just the last-defined entry for every non-call
+use (hover, `Assign`, ...), a documented simplification. Runtime:
+`environment.rs`/`value.rs`/`interpreter.rs` gain `Value::Overload(Rc<Vec<Rc<FunctionValue>>>)`
+— a second `fun` sharing a name in the same `Env` groups with the first
+(`Env::get_own`, parent-blind on purpose) instead of overwriting it;
+`call_overload` (the runtime fallback — see 5) runs the same
+`resolve_overload` core against real argument types
+(`Type::from_value`)/real parameter types (new shared
+`types::function_signature_types`, also now used by `Type::from_value`'s
+own `Function` arm, removing a small pre-existing duplication).
+
+**5. The resolver → interpreter bridge** — what makes 4's runtime search
+the *fallback*, not the default. `ResolveResult` gains `resolved_calls:
+HashMap<Span, Span>` (call-site span → the one local-overload candidate's
+declaration span), populated whenever `Call` resolves a local overload
+group to exactly one candidate. `importer.rs`'s `run_top_level`/
+`load_import` now parse **and** resolve each file exactly once (new
+`parse_and_resolve`, replacing the old separate `static_check` — which did
+its own independent re-parse+re-resolve — with one shared analysis feeding
+both "reject before running" and execution); a `Program` that fails
+resolution never executes a single statement (`InterpError::TypeErrors`,
+new). `FunctionValue` additionally carries `resolved_calls: Rc<HashMap<Span,
+Span>>`, captured from `Interpreter::current_resolved` at the same moment
+`file`/`decl_span` are (and swapped the same way, around `call_function`) —
+this is what lets a call site *inside* a cross-file-called function
+resolve against *its own* file's decisions, not the caller's (`Span` has
+no file field, so two files' call-site spans could otherwise collide in
+one shared table). `eval_expr`'s `Call` handling checks
+`current_resolved.get(&expr.span)` first when the callee is a
+`Value::Overload`, and calls the named candidate directly, skipping
+`call_overload`'s search entirely — verified by a test-only call counter
+that a fully statically-typed overloaded call never invokes the runtime
+search at all, while a call bypassing resolution (or one the resolver left
+ambiguous) still falls back to it correctly.
+
+**Fallout fixed along the way**: `ksl-cli`'s separate `static_check` call
+is removed (`run_source` now does this itself); several `interpreter.rs`
+unit tests that deliberately exercised the *runtime* type-checking layer
+in isolation (wrongly-typed call arguments, incompatible `var`
+reassignment, unsafe nullable method/field access, untyped lambda
+parameters) now go through a new `run_bypassing_static_check` test helper
+(parses and runs directly against a bare `Interpreter`, skipping
+`resolver::resolve` entirely) since `run_source` itself now rejects those
+same scripts before ever reaching the runtime checks — preserving direct
+test coverage of that layer as defense-in-depth, independent of whether
+the resolver also happens to catch the same mistake. One vendored Kotlin
+box test (`elvis/nullNullOk.ksl`, `fun box() = null ?: null ?: "OK"`) hit
+a real, pre-existing resolver gap — inferring a hint-less `fun`'s return
+type through a chained elvis whose operands are `null` literals — that had
+simply never been exercised before `run_source` started statically
+checking; demoted to `kotlin-box-pending/` per the harness's own
+documented procedure (`kotlin-box/README.md`) rather than hand-fixed here,
+since it's an unrelated, separate resolver gap.
+
+**Docs:** `docs/syntax.md` gains a "Functions → Overloading" subsection.
+`docs/stdlib.md`'s error-format note now mentions the stack trace.
+
+---
+
 ## Phase 1 — `.` postfix member-access syntax
 
 The linchpin: classes, inheritance, and extension functions are all

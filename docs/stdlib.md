@@ -15,7 +15,11 @@ call (`kotlin.io.println(...)`) always works too, imported or not. See
 
 Errors thrown by these functions are runtime errors like any other — they
 stop the script and print `runtime error: <message> at <line:col>` to
-stderr, `<line:col>` being the actual call site.
+stderr, `<line:col>` being the actual call site, followed by a stack
+trace — one `    at <function>(<params>) (<file>:<line>:<col>)` line per
+active call, innermost first, each crediting the file the function
+printed there was actually declared in (not necessarily the file that
+called it).
 
 ## Output
 
@@ -146,18 +150,17 @@ The `Int` overload is a ksl-only convenience — real Kotlin's
 
 ```kotlin
 max(3, 7)       // 7
-min(3.5, 2)     // 2.0 (printed as "2")
+min(3.5, 2.0)   // 2.0 (printed as "2")
 ```
 
-Also a ksl-only convenience beyond these two overloads: mixed
-`max(anInt, aDouble)`/`min(...)` calls are still accepted at runtime,
-widening to `Double` — real Kotlin has no such overload (`Int` and
-`Double` never mix in one call without an explicit conversion).
-
-```kotlin
-max(3, 7)       // 7
-min(3.5, 2)     // 2.0 (printed as "2")
-```
+Matching real Kotlin exactly — `Int` and `Double` never mix in one call
+without an explicit conversion, so `min(3.5, 2)` (an `Int` where the
+`Double` overload needs a `Double`) is a type error, exactly like calling
+any other function with the wrong argument type. (An earlier ksl-only
+convenience silently widened a mixed call to `Double` at runtime instead;
+it was retired once overload resolution started picking a real, declared
+overload by actual argument type — same mechanism for every stdlib
+function, not a numeric-specific special case.)
 
 ## Assertions
 

@@ -207,10 +207,11 @@ pub fn is_known(name: &str) -> bool {
 /// in real Kotlin.
 ///
 /// Returns `None` for a name with no single checkable *return* type —
-/// `abs`/`max`/`min` (numeric-polymorphic overloads with *different*
-/// return types per overload — handled directly in `resolver.rs`'s `Call`
-/// arm instead, since there's no one fixed `Type` to report here). A
-/// variadic function like `listOf` still gets a real entry here (empty
+/// `abs`/`max`/`min` (overloads with *different* return types per
+/// overload — `resolver.rs` handles any multi-overload stdlib name via
+/// real overload resolution instead, see `stdlib_overloads` and
+/// `types::resolve_overload`, since there's no one fixed `Type` to report
+/// here). A variadic function like `listOf` still gets a real entry here (empty
 /// param list, real `Type::List` return): every argument goes unchecked
 /// (there's no fixed arity to check against, and `Type::List`'s own
 /// element type isn't tracked anyway), but its *return* type is always
@@ -251,6 +252,29 @@ pub fn stdlib_qualified_call_types(path: &[String]) -> Option<(Vec<Type>, Type)>
     call_types_from_entries(pkg.symbols.iter().filter(|s| s.name == name))
 }
 
+/// Every `BuiltinSymbol` overload sharing `name`, across all of
+/// `STDLIB_PACKAGES` — the raw candidate list `resolver.rs` runs real,
+/// per-argument-type overload resolution over (`types::resolve_overload`)
+/// whenever there's more than one, replacing the old numeric-only
+/// `is_numeric_polymorphic` special case with something that works for
+/// any overloaded stdlib function, of any argument types, not just
+/// `Int`/`Double`. A name with zero or one overload has nothing to
+/// resolve between — `resolver.rs` uses `stdlib_call_types` for that case
+/// instead, unaffected by this function.
+pub fn stdlib_overloads(name: &str) -> Vec<&'static BuiltinSymbol> {
+    STDLIB_PACKAGES.iter().flat_map(|p| p.symbols).filter(|s| s.name == name && s.variadic_param.is_none()).collect()
+}
+
+/// Same as `stdlib_overloads`, but for a fully package-qualified call —
+/// see `stdlib_qualified_call_types`'s doc comment for why the package
+/// segment must be validated, not just the trailing name.
+pub fn stdlib_qualified_overloads(path: &[String]) -> Vec<&'static BuiltinSymbol> {
+    let Some((name, package_segs)) = path.split_last() else { return Vec::new() };
+    let package_name = package_segs.join(".");
+    let Some(pkg) = STDLIB_PACKAGES.iter().find(|p| p.name == package_name) else { return Vec::new() };
+    pkg.symbols.iter().filter(|s| s.name == name && s.variadic_param.is_none()).collect()
+}
+
 /// Shared derivation both `stdlib_call_types` and `stdlib_qualified_call_types`
 /// build on, given whichever `BuiltinSymbol`s share the name being called
 /// (already filtered to the right package, for the qualified case). Several
@@ -260,10 +284,12 @@ pub fn stdlib_qualified_call_types(path: &[String]) -> Option<(Vec<Type>, Type)>
 /// return type (true for `sqrt`'s two overloads, both returning Double) —
 /// otherwise (abs/max/min, where Int vs Double overloads return different
 /// types) there's no safe single signature, so this returns `None`.
-/// `resolver.rs`'s own numeric-polymorphic special case (picks the type
-/// from the actual first argument, bare-name calls only — see
-/// `is_numeric_polymorphic` below) is unaffected by this and still
-/// handles those.
+/// `resolver.rs`'s own real overload resolution (`stdlib_overloads` +
+/// `types::resolve_overload`, picking a candidate by the call's actual
+/// argument types) is unaffected by this and handles any name with more
+/// than one overload instead — this function (and its qualified
+/// counterpart) is only ever consulted by `resolver.rs` for a name with
+/// zero or one overload.
 ///
 /// A variadic entry (`listOf`) has no fixed arity to check individual
 /// arguments against, but its return type is still real and known
@@ -297,31 +323,6 @@ fn call_types_from_entries<'a>(entries: impl Iterator<Item = &'a BuiltinSymbol>)
     }
 }
 
-/// True for a stdlib name whose every overload has the shape `fn(T, ...,
-/// T): T` for some numeric `T` (every parameter and the return type all
-/// equal one common numeric type, which varies by overload) — `abs`/
-/// `max`/`min` today. `resolver.rs`'s `Call` arm uses this, instead of a
-/// hardcoded name list, to decide when a call's return type should be
-/// inferred from its own first argument's numeric type — the one case
-/// `call_types_from_entries` can't report as a single fixed `Type`
-/// because the overloads genuinely disagree on return type. Computed
-/// structurally from `STDLIB_PACKAGES`, so a future stdlib overload set
-/// with this exact shape is picked up automatically — nothing to
-/// remember to update by hand (the way `resolver.rs`'s old hardcoded
-/// `"abs" | "max" | "min"` match could have silently missed one).
-pub fn is_numeric_polymorphic(name: &str) -> bool {
-    let entries: Vec<&BuiltinSymbol> = STDLIB_PACKAGES
-        .iter()
-        .flat_map(|p| p.symbols)
-        .filter(|s| s.name == name && s.variadic_param.is_none())
-        .collect();
-    entries.len() > 1
-        && entries.iter().all(|s| {
-            matches!(s.return_type, Type::Int | Type::Double)
-                && !s.params.is_empty()
-                && s.params.iter().all(|p| p.ty == s.return_type)
-        })
-}
 
 /// Defines a native function `name` on `env` — the one primitive every
 /// package's own `populate` fn builds on.
@@ -528,21 +529,25 @@ mod tests {
         assert_eq!(stdlib_qualified_call_types(&path(&["assertFalse"])), None);
     }
 
-    /// Regression/documentation test for `is_numeric_polymorphic`:
-    /// confirms it derives exactly the same three names `resolver.rs`
-    /// used to hardcode (`abs`/`max`/`min`), and correctly excludes
-    /// `sqrt` (same-Double-return overloads, not param-equals-return) and
-    /// any non-overloaded or non-numeric name.
     #[test]
-    fn is_numeric_polymorphic_matches_the_old_hardcoded_name_list() {
-        assert!(is_numeric_polymorphic("abs"));
-        assert!(is_numeric_polymorphic("max"));
-        assert!(is_numeric_polymorphic("min"));
-        assert!(!is_numeric_polymorphic("sqrt"));
-        assert!(!is_numeric_polymorphic("println"));
-        assert!(!is_numeric_polymorphic("length"));
-        assert!(!is_numeric_polymorphic("assertEquals"));
-        assert!(!is_numeric_polymorphic("nope"));
+    fn stdlib_overloads_lists_every_overload_sharing_a_name() {
+        assert_eq!(stdlib_overloads("abs").len(), 2);
+        assert_eq!(stdlib_overloads("max").len(), 2);
+        assert_eq!(stdlib_overloads("min").len(), 2);
+        assert_eq!(stdlib_overloads("sqrt").len(), 2);
+        assert_eq!(stdlib_overloads("println").len(), 1);
+        assert_eq!(stdlib_overloads("nope").len(), 0);
+        // listOf is variadic, not overloaded — excluded, matching
+        // `stdlib_call_types`'s own single-entry handling for it.
+        assert_eq!(stdlib_overloads("listOf").len(), 0);
+    }
+
+    #[test]
+    fn stdlib_qualified_overloads_validates_the_package_too() {
+        let path = |segs: &[&str]| segs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(stdlib_qualified_overloads(&path(&["kotlin", "math", "abs"])).len(), 2);
+        assert_eq!(stdlib_qualified_overloads(&path(&["kotlin", "test", "abs"])).len(), 0);
+        assert_eq!(stdlib_qualified_overloads(&path(&["kotlin", "nope", "abs"])).len(), 0);
     }
 
     /// Regression test: `listOf` (variadic) used to be entirely excluded

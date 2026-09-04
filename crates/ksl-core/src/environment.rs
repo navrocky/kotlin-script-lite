@@ -78,6 +78,16 @@ impl Env {
         }
     }
 
+    /// Like `get`, but only ever looks at this exact scope — never a
+    /// parent. Used by `StmtKind::FunDecl` execution to tell "a sibling
+    /// `fun` already declared this name *in this same scope*" (real
+    /// overloading — group with it, see `Value::Overload`) apart from "a
+    /// same-named binding exists somewhere further out" (irrelevant
+    /// shadowing, not a reason to group).
+    pub fn get_own(&self, name: &str) -> Option<Value> {
+        self.0.borrow().vars.get(name).map(|b| b.value.clone())
+    }
+
     pub fn assign(&self, name: &str, value: Value) -> Result<(), AssignError> {
         let mut data = self.0.borrow_mut();
         if let Some(b) = data.vars.get_mut(name) {

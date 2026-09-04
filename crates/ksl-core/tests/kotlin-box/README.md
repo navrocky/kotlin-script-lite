@@ -88,3 +88,4 @@ fixed: move its path from `PENDING_FILES` to `ACTIVE_FILES` in
 | `controlStructures/factorialTest.ksl` | same (`do`/`while`) |
 | `controlStructures/kt2147.ksl` | classes (`docs/roadmap.md` Phase 6) |
 | `basics/local_variable.ksl` | `throw` (`docs/roadmap.md` Phase 5) |
+| `elvis/nullNullOk.ksl` | resolver can't infer a hint-less `fun`'s return type through a chained elvis whose operands are `null` literals (`null ?: null ?: "OK"`) — demoted from `kotlin-box/` once `run_source` started statically checking a file before running it (see Phase 0.5's own addendum on this) and this pre-existing gap started actually blocking the file instead of going unexercised |

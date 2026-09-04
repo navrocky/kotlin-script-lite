@@ -148,6 +148,14 @@ fn expect_num(name: &str, args: &[Value], idx: usize, span: Span) -> Result<f64,
     }
 }
 
+/// A mixed `(Int, Double)`/`(Double, Int)` pair still widens to `Double`
+/// here at runtime — a lenient fallback for a call the static checker
+/// couldn't fully type (e.g. an `Unknown`-typed argument), not a
+/// documented feature: `max`/`min`'s declared overloads
+/// (`(Int,Int):Int`/`(Double,Double):Double`, see `PACKAGE` above) no
+/// longer include a mixed shape, so a *statically*-typed mixed call like
+/// `min(3.5, 2)` is now a real type error before this ever runs — see
+/// `docs/stdlib.md`'s Math section.
 fn numeric_binary(a: &Value, b: &Value, span: Span, f: impl Fn(f64, f64) -> f64) -> Result<Value, Flow> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => {

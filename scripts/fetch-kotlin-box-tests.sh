@@ -38,7 +38,6 @@ ACTIVE_FILES=(
   "controlStructures/ifConst1.kt"
   "controlStructures/kt1899.kt"
   "controlStructures/kt870.kt"
-  "elvis/nullNullOk.kt"
   "basics/concatenation.kt"
 )
 
@@ -48,11 +47,19 @@ ACTIVE_FILES=(
 #                                     construct in ksl at all yet)
 #   kt2147.kt                     -- classes (roadmap Phase 6)
 #   local_variable.kt             -- `throw` (roadmap Phase 5)
+#   nullNullOk.kt                 -- resolver can't infer a hint-less fun's
+#                                     return type through a chained elvis
+#                                     whose operands are `null` literals
+#                                     (`null ?: null ?: "OK"`) — surfaced
+#                                     once `run_source` started statically
+#                                     checking before running (see
+#                                     docs/roadmap.md's Phase 0.5)
 PENDING_FILES=(
   "controlStructures/doWhile.kt"
   "controlStructures/factorialTest.kt"
   "controlStructures/kt2147.kt"
   "basics/local_variable.kt"
+  "elvis/nullNullOk.kt"
 )
 
 fetch() {

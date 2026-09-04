@@ -414,6 +414,29 @@ add(a = 1, b = 2)       // named arguments can be given in any order
 - Functions declared with `fun` inside another function's body are
   closures over that enclosing scope, and can be recursive.
 
+### Overloading
+
+```kotlin
+fun describe(x: Int): String = "int $x"
+fun describe(x: String): String = "string $x"
+
+println(describe(5))     // "int 5"
+println(describe("hi"))  // "string hi"
+```
+
+Several `fun`s sharing one name are legal as long as their parameter types
+make them distinguishable — matching real Kotlin, this is real overload
+resolution by the call's actual argument types (arity first, then an exact
+type match, then ordinary assignability), not name-mangling or a
+first-match-wins list; picking a stdlib function (like `abs`/`max`/`min`)
+between its own overloads uses the exact same mechanism. A call whose
+argument types don't match *any* declared overload — wrong arity, or no
+overload accepts the given types — is a compile-time error, same as any
+other type mismatch. Two `fun`s sharing a name with the *exact* same
+parameter types (not just the same arity) is a compile-time
+"conflicting overload" error, distinct from redeclaring a plain `val`/`var`
+name (still "already declared").
+
 ## Lambdas / closures
 
 ```kotlin

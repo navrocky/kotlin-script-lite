@@ -116,12 +116,19 @@ struct ScopeData {
     /// suggestion, never a missing one. `symbol_at` is unaffected either
     /// way, since it matches on `occurrences`, not scope bounds.
     bounds: Span,
-    /// name -> index into `SymbolTable::symbols`. A later definition of the
-    /// same name in the same scope overwrites the entry (shadowing within
-    /// one scope is flagged as a diagnostic at definition time, see
-    /// `Resolver::define`), matching last-write-wins the way a second
-    /// `env.define` with the same name would at runtime.
-    names: HashMap<String, usize>,
+    /// name -> every declared symbol index sharing it, in declaration
+    /// order — almost always exactly one entry; more than one only when
+    /// they're all mutually-distinguishable `Fun` overloads (real
+    /// overloading — see `Resolver::define`), which is the one case this
+    /// isn't a conflict. Any other same-name redefinition in one scope
+    /// (a second `val`/`var`, or a `Fun` whose signature exactly matches
+    /// an existing one) is flagged as a diagnostic at definition time but
+    /// still appended, matching last-write-wins the way a second
+    /// `env.define` with the same name would at runtime — `resolve_symbol`
+    /// resolves such a group to its *last* entry as a documented
+    /// simplification; only a real call site (`Call`/`MethodCall`) needs
+    /// the *whole* group, via `resolve_symbols`.
+    names: HashMap<String, Vec<usize>>,
 }
 
 pub struct SymbolTable {
@@ -218,7 +225,7 @@ impl SymbolTable {
     /// unrelated to `symbols_in_scope`, which is scoped to a cursor
     /// position within *this* file, not "what does this file export".
     pub fn top_level_symbols(&self) -> impl Iterator<Item = &Symbol> {
-        self.scopes[0].names.values().map(|&idx| &self.symbols[idx])
+        self.scopes[0].names.values().flatten().map(|&idx| &self.symbols[idx])
     }
 
     /// Like `symbol_at`, but also returns the exact span of the occurrence
@@ -246,9 +253,15 @@ impl SymbolTable {
         let mut out = Vec::new();
         loop {
             let scope = &self.scopes[scope_idx];
-            for (name, &sym_idx) in &scope.names {
+            for (name, indices) in &scope.names {
                 if seen.insert(name.clone()) {
-                    out.push(&self.symbols[sym_idx]);
+                    // Every overload sharing this name in the nearest
+                    // scope that declares it at all (almost always just
+                    // one) — an outer scope's same name is still fully
+                    // shadowed, exactly as before.
+                    for &sym_idx in indices {
+                        out.push(&self.symbols[sym_idx]);
+                    }
                 }
             }
             match scope.parent {
@@ -280,6 +293,15 @@ pub struct ResolveResult {
     /// changing behavior for the pre-existing, deliberately-imprecise
     /// diagnostics.
     pub type_errors: Vec<RuntimeError>,
+    /// Call-site span → the chosen overload's own declaration span, for
+    /// every call that resolved to exactly one of *several* local `fun`
+    /// overloads (see `ScopeData::names`'s doc comment) — empty for the
+    /// overwhelming majority of calls, which never had more than one
+    /// candidate to begin with. This is what lets a later execution pass
+    /// skip redoing the same by-argument-type search the resolver already
+    /// did, by matching a `FunctionValue`'s own `decl_span` against the
+    /// value recorded here for a given call site.
+    pub resolved_calls: HashMap<Span, Span>,
 }
 
 pub fn resolve(program: &Program) -> ResolveResult {
@@ -295,6 +317,7 @@ pub fn resolve(program: &Program) -> ResolveResult {
         },
         diagnostics: Vec::new(),
         type_errors: Vec::new(),
+        resolved_calls: HashMap::new(),
         imported_names: program.imports_use.iter().filter(|u| !u.wildcard).map(|u| u.path.last().unwrap().clone()).collect(),
         has_file_imports: !program.imports.is_empty(),
         has_wildcard_import: program.imports_use.iter().any(|u| u.wildcard),
@@ -305,13 +328,14 @@ pub fn resolve(program: &Program) -> ResolveResult {
     };
     let global = r.push_scope(None, 0, FILE_SPAN);
     r.walk_stmts(&program.stmts, global, FILE_END);
-    ResolveResult { table: r.table, diagnostics: r.diagnostics, type_errors: r.type_errors }
+    ResolveResult { table: r.table, diagnostics: r.diagnostics, type_errors: r.type_errors, resolved_calls: r.resolved_calls }
 }
 
 struct Resolver {
     table: SymbolTable,
     diagnostics: Vec<RuntimeError>,
     type_errors: Vec<RuntimeError>,
+    resolved_calls: HashMap<Span, Span>,
     /// Bare names brought in by this file's own `import a.b.c` (the last
     /// segment of each path) — never flagged as undefined, since exactly
     /// which names these introduce is known precisely (unlike plain
@@ -538,11 +562,33 @@ impl Resolver {
         param_names: Vec<String>,
         doc: Option<String>,
     ) -> usize {
-        if self.table.scopes[scope].names.contains_key(name) {
-            self.diagnostics.push(RuntimeError::new(
-                format!("'{name}' is already declared in this scope"),
-                def_span,
-            ));
+        // Real overloading — several `Fun` declarations sharing one name —
+        // is legal *only* when every existing entry under this name is
+        // also a `Fun` and none of them has this exact same parameter-type
+        // signature already (a genuine conflict, matching real Kotlin's
+        // "conflicting overloads" error, not "already declared" — the
+        // wording differs on purpose, since these are different mistakes:
+        // one is redeclaring a name, the other is redeclaring a signature).
+        // Anything else sharing a name with `kind`/an existing non-`Fun`
+        // entry is the original, unconditional "already declared" case.
+        let existing = self.table.scopes[scope].names.get(name).cloned().unwrap_or_default();
+        if !existing.is_empty() {
+            let all_fun = kind == SymbolKind::Fun && existing.iter().all(|&i| self.table.symbols[i].kind == SymbolKind::Fun);
+            if all_fun {
+                if existing.iter().any(|&i| self.table.symbols[i].param_types == param_types) {
+                    self.diagnostics.push(RuntimeError::new(
+                        format!(
+                            "conflicting overload of '{name}': a function with this exact signature is already declared in this scope"
+                        ),
+                        def_span,
+                    ));
+                }
+            } else {
+                self.diagnostics.push(RuntimeError::new(
+                    format!("'{name}' is already declared in this scope"),
+                    def_span,
+                ));
+            }
         }
         let idx = self.table.symbols.len();
         self.table.symbols.push(Symbol {
@@ -557,7 +603,7 @@ impl Resolver {
             param_names,
             doc,
         });
-        self.table.scopes[scope].names.insert(name.to_string(), idx);
+        self.table.scopes[scope].names.entry(name.to_string()).or_default().push(idx);
         self.table.occurrences.push((def_span, idx));
         self.touch(scope, def_span);
         idx
@@ -731,15 +777,38 @@ impl Resolver {
         self.resolve_symbol_index(scope, name).map(|idx| &self.table.symbols[idx])
     }
 
+    /// The *last*-declared symbol sharing `name`, from the nearest scope
+    /// that declares it at all — a deliberate simplification for every
+    /// non-call use (hover, `Assign`, generic name resolution): picking
+    /// one of several real overloads to represent "the" symbol for these
+    /// purposes is inherently lossy, but none of them need true per-
+    /// overload resolution the way an actual call does — see
+    /// `resolve_symbols` for that.
     fn resolve_symbol_index(&self, scope: usize, name: &str) -> Option<usize> {
         let mut cur = Some(scope);
         while let Some(s) = cur {
-            if let Some(&idx) = self.table.scopes[s].names.get(name) {
-                return Some(idx);
+            if let Some(indices) = self.table.scopes[s].names.get(name) {
+                return indices.last().copied();
             }
             cur = self.table.scopes[s].parent;
         }
         None
+    }
+
+    /// Every symbol sharing `name` from the nearest scope that declares it
+    /// at all — almost always exactly one, more than one only for a real
+    /// local overload group (see `ScopeData::names`'s doc comment). Used
+    /// only by `Call`, which needs the *whole* group to resolve which
+    /// overload actually applies to a given call's argument types.
+    fn resolve_symbols(&self, scope: usize, name: &str) -> Vec<&Symbol> {
+        let mut cur = Some(scope);
+        while let Some(s) = cur {
+            if let Some(indices) = self.table.scopes[s].names.get(name) {
+                return indices.iter().map(|&idx| &self.table.symbols[idx]).collect();
+            }
+            cur = self.table.scopes[s].parent;
+        }
+        Vec::new()
     }
 
     /// `following` is the span of whatever comes next, textually, after
@@ -1404,6 +1473,119 @@ impl Resolver {
         ret_ty
     }
 
+    /// Real, Kotlin-style overload resolution for a call to a stdlib name
+    /// with more than one overload (`abs`/`max`/`min`/`sqrt` today) — by
+    /// arity and actual argument type, via `types::resolve_overload`, not
+    /// a hardcoded name list tied to numeric types. Shared by `Call`
+    /// (bare name) and `MethodCall` (fully package-qualified path) so a
+    /// stdlib overload set resolves identically either way — `entries`
+    /// comes from `stdlib::stdlib_overloads`/`stdlib_qualified_overloads`
+    /// respectively.
+    ///
+    /// - No overload accepts this many arguments: always a real error —
+    ///   arity is a syntactic fact, `Type::Unknown` can't excuse it.
+    /// - Zero type-compatible overloads at the right arity, and every
+    ///   argument's own type is concrete (no `Unknown` anywhere): a
+    ///   genuine mismatch, reported the same way.
+    /// - Exactly one type-compatible overload: its parameters are already
+    ///   known compatible, so nothing left to flag — just its return type.
+    /// - More than one still-possible match (typically because an
+    ///   argument's own type is `Unknown`): if they all happen to agree
+    ///   on return type regardless of which actually applies, that's safe
+    ///   to report (matches `sqrt`'s two overloads, both `Double`);
+    ///   otherwise `Type::Unknown`, deferred, no error — can't be sure
+    ///   it's really wrong.
+    fn resolve_stdlib_overload(
+        &mut self,
+        name: &str,
+        entries: &[&'static crate::stdlib::BuiltinSymbol],
+        arg_infos: &[(Option<String>, Type)],
+        span: Span,
+    ) -> Type {
+        let arg_types: Vec<Type> = arg_infos.iter().map(|(_, t)| t.clone()).collect();
+        let candidate_params: Vec<Vec<Type>> =
+            entries.iter().map(|s| s.params.iter().map(crate::stdlib::BuiltinParam::real_type).collect()).collect();
+        let candidate_param_slices: Vec<&[Type]> = candidate_params.iter().map(Vec::as_slice).collect();
+        match types::resolve_overload(&candidate_param_slices, &arg_types) {
+            types::OverloadResolution::Unique(i) => entries[i].return_type.clone(),
+            types::OverloadResolution::Ambiguous(is) => {
+                let first_ret = entries[is[0]].return_type.clone();
+                if is.iter().all(|&i| entries[i].return_type == first_ret) { first_ret } else { Type::Unknown }
+            }
+            types::OverloadResolution::ArityMismatch => {
+                self.type_errors.push(RuntimeError::new(
+                    format!("no overload of '{name}' accepts {} argument(s)", arg_types.len()),
+                    span,
+                ));
+                Type::Unknown
+            }
+            types::OverloadResolution::NoMatch => {
+                if arg_types.iter().all(|t| *t != Type::Unknown) {
+                    let arg_list = arg_types.iter().map(Type::name).collect::<Vec<_>>().join(", ");
+                    self.type_errors.push(RuntimeError::new(
+                        format!("no overload of '{name}' matches argument types ({arg_list})"),
+                        span,
+                    ));
+                }
+                Type::Unknown
+            }
+        }
+    }
+
+    /// Same idea as `resolve_stdlib_overload`, for a call to more than one
+    /// local `fun` sharing one name (real user-defined overloading — see
+    /// `ScopeData::names`'s doc comment) — the exact same
+    /// `types::resolve_overload` core, just fed from `Symbol.param_types`/
+    /// `return_type` instead of `BuiltinSymbol`, so the mechanism is
+    /// identical regardless of whether the function being called is a
+    /// builtin or user-declared. The one addition: a `Unique` match also
+    /// records `call_span -> chosen.def_span` in `resolved_calls` — the
+    /// decision a later execution pass can use to skip redoing this same
+    /// search by runtime argument type (see `ResolveResult::resolved_calls`'s
+    /// doc comment).
+    /// `candidates` is `(param_types, return_type, def_span)` per local
+    /// overload — cloned out of the resolver's own `Symbol` table by the
+    /// caller (rather than borrowed as `&Symbol`) purely so this can take
+    /// `&mut self` (for `type_errors`/`resolved_calls`) without the
+    /// borrow checker seeing a conflicting live borrow of `self.table`.
+    fn resolve_user_overload(
+        &mut self,
+        name: &str,
+        candidates: &[(Vec<Type>, Type, Span)],
+        arg_infos: &[(Option<String>, Type)],
+        span: Span,
+    ) -> Type {
+        let arg_types: Vec<Type> = arg_infos.iter().map(|(_, t)| t.clone()).collect();
+        let candidate_params: Vec<&[Type]> = candidates.iter().map(|(p, _, _)| p.as_slice()).collect();
+        match types::resolve_overload(&candidate_params, &arg_types) {
+            types::OverloadResolution::Unique(i) => {
+                self.resolved_calls.insert(span, candidates[i].2);
+                candidates[i].1.clone()
+            }
+            types::OverloadResolution::Ambiguous(is) => {
+                let first_ret = candidates[is[0]].1.clone();
+                if is.iter().all(|&i| candidates[i].1 == first_ret) { first_ret } else { Type::Unknown }
+            }
+            types::OverloadResolution::ArityMismatch => {
+                self.type_errors.push(RuntimeError::new(
+                    format!("no overload of '{name}' accepts {} argument(s)", arg_types.len()),
+                    span,
+                ));
+                Type::Unknown
+            }
+            types::OverloadResolution::NoMatch => {
+                if arg_types.iter().all(|t| *t != Type::Unknown) {
+                    let arg_list = arg_types.iter().map(Type::name).collect::<Vec<_>>().join(", ");
+                    self.type_errors.push(RuntimeError::new(
+                        format!("no overload of '{name}' matches argument types ({arg_list})"),
+                        span,
+                    ));
+                }
+                Type::Unknown
+            }
+        }
+    }
+
     /// Like `walk_expr`, but with an optional "expected type" for `expr`
     /// itself — used only by a `Lambda` at this exact position to infer its
     /// parameter types when it has no explicit annotation of its own (see
@@ -1517,18 +1699,31 @@ impl Resolver {
                 // argument-vs-parameter checking a bare, imported call to
                 // the same function already gets via `ExprKind::Call`'s
                 // `stdlib::stdlib_call_types` — matching real Kotlin, where
-                // both call forms are the same function. `None` here (an
-                // unrecognized qualified path — a typo, or a real cross-
-                // file user package this single-file resolver has no
-                // static visibility into either way) falls through to
-                // `check_call_signature`'s own `None` case below, exactly
-                // preserving today's lenient `Type::Unknown` behavior.
-                let signature = qualified_path.as_ref().and_then(|path| {
-                    crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
-                        let names = vec![String::new(); param_types.len()];
-                        (ret_ty, param_types, names)
+                // both call forms are the same function. More than one
+                // overload (e.g. `kotlin.math.abs(-5)`) gets real overload
+                // resolution instead, exactly like the bare-name `Call`
+                // arm — a genuinely new capability for the qualified form.
+                // `None`/empty here (an unrecognized qualified path — a
+                // typo, or a real cross-file user package this single-file
+                // resolver has no static visibility into either way) falls
+                // through to `check_call_signature`'s own `None` case
+                // below, exactly preserving today's lenient `Type::Unknown`
+                // behavior.
+                let overloads: Vec<&'static crate::stdlib::BuiltinSymbol> = qualified_path
+                    .as_ref()
+                    .map(|path| crate::stdlib::stdlib_qualified_overloads(path))
+                    .unwrap_or_default();
+                let use_overload_resolution = overloads.len() > 1;
+                let signature = if use_overload_resolution {
+                    None
+                } else {
+                    qualified_path.as_ref().and_then(|path| {
+                        crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
+                            let names = vec![String::new(); param_types.len()];
+                            (ret_ty, param_types, names)
+                        })
                     })
-                });
+                };
                 let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
                 // An unsafe (`.`) call on a still-nullable receiver is
                 // rejected outright, matching Kotlin's own compile error —
@@ -1580,13 +1775,23 @@ impl Resolver {
                             }
                         }
                         // The qualified-path case (`kotlin.test.assertFalse(...)`):
-                        // `signature` is `Some` exactly when the path
-                        // resolved to a real stdlib member above, in which
-                        // case this both checks `arg_infos` against it and
-                        // returns its real return type — `None` (unknown
-                        // qualified path) falls back to `Type::Unknown`,
-                        // unchanged from before this check existed.
-                        None => self.check_call_signature(&arg_infos, signature, *method_span),
+                        // `signature`/`overloads` is populated exactly when
+                        // the path resolved to real stdlib member(s) above;
+                        // this checks `arg_infos` against it (single
+                        // overload) or resolves among several (multiple
+                        // overloads) and returns the real return type —
+                        // `None`/empty (unknown qualified path) falls back
+                        // to `Type::Unknown`, unchanged from before this
+                        // check existed.
+                        None => {
+                            if use_overload_resolution {
+                                let Some(path) = &qualified_path else { unreachable!() };
+                                let name = path.last().unwrap();
+                                self.resolve_stdlib_overload(name, &overloads, &arg_infos, *method_span)
+                            } else {
+                                self.check_call_signature(&arg_infos, signature, *method_span)
+                            }
+                        }
                     }
                 };
                 // A safe (`?.`) call's own result is nullable whenever it
@@ -1712,74 +1917,114 @@ impl Resolver {
             ExprKind::Call { callee, args } => {
                 self.walk_expr(callee, scope, following);
 
+                // A bare name with more than one candidate — several local
+                // `fun` overloads (real user-defined overloading — see
+                // `ScopeData::names`'s doc comment), or, absent any local
+                // symbol at all, more than one stdlib overload (`abs`/
+                // `max`/`min`/`sqrt`) — gets real overload resolution below
+                // instead of a single collapsed signature, decided up
+                // front so no expected-type is propagated into a lambda
+                // argument for it (which overload even applies isn't known
+                // before the arguments are walked anyway). Local overloads
+                // take priority over a same-named stdlib function, exactly
+                // like the single-candidate path below already does via
+                // `resolve_symbol` before `stdlib_call_types`.
+                let local_overload_count = match &callee.kind {
+                    ExprKind::Name(name) => {
+                        let syms = self.resolve_symbols(scope, name);
+                        if !syms.is_empty() && syms.iter().all(|s| s.kind == SymbolKind::Fun) {
+                            syms.len()
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                };
+                let use_local_overload_resolution = local_overload_count > 1;
+
+                let overloads: Vec<&'static crate::stdlib::BuiltinSymbol> = if use_local_overload_resolution {
+                    Vec::new()
+                } else {
+                    match &callee.kind {
+                        ExprKind::Name(name) if self.resolve_symbol(scope, name).is_none() => {
+                            crate::stdlib::stdlib_overloads(name)
+                        }
+                        _ => Vec::new(),
+                    }
+                };
+                let use_stdlib_overload_resolution = overloads.len() > 1;
+                let use_overload_resolution = use_local_overload_resolution || use_stdlib_overload_resolution;
+
                 // A checkable signature comes from either a local `fun`
-                // symbol or a stdlib function with a known machine-
-                // readable signature (a `BuiltinSymbol`'s own signature
-                // field is a free-text display string, not this). Stdlib
-                // params have no real names to match a named argument
-                // against (`String::new()` placeholders — any named-arg
-                // call to a stdlib function falls into the "unknown
-                // parameter" case below, a minor, documented limitation).
-                // Resolved *before* walking the arguments (unlike every
-                // other subexpression here) so a lambda argument whose
-                // matching parameter is itself a function type
-                // (`apply({ x -> x * 2 }, 5)`) can infer its own parameter
-                // types from that — see `walk_expr_expected`.
-                let signature = match &callee.kind {
-                    ExprKind::Name(name) => self
-                        .resolve_symbol(scope, name)
-                        .and_then(|s| {
-                            // A named `fun` symbol carries its own
-                            // `param_names` (needed for named-argument
-                            // matching below); anything else — a `val`/
-                            // `var` holding a lambda, or a function-typed
-                            // parameter (`f: (Int) -> Int` inside another
-                            // function's body) — is only known
-                            // structurally, via its `Type::Function`, with
-                            // no parameter names of its own to match a
-                            // named argument against (same placeholder
-                            // scheme already used for stdlib calls below,
-                            // and for the same reason: a function *type*,
-                            // unlike a `fun` declaration, never names its
-                            // parameters).
-                            if s.kind == SymbolKind::Fun {
-                                Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone()))
-                            } else if let Type::Function(params, ret) = &s.ty {
-                                let names = vec![String::new(); params.len()];
-                                Some(((**ret).clone(), params.clone(), names))
-                            } else {
-                                None
-                            }
-                        })
-                        .or_else(|| {
-                            crate::stdlib::stdlib_call_types(name)
-                                .map(|(param_types, ret_ty)| {
-                                    let names = vec![String::new(); param_types.len()];
-                                    (ret_ty, param_types, names)
-                                })
-                        }),
-                    _ => None,
+                // symbol or a non-overloaded stdlib function with a known
+                // machine-readable signature (a `BuiltinSymbol`'s own
+                // signature field is a free-text display string, not
+                // this). Stdlib params have no real names to match a
+                // named argument against (`String::new()` placeholders —
+                // any named-arg call to a stdlib function falls into the
+                // "unknown parameter" case below, a minor, documented
+                // limitation). Resolved *before* walking the arguments
+                // (unlike every other subexpression here) so a lambda
+                // argument whose matching parameter is itself a function
+                // type (`apply({ x -> x * 2 }, 5)`) can infer its own
+                // parameter types from that — see `walk_expr_expected`.
+                let signature = if use_overload_resolution {
+                    None
+                } else {
+                    match &callee.kind {
+                        ExprKind::Name(name) => self
+                            .resolve_symbol(scope, name)
+                            .and_then(|s| {
+                                // A named `fun` symbol carries its own
+                                // `param_names` (needed for named-argument
+                                // matching below); anything else — a `val`/
+                                // `var` holding a lambda, or a function-typed
+                                // parameter (`f: (Int) -> Int` inside another
+                                // function's body) — is only known
+                                // structurally, via its `Type::Function`, with
+                                // no parameter names of its own to match a
+                                // named argument against (same placeholder
+                                // scheme already used for stdlib calls below,
+                                // and for the same reason: a function *type*,
+                                // unlike a `fun` declaration, never names its
+                                // parameters).
+                                if s.kind == SymbolKind::Fun {
+                                    Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone()))
+                                } else if let Type::Function(params, ret) = &s.ty {
+                                    let names = vec![String::new(); params.len()];
+                                    Some(((**ret).clone(), params.clone(), names))
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| {
+                                crate::stdlib::stdlib_call_types(name)
+                                    .map(|(param_types, ret_ty)| {
+                                        let names = vec![String::new(); param_types.len()];
+                                        (ret_ty, param_types, names)
+                                    })
+                            }),
+                        _ => None,
+                    }
                 };
 
                 let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
 
-                // A numeric-polymorphic stdlib name (`abs`/`max`/`min` —
-                // see `stdlib::is_numeric_polymorphic`'s doc comment for
-                // exactly which shape qualifies) has a return type that
-                // mirrors whichever numeric type the caller actually
-                // passed — doesn't fit the "one fixed Type" shape every
-                // other signature above has, so it's handled directly here
-                // instead of via `stdlib::stdlib_call_types` (and, being
-                // stdlib functions, never matched a real `signature` above
-                // anyway).
-                if let ExprKind::Name(name) = &callee.kind {
-                    if crate::stdlib::is_numeric_polymorphic(name) {
-                        return arg_infos
-                            .first()
-                            .map(|(_, t)| t.clone())
-                            .filter(is_numeric)
-                            .unwrap_or(Type::Unknown);
-                    }
+                if use_local_overload_resolution {
+                    let ExprKind::Name(name) = &callee.kind else { unreachable!() };
+                    // Cloned out of the `Symbol` table (not borrowed as
+                    // `&Symbol`) so this doesn't hold a live borrow of
+                    // `self.table` across the `&mut self` call below.
+                    let candidates: Vec<(Vec<Type>, Type, Span)> = self
+                        .resolve_symbols(scope, name)
+                        .iter()
+                        .map(|s| (s.param_types.clone(), s.return_type.clone(), s.def_span))
+                        .collect();
+                    return self.resolve_user_overload(name, &candidates, &arg_infos, expr.span);
+                }
+                if use_stdlib_overload_resolution {
+                    let ExprKind::Name(name) = &callee.kind else { unreachable!() };
+                    return self.resolve_stdlib_overload(name, &overloads, &arg_infos, expr.span);
                 }
 
                 self.check_call_signature(&arg_infos, signature, expr.span)
@@ -2405,6 +2650,139 @@ mod tests {
     fn hint_less_val_from_list_of_infers_list_not_an_error() {
         let result = resolve_src("val l = listOf(1, 2, 3)\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    // ---- real stdlib overload resolution (replaces the old
+    // is_numeric_polymorphic special case) ----
+
+    #[test]
+    fn abs_and_max_still_infer_the_real_argument_type() {
+        // The behavior the old numeric-only special case got right —
+        // must still work exactly the same via real overload resolution.
+        let result = resolve_src("import kotlin.math.*\nval x: Double = abs(-5)\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected Double, got Int"), "{}", result.type_errors[0].message);
+
+        let result = resolve_src("import kotlin.math.*\nval x: Double = abs(-5.5)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        let result = resolve_src("import kotlin.math.*\nval x: Int = max(3, 7)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn sqrt_with_an_unknown_typed_argument_still_infers_double() {
+        // Ambiguous overload (Unknown could be either Int or Double), but
+        // both of sqrt's overloads agree on Double regardless — must
+        // still resolve, not fall back to Unknown.
+        let src = "import kotlin.math.*\nimport util.math.square\nval x: Int = sqrt(square(2))\n";
+        let result = resolve_src(src);
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected Int, got Double"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn abs_with_a_non_numeric_argument_is_a_real_type_error() {
+        // The gap the old numeric-only special case had: a String didn't
+        // pass `is_numeric`'s filter, so the whole call silently became
+        // Unknown — no error at all. Real overload resolution must catch
+        // this the same way any other type mismatch is caught.
+        let result = resolve_src("import kotlin.math.*\nabs(\"hello\")\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("no overload of 'abs' matches argument types (String)"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    #[test]
+    fn abs_with_the_wrong_arity_is_a_real_type_error() {
+        let result = resolve_src("import kotlin.math.*\nabs(1, 2)\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("no overload of 'abs' accepts 2 argument(s)"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    #[test]
+    fn qualified_overloaded_stdlib_call_now_gets_real_resolution() {
+        // A genuinely new capability: `kotlin.math.abs(...)` used to be
+        // entirely unchecked (Type::Unknown, no dispatch at all) — now it
+        // resolves exactly like the bare, imported form.
+        let result = resolve_src("val x: Double = kotlin.math.abs(-5)\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected Double, got Int"), "{}", result.type_errors[0].message);
+
+        let result = resolve_src("kotlin.math.abs(\"hello\")\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("no overload of 'abs' matches argument types (String)"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    // ---- real user-defined function overloading ----
+
+    #[test]
+    fn distinguishable_fun_overloads_are_accepted_with_no_diagnostic() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: String): String = \"string\"\n";
+        let result = resolve_src(src);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn identical_signature_fun_overload_is_a_conflicting_overload_diagnostic() {
+        let src = "fun show(x: Int): String = \"a\"\nfun show(x: Int): String = \"b\"\n";
+        let result = resolve_src(src);
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("conflicting overload of 'show'"), "{}", result.diagnostics[0].message);
+    }
+
+    #[test]
+    fn a_fun_overload_and_a_val_with_the_same_name_is_still_already_declared() {
+        // Real overloading is only ever legal between several `Fun`
+        // symbols — a `Fun`/`Val` clash is the original, unconditional
+        // "already declared" case, unchanged.
+        let src = "val show = 1\nfun show(x: Int): String = \"a\"\n";
+        let result = resolve_src(src);
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("'show' is already declared in this scope"), "{}", result.diagnostics[0].message);
+    }
+
+    #[test]
+    fn call_to_an_overloaded_fun_resolves_the_right_return_type() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): Int = 1\nval a: String = show(5)\nval b: Int = show(true)\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn call_to_an_overloaded_fun_with_no_matching_signature_is_flagged() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): Int = 1\nshow(\"nope\")\n";
+        let result = resolve_src(src);
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("no overload of 'show' matches argument types (String)"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    #[test]
+    fn call_to_an_overloaded_fun_records_the_resolved_target_span() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): Int = 1\nshow(5)\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.resolved_calls.len(), 1, "{:?}", result.resolved_calls);
+        let (call_span, target_span) = result.resolved_calls.iter().next().unwrap();
+        assert_eq!(call_span.line, 3);
+        // The `Int` overload is declared on line 1.
+        assert_eq!(target_span.line, 1);
     }
 
     #[test]

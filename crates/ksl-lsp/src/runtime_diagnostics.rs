@@ -74,6 +74,14 @@ fn error_to_diagnostics(current_uri: Url, err: InterpError) -> RuntimeDiagnostic
             uri: current_uri,
             diagnostics: vec![new_diagnostic(span_to_range(e.span), e.message)],
         },
+        // `run_source` now statically checks a file before running it (see
+        // `importer.rs`'s unified parse-resolve-then-run flow) — a script
+        // with a real type error surfaces every one of them here, on the
+        // file that's actually running, same as `Runtime`/`Parse` above.
+        InterpError::TypeErrors(errors) => RuntimeDiagnostics {
+            uri: current_uri,
+            diagnostics: errors.into_iter().map(|e| new_diagnostic(span_to_range(e.span), e.message)).collect(),
+        },
     }
 }
 

@@ -1,12 +1,14 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::*;
 use crate::environment::{AssignError, Env};
-use crate::error::{Flow, RuntimeError, Span};
-use crate::value::{FunctionValue, Value};
+use crate::error::{Flow, RuntimeError, Span, StackFrame};
+use crate::value::{function_signature, FunctionValue, Value};
 
 pub struct Interpreter<'a> {
     pub globals: Env,
@@ -19,6 +21,38 @@ pub struct Interpreter<'a> {
     /// `@file:Import`ed files without a package already share one flat
     /// `globals`. Never removed; a script only ever adds packages.
     packages: HashMap<String, Env>,
+    /// Which file is "currently executing" — stamped onto every
+    /// `FunctionValue` created while it's active (`StmtKind::FunDecl`/
+    /// `ExprKind::Lambda`). Defaults to a `<script>` sentinel for anything
+    /// run without ever going through `importer.rs` (most unit tests);
+    /// `importer.rs` sets this to each real file's own path before running
+    /// that file's top-level statements.
+    pub(crate) current_file: Arc<Path>,
+    /// The current file's own resolver-computed overload decisions —
+    /// call-site span -> the one local-overload candidate's own
+    /// declaration span (`resolver::ResolveResult::resolved_calls`).
+    /// Consulted by `eval_expr`'s `Call`/`MethodCall` handling *before*
+    /// falling back to `call_value`'s own by-runtime-argument-type search
+    /// (`Value::Overload`'s dispatch) — every call the resolver could
+    /// already decide statically skips redoing that search at every
+    /// execution. Defaults empty for anything run without ever going
+    /// through `importer.rs`; swapped — saved and restored, mirroring
+    /// `current_file` — around a call so a function's own file's
+    /// decisions apply inside its body even when called from a different
+    /// file's code.
+    pub(crate) current_resolved: Rc<HashMap<Span, Span>>,
+    /// The active call chain, innermost (most recent) last — pushed by
+    /// `call_function`/`call_value` on entry, popped only on a *successful*
+    /// return, so an error in progress leaves every enclosing frame in
+    /// place until `run_in_env` reads them off into the error itself (see
+    /// that function) and clears this back to empty.
+    call_stack: Vec<StackFrame>,
+    /// Test-only instrumentation: counts calls that fell through to
+    /// `call_overload`'s by-runtime-value search, as opposed to the
+    /// `ExprKind::Call` fast path that uses the resolver's own
+    /// pre-computed decision — see `overload_search_count`'s doc comment.
+    #[cfg(test)]
+    overload_search_count: u32,
 }
 
 impl<'a> Interpreter<'a> {
@@ -46,7 +80,28 @@ impl<'a> Interpreter<'a> {
             }
             packages.insert(pkg.name.to_string(), env);
         }
-        Interpreter { globals, out, packages }
+        Interpreter {
+            globals,
+            out,
+            packages,
+            current_file: Arc::from(Path::new("<script>")),
+            current_resolved: Rc::new(HashMap::new()),
+            call_stack: Vec::new(),
+            #[cfg(test)]
+            overload_search_count: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overload_search_count(&self) -> u32 {
+        self.overload_search_count
+    }
+
+    /// The call stack captured at the point of the most recent uncaught
+    /// error (see `run_in_env`) — empty otherwise, including after a
+    /// successful run.
+    pub fn call_stack(&self) -> &[StackFrame] {
+        &self.call_stack
     }
 
     pub fn run(&mut self, stmts: &[Stmt]) -> Result<(), Flow> {
@@ -57,8 +112,27 @@ impl<'a> Interpreter<'a> {
     /// Runs `stmts` against `env` directly — the general primitive `run`
     /// and package-scoped execution (see `importer.rs`, which runs a
     /// `package`-declaring file's top-level statements against
-    /// `package_env(name)` instead of `globals`) both build on.
+    /// `package_env(name)` instead of `globals`) both build on. A
+    /// `RuntimeError` that reaches here uncaught gets the interpreter's
+    /// current call stack attached exactly once (innermost frame first —
+    /// see `StackFrame`), then the stack is cleared either way so a
+    /// reused `Interpreter` (multiple files via `importer.rs`, or a test
+    /// harness) starts the next run with a clean slate.
     pub fn run_in_env(&mut self, stmts: &[Stmt], env: &Env) -> Result<(), Flow> {
+        let result = self.run_in_env_inner(stmts, env);
+        match result {
+            Err(Flow::Error(mut e)) => {
+                e.stack = std::mem::take(&mut self.call_stack);
+                Err(Flow::Error(e))
+            }
+            other => {
+                self.call_stack.clear();
+                other
+            }
+        }
+    }
+
+    fn run_in_env_inner(&mut self, stmts: &[Stmt], env: &Env) -> Result<(), Flow> {
         for stmt in stmts {
             self.exec_stmt(stmt, env)?;
         }
@@ -211,14 +285,37 @@ impl<'a> Interpreter<'a> {
                     .into(),
                 })
             }
-            StmtKind::FunDecl { name, params, return_type, body, .. } => {
-                let f = Value::Function(Rc::new(FunctionValue {
+            StmtKind::FunDecl { name, name_span, params, return_type, body, .. } => {
+                let new_fn = Rc::new(FunctionValue {
                     name: Some(name.clone()),
                     params: params.clone(),
                     return_type: return_type.clone(),
                     body: body.clone(),
                     closure: env.clone(),
-                }));
+                    file: self.current_file.clone(),
+                    // Must match `resolver.rs`'s own `Symbol.def_span`
+                    // exactly (`*name_span`, not the whole statement's
+                    // span) — that's the span a resolved overload decision
+                    // in `resolved_calls` actually names, see
+                    // `FunctionValue::decl_span`'s doc comment.
+                    decl_span: *name_span,
+                    resolved_calls: self.current_resolved.clone(),
+                });
+                // Real overloading: a sibling `fun` already sharing this
+                // exact name *in this same scope* (never a parent's — see
+                // `Env::get_own`) groups with it into `Value::Overload`
+                // instead of silently overwriting it, matching the
+                // resolver's own `ScopeData::names` (which already allowed
+                // this statically — see its doc comment).
+                let f = match env.get_own(name) {
+                    Some(Value::Function(old)) => Value::Overload(Rc::new(vec![old, new_fn])),
+                    Some(Value::Overload(old_group)) => {
+                        let mut group = (*old_group).clone();
+                        group.push(new_fn);
+                        Value::Overload(Rc::new(group))
+                    }
+                    _ => Value::Function(new_fn),
+                };
                 env.define(name, f, false, crate::types::Type::Unknown);
                 Ok(())
             }
@@ -430,6 +527,27 @@ impl<'a> Interpreter<'a> {
             ExprKind::Call { callee, args } => {
                 let callee_val = self.eval_expr(callee, env)?;
                 let arg_values = self.eval_args(args, env)?;
+                // Fast path: the resolver already picked exactly one
+                // overload for *this* call site, by static argument type
+                // (`resolver::ResolveResult::resolved_calls`) — skip
+                // `call_value`'s own by-runtime-value search
+                // (`Value::Overload`'s dispatch in `call_overload`)
+                // entirely and invoke that one directly. Only reachable
+                // when `callee_val` really is an `Overload` group (a
+                // single `Function`/`Native` never needed resolving in the
+                // first place, so was never recorded here) — falls
+                // through to the normal path when this call's span isn't
+                // in the map (the resolver left it ambiguous, e.g. an
+                // `Unknown`-typed argument) or the recorded declaration
+                // isn't found in this group (shouldn't happen for a
+                // same-file call, but never fatal either way).
+                if let Value::Overload(group) = &callee_val {
+                    if let Some(&target) = self.current_resolved.get(&expr.span) {
+                        if let Some(f) = group.iter().find(|f| f.decl_span == target) {
+                            return self.call_function(f, arg_values, expr.span);
+                        }
+                    }
+                }
                 self.call_value(callee_val, arg_values, expr.span)
             }
             ExprKind::Lambda { params, body } => Ok(Value::Function(Rc::new(FunctionValue {
@@ -438,6 +556,9 @@ impl<'a> Interpreter<'a> {
                 return_type: None,
                 body: FunBody::Block(body.clone()),
                 closure: env.clone(),
+                file: self.current_file.clone(),
+                decl_span: expr.span,
+                resolved_calls: self.current_resolved.clone(),
             }))),
             ExprKind::If {
                 cond,
@@ -499,15 +620,116 @@ impl<'a> Interpreter<'a> {
     ) -> Result<Value, Flow> {
         match callee {
             Value::Native(n) => {
+                self.push_frame(n.name.clone(), Arc::from(Path::new("<builtin>")), span);
                 let positional: Vec<Value> = args.into_iter().map(|(_, v)| v).collect();
-                (n.func)(self, positional, span)
+                let result = (n.func)(self, positional, span);
+                if result.is_ok() {
+                    self.call_stack.pop();
+                }
+                result
             }
             Value::Function(f) => self.call_function(&f, args, span),
+            Value::Overload(group) => self.call_overload(&group, args, span),
             other => Err(RuntimeError::new(format!("'{}' is not callable", other.type_name()), span).into()),
         }
     }
 
+    /// Real, Kotlin-style overload resolution at the point a call to a
+    /// `Value::Overload` group actually runs — the runtime fallback for
+    /// any call the resolver couldn't already resolve to one specific
+    /// overload statically (an argument whose static type was `Unknown`;
+    /// every *statically* fully-typed call instead takes the fast path in
+    /// `eval_expr`'s `Call`/`MethodCall` handling, which looks up the
+    /// resolver's own pre-computed decision instead of ever reaching
+    /// here). Uses the exact same `types::resolve_overload` core the
+    /// static checker uses, fed real runtime argument types
+    /// (`Type::from_value`) against each candidate's real parameter types
+    /// (`types::function_signature_types`) — so a call that somehow still
+    /// reaches here with fully concrete argument values resolves
+    /// identically to how the static checker would have, had it known
+    /// them.
+    fn call_overload(
+        &mut self,
+        group: &[Rc<FunctionValue>],
+        args: Vec<(Option<String>, Value)>,
+        span: Span,
+    ) -> Result<Value, Flow> {
+        #[cfg(test)]
+        {
+            self.overload_search_count += 1;
+        }
+        let name = group[0].name.as_deref().unwrap_or("<lambda>");
+        let arg_types: Vec<crate::types::Type> = args.iter().map(|(_, v)| crate::types::Type::from_value(v)).collect();
+        let candidate_param_types: Vec<Vec<crate::types::Type>> =
+            group.iter().map(|f| crate::types::function_signature_types(f).0).collect();
+        let candidate_params: Vec<&[crate::types::Type]> = candidate_param_types.iter().map(Vec::as_slice).collect();
+        match crate::types::resolve_overload(&candidate_params, &arg_types) {
+            crate::types::OverloadResolution::Unique(i) => self.call_function(&group[i], args, span),
+            crate::types::OverloadResolution::ArityMismatch => Err(RuntimeError::new(
+                format!("no overload of '{name}' accepts {} argument(s)", arg_types.len()),
+                span,
+            )
+            .into()),
+            crate::types::OverloadResolution::NoMatch => {
+                let arg_list = arg_types.iter().map(crate::types::Type::name).collect::<Vec<_>>().join(", ");
+                Err(RuntimeError::new(format!("no overload of '{name}' matches argument types ({arg_list})"), span).into())
+            }
+            // Every runtime `Value` has a fully concrete `Type::from_value`
+            // (unlike the static checker, which can genuinely not know an
+            // argument's type yet) — real ambiguity here would mean two
+            // overloads both structurally accept the exact same concrete
+            // argument types, which `resolve_user_overload`'s own
+            // "conflicting overload" diagnostic already rejects at
+            // resolve time. Reachable only for a script that ran despite
+            // that diagnostic (e.g. a caller of `Interpreter` that skips
+            // `resolver::resolve` entirely) — a real error either way,
+            // not a panic.
+            crate::types::OverloadResolution::Ambiguous(_) => {
+                Err(RuntimeError::new(format!("ambiguous call to overloaded function '{name}'"), span).into())
+            }
+        }
+    }
+
+    /// Records `span` (in the *current* top-of-stack frame's own file's
+    /// coordinates — it's a span from whatever that frame's body is
+    /// currently evaluating) as that frame's current `position`, then
+    /// pushes a fresh frame for the callee being entered — see
+    /// `StackFrame`'s own doc comment for why the two are kept separate
+    /// instead of one field mixing a callee's file with a caller's span.
+    fn push_frame(&mut self, signature: String, file: Arc<Path>, span: Span) {
+        if let Some(top) = self.call_stack.last_mut() {
+            top.position = span;
+        }
+        self.call_stack.push(StackFrame { signature, file, position: span });
+    }
+
     fn call_function(
+        &mut self,
+        f: &FunctionValue,
+        args: Vec<(Option<String>, Value)>,
+        span: Span,
+    ) -> Result<Value, Flow> {
+        self.push_frame(function_signature(f), f.file.clone(), span);
+        // Swapped for the duration of this call — a nested `fun`/lambda
+        // declared *inside* `f`'s own body must be stamped with `f`'s own
+        // file (see `FunctionValue::file`'s doc comment), and any call
+        // site inside `f`'s body must resolve against `f`'s own file's
+        // overload decisions, not whichever file happened to be
+        // "current" in the *caller* — always restored afterward,
+        // regardless of success or error, since this is definitional
+        // context, not part of the call-stack/error-reporting mechanism.
+        let caller_file = std::mem::replace(&mut self.current_file, f.file.clone());
+        let caller_resolved = std::mem::replace(&mut self.current_resolved, f.resolved_calls.clone());
+        let result = self.call_function_inner(f, args, span);
+        self.current_file = caller_file;
+        self.current_resolved = caller_resolved;
+        if result.is_ok() {
+            self.call_stack.pop();
+        }
+        result
+    }
+
+    fn call_function_inner(
         &mut self,
         f: &FunctionValue,
         args: Vec<(Option<String>, Value)>,
@@ -773,6 +995,37 @@ mod tests {
         }
     }
 
+    /// Runs `src` directly against a bare `Interpreter` — parsing only,
+    /// never through `resolver::resolve` at all (unlike `run`/`run_err`,
+    /// which go through `run_source`/`importer.rs`'s unified parse-
+    /// resolve-then-run flow and so refuse to execute anything statically
+    /// invalid). Exists specifically to exercise the *runtime* layer's own
+    /// type-checking (`call_function`'s argument/return checks,
+    /// `Env::assign`'s reassignment check, the null-safety runtime
+    /// messages) in isolation, for a script that's statically invalid on
+    /// purpose — real `ksl-cli` usage would never reach these checks for
+    /// such a script (the resolver rejects it first), but the runtime
+    /// checks still exist as defense in depth (e.g. for a value whose
+    /// static type was genuinely `Unknown`) and deserve their own direct
+    /// coverage.
+    fn run_bypassing_static_check(src: &str) -> Result<String, String> {
+        let program = crate::parse_only(src).expect("valid syntax");
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        match interp.run(&program.stmts) {
+            Ok(()) => Ok(String::from_utf8(out).unwrap()),
+            Err(crate::error::Flow::Error(e)) => Err(e.message),
+            Err(_) => panic!("expected a Flow::Error"),
+        }
+    }
+
+    fn run_err_bypassing_static_check(src: &str) -> String {
+        match run_bypassing_static_check(src) {
+            Ok(_) => panic!("expected script to fail:\n{src}"),
+            Err(e) => e,
+        }
+    }
+
     #[test]
     fn arithmetic_and_precedence() {
         assert_eq!(run("println(1 + 2 * 3)"), "7\n");
@@ -869,18 +1122,19 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
 
     #[test]
     fn unsafe_method_call_on_a_null_value_has_a_clear_message() {
-        // `run`/`run_err` call `run_source` directly, which — unlike
-        // `ksl-cli` — doesn't run `static_check` first, so this exercises
-        // the interpreter's own runtime message directly, independent of
-        // the resolver's (separate) static rejection of the same script.
-        let err = run_err("val x: String? = null\nprintln(x.length())");
+        // A `String?` unsafe (`.`) call is *also* rejected statically
+        // (`run_source` refuses to run a script the resolver flags at
+        // all — see `run_bypassing_static_check`'s own doc comment) — this
+        // specifically exercises the interpreter's own runtime message,
+        // independent of that static rejection.
+        let err = run_err_bypassing_static_check("val x: String? = null\nprintln(x.length())");
         assert!(err.contains("cannot call method 'length' on a null value"), "{err}");
         assert!(!err.contains("'Null' has no method"), "{err}");
     }
 
     #[test]
     fn unsafe_field_access_on_a_null_value_has_a_clear_message() {
-        let err = run_err("val x: String? = null\nprintln(x.y)");
+        let err = run_err_bypassing_static_check("val x: String? = null\nprintln(x.y)");
         assert!(err.contains("cannot access field 'y' on a null value"), "{err}");
         assert!(!err.contains("'Null' has no field"), "{err}");
     }
@@ -950,13 +1204,19 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
 
     #[test]
     fn lambda_implicit_it_and_explicit_params() {
+        // Untyped `f`/lambda params are statically invalid under the
+        // strict-typing rules the resolver already enforces (unrelated to
+        // this test) — bypassed here since the actual point of this test
+        // is the interpreter's own lambda-calling mechanics (implicit
+        // `it`, explicit multi-param destructuring-free binding), not
+        // whether this particular untyped script is well-typed.
         let src = r#"
             fun apply(f, x: Int): Int = f(x)
             println(apply({ it * 2 }, 10))
             val add = { a, b -> a + b }
             println(add(3, 4))
         "#;
-        assert_eq!(run(src), "20\n7\n");
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "20\n7\n");
     }
 
     #[test]
@@ -1051,7 +1311,7 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
 
     #[test]
     fn call_function_rejects_a_wrongly_typed_argument() {
-        let err = run_err("fun add(a: Int, b: Int): Int { return a + b }\nadd(1, \"x\")");
+        let err = run_err_bypassing_static_check("fun add(a: Int, b: Int): Int { return a + b }\nadd(1, \"x\")");
         assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
     }
 
@@ -1071,9 +1331,92 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
         assert_eq!(run("fun f(): Int = 5\nprintln(f())"), "5\n");
     }
 
+    // ---- real user-defined function overloading (runtime dispatch) ----
+
+    #[test]
+    fn overloaded_fun_dispatches_to_the_right_body_by_argument_type() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): String = \"bool\"\nprintln(show(5))\nprintln(show(true))\n";
+        assert_eq!(run(src), "int\nbool\n");
+    }
+
+    #[test]
+    fn overloaded_fun_call_with_no_matching_overload_is_a_runtime_error() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): String = \"bool\"\nshow(\"nope\")\n";
+        let err = run_err(src);
+        assert!(err.contains("no overload of 'show' matches argument types (String)"), "{err}");
+    }
+
+    #[test]
+    fn a_single_fun_per_name_still_behaves_exactly_as_before() {
+        // Regression safety for the overwhelming common case: no
+        // `Value::Overload` involved at all when a name is never
+        // redeclared.
+        assert_eq!(run("fun add(a: Int, b: Int): Int = a + b\nprintln(add(1, 2))"), "3\n");
+    }
+
+    // ---- resolver -> interpreter bridge: skip the runtime search when
+    // the resolver already decided statically ----
+
+    #[test]
+    fn statically_resolved_overload_call_skips_the_runtime_search() {
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): String = \"bool\"\nprintln(show(5))\nprintln(show(true))\n";
+        let program = crate::parse_only(src).unwrap();
+        let resolved = crate::resolver::resolve(&program);
+        assert!(resolved.type_errors.is_empty(), "{:?}", resolved.type_errors);
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        interp.current_resolved = std::rc::Rc::new(resolved.resolved_calls);
+        assert!(interp.run(&program.stmts).is_ok());
+        assert_eq!(interp.overload_search_count(), 0, "the fast path should have skipped the runtime search entirely");
+        drop(interp);
+        assert_eq!(String::from_utf8(out).unwrap(), "int\nbool\n");
+    }
+
+    #[test]
+    fn bypassing_static_resolution_falls_back_to_the_runtime_overload_search() {
+        // Same script as above, but run the way `run_bypassing_static_check`
+        // does — `current_resolved` never populated — so every overloaded
+        // call here has no choice but to fall back to `call_overload`'s own
+        // by-runtime-value search. Confirms that fallback still exists and
+        // still dispatches correctly, independent of the fast path.
+        let src = "fun show(x: Int): String = \"int\"\nfun show(x: Boolean): String = \"bool\"\nprintln(show(5))\nprintln(show(true))\n";
+        let program = crate::parse_only(src).unwrap();
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+        assert_eq!(interp.overload_search_count(), 2, "both calls should have used the runtime search");
+        drop(interp);
+        assert_eq!(String::from_utf8(out).unwrap(), "int\nbool\n");
+    }
+
+    // ---- call stack / stack traces ----
+
+    #[test]
+    fn uncaught_error_prints_a_stack_trace_with_both_frames_in_order() {
+        let src = "import kotlin.test.*\nfun b() {\n    assertTrue(1 > 2)\n}\nfun a() {\n    b()\n}\na()\n";
+        let err = run_err(src);
+        let lines: Vec<&str> = err.lines().collect();
+        assert!(lines[0].starts_with("runtime error: assertTrue failed at"), "{err}");
+        // Innermost (where the failure happened) first, then outward.
+        assert!(lines[1].trim_start().starts_with("at assertTrue ("), "{err}");
+        assert!(lines[2].trim_start().starts_with("at b() ("), "{err}");
+        assert!(lines[3].trim_start().starts_with("at a() ("), "{err}");
+    }
+
+    #[test]
+    fn a_successful_run_leaves_the_call_stack_empty() {
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        let src = "fun add(a: Int, b: Int): Int = a + b\nprintln(add(1, 2))\n";
+        let tokens = crate::lexer::tokenize(src).unwrap();
+        let program = crate::parser::parse(&tokens).unwrap();
+        assert!(interp.run(&program.stmts).is_ok());
+        assert!(interp.call_stack().is_empty(), "{:?}", interp.call_stack());
+    }
+
     #[test]
     fn declared_typed_var_reassignment_incompatibly_is_a_runtime_error() {
-        let err = run_err("var x: Int = 5\nx = \"hi\"\nprintln(x)");
+        let err = run_err_bypassing_static_check("var x: Int = 5\nx = \"hi\"\nprintln(x)");
         assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
     }
 
@@ -1086,7 +1429,7 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
         // is statically — every value has a concrete `Type::from_value`,
         // so a hint-less local is type-locked to its initial value's type
         // from the moment it's first assigned.
-        let err = run_err("var x = 5\nx = \"hi\"\nprintln(x)");
+        let err = run_err_bypassing_static_check("var x = 5\nx = \"hi\"\nprintln(x)");
         assert!(err.contains("type mismatch: expected Int, got String"), "{err}");
     }
 
