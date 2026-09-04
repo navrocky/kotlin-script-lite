@@ -165,12 +165,19 @@ mismatch: expected Int, got String`; an unrecognized annotation looks like
 
 **Type annotation syntax**: a plain name — one of the 6 recognized
 primitives, `Int`, `Double`, `Boolean`, `String`, `Unit`, `List` (no
-class/generic/nullable types exist yet, see "Not supported" below) — or a
+class/generic types exist yet, see "Not supported" below) — or a
 function type, `(ParamType, ...) -> ReturnType`, e.g. `(Int, String) ->
 Boolean` or `() -> Unit`. Function types nest (`((Int) -> Int) -> String`)
 and are compared structurally: same parameter count, each parameter and
 the return type individually compatible — no named function-type
 declaration to match by identity.
+
+Any of the above — a primitive, or a function type — may be suffixed with
+`?` to make it nullable, e.g. `String?`, `(Int) -> String?` (nullable
+*return* type), `((Int) -> String)?` (the *whole* function type is
+nullable, parens required to attach `?` to it rather than just its return
+type — the same disambiguation real Kotlin uses). See [Null
+safety](#null-safety) below.
 
 ## Operators
 
@@ -183,11 +190,12 @@ Listed loosest-to-tightest binding (i.e. `a || b && c` parses as
 | 2 | `&&` | short-circuits |
 | 3 | `==` `!=` | structural equality |
 | 4 | `<` `>` `<=` `>=` | numeric or lexicographic `String` comparison |
-| 5 | `..` | inclusive `Int` range, e.g. `1..5` |
-| 6 | `+` `-` | `+` also concatenates `String` (`"x" + 1`) and `List` |
-| 7 | `*` `/` `%` | integer division/remainder by zero is a runtime error |
+| 5 | `?:` | elvis — short-circuits, doesn't evaluate the right side unless the left is `null`; right-associative |
+| 6 | `..` | inclusive `Int` range, e.g. `1..5` |
+| 7 | `+` `-` | `+` also concatenates `String` (`"x" + 1`) and `List` |
+| 8 | `*` `/` `%` | integer division/remainder by zero is a runtime error |
 | — | unary `-` `+` `!` | tightest, right-associative |
-| — | `f(...)`, `.field`, `.method(...)` | postfix call/member-access, tightest of all, left-associative (`a.b.c()` is `(a.b).c(...)`) |
+| — | `f(...)`, `.field`, `.method(...)`, `?.field`, `?.method(...)`, `!!` | postfix call/member-access/null-safety, tightest of all, left-associative (`a.b.c()` is `(a.b).c(...)`) |
 
 `Int`/`Double` operands mix freely (`1 + 2.5`); the result is `Double`
 whenever either operand is. `Int` arithmetic wraps on overflow, matching
@@ -263,6 +271,81 @@ matching Kotlin's compile-time rejection of the same cases.
 `return` exits the enclosing function with a value (`return expr`) or
 `Unit` (bare `return`). At the top level of a script, `return` simply
 stops the script.
+
+## Null safety
+
+```kotlin
+val name: String? = null       // T? — a nullable type annotation
+println(name?.uppercase())     // ?. safe call — null instead of erroring
+println(name?.uppercase() ?: "NONE")   // ?: elvis — fallback when the left side is null
+println(name!!)                // !! not-null assertion — errors on null
+```
+
+- **`null`** is a literal, of its own type (`Null`). `x == null` is always
+  legal and never a type error, whatever `x`'s type is.
+- **`T?`** — any type suffixed with `?` — accepts either a `T` value or
+  `null`. Enforced both statically and at runtime, the same way every
+  other type rule is (see [Types](#types)): `val x: String = null` is
+  rejected as a type mismatch; `val x: String? = null` is fine.
+- **`?.`** (safe call) evaluates to `null`, without evaluating the member
+  or any of its arguments, when the receiver is `null`; otherwise it
+  behaves exactly like `.`. A chain of safe calls (`a?.b?.c`) short-circuits
+  as soon as any link is `null`, with no special chain-wide handling needed
+  — each `?.` step only needs its own immediate receiver.
+- **`?:`** (elvis) evaluates its right side only when the left side is
+  `null` — the right side is a plain fallback value or expression,
+  evaluated lazily (`x ?: computeDefault()` never calls `computeDefault()`
+  when `x` isn't null).
+- **`!!`** (not-null assertion) is a postfix operator: `x!!` passes `x`
+  through unchanged if it isn't `null`, and errors with `null cannot be
+  cast to non-null type` if it is.
+
+**Unsafe access on a nullable receiver is a compile-time error, unless
+smart-cast applies.** `val x: String? = null; x.length()` is rejected
+outright — `only safe (?.) or non-null asserted (!!) calls are allowed on
+a nullable receiver of type 'String?'` — matching Kotlin's own compiler
+error, and never a confusing runtime "has no method" message.
+
+**Smart-cast narrows a `val`/parameter's type after a null check**, the
+same way Kotlin's does, for these condition shapes:
+
+```kotlin
+fun describe(s: String?): String {
+    if (s == null) {
+        return "unknown"          // early exit narrows `s` for the rest of the function
+    }
+    return s.uppercase()          // `s` is smart-cast to `String` here — no ?./!! needed
+}
+
+fun greet(s: String?) {
+    if (s != null) {
+        println(s.uppercase())    // narrowed inside the `then` branch
+    }
+    // `s` is back to `String?` here — the narrowing doesn't outlive the `if`
+}
+
+println(s != null && s.length() > 0)   // narrows `s` for the right side of `&&`
+println(s == null || s.length() > 0)   // narrows `s` for the right side of `||`
+while (s != null) { println(s.length()) }   // narrows `s` inside the loop body
+```
+
+Recognized: `x != null`/`x == null` (either operand order), combined
+through `&&`, `||`, and unary `!`; `if`/`else` branches; carry-forward past
+an `if` whose taken branch always `return`s/`break`s/`continue`s; `&&`/`||`
+short-circuit (the right operand sees the left operand's implied
+narrowing); `while` loop bodies; and a subject-less `when` arm with a
+single condition (`when { s != null -> ... }`).
+
+**Restricted to `val`s and parameters** — never `var`, matching Kotlin's
+own rule (a mutable local could change between the check and the use, so
+narrowing it wouldn't be sound), and never a method-call result or a field
+(only a bare name is a "stable reference"). This is still best-effort, not
+full Kotlin-grade flow analysis: **hover doesn't show the narrowed type**
+(it shows the declaration's own `T?`, not the smart-cast `T`), and
+`val y = x ?: return` (Kotlin's own idiom for narrowing `x` via an early
+return through elvis) isn't recognized — moot for now, since ksl's grammar
+has no `return`/`break`/`continue` in expression position at all, so that
+exact form can't be written yet either.
 
 ## Functions
 
@@ -401,8 +484,12 @@ error until then.
 ## Not supported
 
 Deliberately out of scope for now: classes/objects, inheritance,
-generics, null-safety operators (`?`, `?.`, `?:`, `!!`), list/map
-literals, `try`/`catch`, coroutines, extension functions, and network
-imports. `.` method syntax only covers the small builtin set in
-[`stdlib.md`](stdlib.md#methods) — arbitrary field/method access on a
-value needs classes/objects first.
+generics, list/map literal syntax (`[1, 2, 3]` isn't real Kotlin syntax
+either — build a list with [`listOf(...)`](stdlib.md#listof); a `{k: v}`
+map literal doesn't exist in real Kotlin at all), collection indexing
+(`list[i]`) — deferred until classes, generics, properties, and
+`operator fun get`/`set` exist, so it can be real operator overloading on
+a real `List<T>` rather than a special case — `try`/`catch`, coroutines,
+extension functions, and network imports. `.` method syntax only covers
+the small builtin set in [`stdlib.md`](stdlib.md#methods) — arbitrary
+field/method access on a value needs classes/objects first.

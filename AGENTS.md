@@ -2,6 +2,10 @@
 
 Guidance for AI coding agents working in this repository.
 
+## Planning
+
+Write plan-mode plans (the files under `~/.claude/plans/...`) in Russian.
+
 ## What this is
 
 A tree-walking interpreter for a Kotlin-syntax scripting language, written
@@ -101,10 +105,21 @@ sequence) that the end-to-end examples don't check.
 
 ## Explicitly out of scope (don't add without being asked)
 
-Classes/objects, inheritance, generics, null-safety operators, rich
-collection literals beyond `listOf`, `try`/`catch`, coroutines, and
+Classes/objects, inheritance, generics, `try`/`catch`, coroutines, and
 extension functions. These were deliberately deferred — see
 `docs/syntax.md`.
+
+Null safety (`null`, `T?`, `?.`, `?:`, `!!`) is implemented — see
+`docs/syntax.md#null-safety`.
+
+List-literal syntax (`[1, 2, 3]`) is **not** real Kotlin (Kotlin has no
+bracket list literal at all — `[` there only ever means indexing or a
+narrow annotation-argument case) and isn't planned; a `{k: v}` map literal
+likewise doesn't exist in real Kotlin. Collection indexing (`list[i]`,
+`list[i] = v`) *is* real Kotlin and is deferred, not out of scope
+permanently — it needs classes, generics, properties, and `operator fun
+get`/`set` to exist first, so it lands as real operator overloading on a
+real `List<T>` rather than a builtin special case; see `docs/roadmap.md`.
 
 Local file imports (`@file:Import("path.ksl")`, loading another file's
 top-level code into the shared global scope, or a package's own scope —

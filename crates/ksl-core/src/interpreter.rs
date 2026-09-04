@@ -255,20 +255,39 @@ impl<'a> Interpreter<'a> {
             ExprKind::Name(name) => env
                 .get(name)
                 .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span).into()),
-            ExprKind::FieldAccess { receiver, field, .. } => {
+            ExprKind::FieldAccess { receiver, field, safe, .. } => {
                 if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
                     let mut full_path = path;
                     full_path.push(field.clone());
                     return self.resolve_qualified(&full_path, expr.span).map_err(Into::into);
                 }
                 let recv = self.eval_expr(receiver, env)?;
+                if *safe && matches!(recv, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                // A clearer message than the generic "has no field" below
+                // for the specific, common case of a null receiver — this
+                // is the residual, purely-dynamic path a well-typed script
+                // never reaches (the resolver now statically rejects an
+                // unsafe access whenever the receiver's declared type is
+                // nullable); it only fires when that type was genuinely
+                // `Unknown` to the static checker (e.g. a package-qualified
+                // call's result) and turned out to be `Value::Null` at
+                // runtime.
+                if matches!(recv, Value::Null) {
+                    return Err(RuntimeError::new(
+                        format!("cannot access field '{field}' on a null value — check for null first or use ?./!!"),
+                        expr.span,
+                    )
+                    .into());
+                }
                 Err(RuntimeError::new(
                     format!("'{}' has no field '{field}'", recv.type_name()),
                     expr.span,
                 )
                 .into())
             }
-            ExprKind::MethodCall { receiver, method, args, .. } => {
+            ExprKind::MethodCall { receiver, method, args, safe, .. } => {
                 if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
                     let mut full_path = path;
                     full_path.push(method.clone());
@@ -277,6 +296,20 @@ impl<'a> Interpreter<'a> {
                     return self.call_value(callee, arg_values, expr.span);
                 }
                 let recv = self.eval_expr(receiver, env)?;
+                if *safe && matches!(recv, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                // See the identical check in `FieldAccess` above — a
+                // clearer message than `call_builtin_method`'s generic
+                // "has no method" for the specific, common case of calling
+                // on a null receiver.
+                if matches!(recv, Value::Null) {
+                    return Err(RuntimeError::new(
+                        format!("cannot call method '{method}' on a null value — check for null first or use ?./!!"),
+                        expr.span,
+                    )
+                    .into());
+                }
                 let arg_values: Vec<Value> =
                     self.eval_args(args, env)?.into_iter().map(|(_, v)| v).collect();
                 crate::stdlib::call_builtin_method(recv, method, arg_values, expr.span)
@@ -288,6 +321,12 @@ impl<'a> Interpreter<'a> {
                     (UnaryOp::Neg, Value::Double(d)) => Ok(Value::Double(-d)),
                     (UnaryOp::Pos, Value::Int(_) | Value::Double(_)) => Ok(v),
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                    (UnaryOp::NotNullAssert, Value::Null) => Err(RuntimeError::new(
+                        "null cannot be cast to non-null type",
+                        expr.span,
+                    )
+                    .into()),
+                    (UnaryOp::NotNullAssert, _) => Ok(v),
                     _ => Err(RuntimeError::new(
                         format!("bad operand type for unary operator: {}", v.type_name()),
                         expr.span,
@@ -358,6 +397,15 @@ impl<'a> Interpreter<'a> {
             }
             ExprKind::When { subject, arms } => self.eval_when(subject.as_deref(), arms, env),
             ExprKind::Block(stmts) => self.exec_block(stmts, &env.child()),
+            ExprKind::NullLit => Ok(Value::Null),
+            ExprKind::Elvis { lhs, rhs } => {
+                let l = self.eval_expr(lhs, env)?;
+                if matches!(l, Value::Null) {
+                    self.eval_expr(rhs, env)
+                } else {
+                    Ok(l)
+                }
+            }
         }
     }
 
@@ -520,8 +568,13 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
 /// precisely (see `resolve_type_annotation_here`).
 fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span) -> Result<crate::types::Type, Flow> {
     let expected = crate::types::resolve_type_annotation(annotation, &[], &std::collections::HashSet::new());
-    if let TypeAnnotation::Named(name, _) = annotation {
-        if expected == crate::types::Type::Unknown {
+    if let Some(name) = top_level_named_name(annotation) {
+        let unresolved = match &expected {
+            crate::types::Type::Unknown => true,
+            crate::types::Type::Nullable(inner) => **inner == crate::types::Type::Unknown,
+            _ => false,
+        };
+        if unresolved {
             return Err(RuntimeError::new(format!("unknown type '{name}'"), span).into());
         }
     }
@@ -534,6 +587,21 @@ fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span) -> Result<crat
             span,
         )
         .into())
+    }
+}
+
+/// Unwraps at most one level of `Nullable` to find a bare `Named`'s own
+/// name, for `check_type`'s "unknown type" diagnostic — mirrors this
+/// function's existing deliberate non-recursion into `Function`'s nested
+/// parameter/return annotations: a bad name buried inside `(Sting) -> Int`
+/// still silently resolves that slot to `Unknown` rather than erroring here
+/// (the resolver's own `diagnose_unknown_names` is the one place that's
+/// checked fully).
+fn top_level_named_name(ann: &TypeAnnotation) -> Option<&str> {
+    match ann {
+        TypeAnnotation::Named(name, _) => Some(name),
+        TypeAnnotation::Nullable(inner, _) => top_level_named_name(inner),
+        TypeAnnotation::Function(..) => None,
     }
 }
 
@@ -698,6 +766,88 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
             println(true || boom())
         "#;
         assert_eq!(run(src), "false\ntrue\n");
+    }
+
+    #[test]
+    fn safe_call_short_circuits_to_null_on_a_null_receiver() {
+        let src = r#"
+            val s: String? = null
+            println(s?.length() ?: -1)
+        "#;
+        assert_eq!(run(src), "-1\n");
+    }
+
+    #[test]
+    fn safe_call_dispatches_normally_on_a_non_null_receiver() {
+        let src = r#"
+            val s: String? = "hi"
+            println(s?.length() ?: -1)
+        "#;
+        assert_eq!(run(src), "2\n");
+    }
+
+    #[test]
+    fn elvis_does_not_evaluate_rhs_when_lhs_is_non_null() {
+        let src = r#"
+            fun boom(): Int {
+                println("evaluated")
+                return -1
+            }
+            val s: String? = "hi"
+            println(s?.length() ?: boom())
+        "#;
+        assert_eq!(run(src), "2\n");
+    }
+
+    #[test]
+    fn not_null_assert_passes_through_a_non_null_value() {
+        assert_eq!(run("val x: Int? = 5\nprintln(x!!)"), "5\n");
+    }
+
+    #[test]
+    fn not_null_assert_errors_on_null() {
+        let err = run_err("val x: Int? = null\nprintln(x!!)");
+        assert!(err.contains("null cannot be cast to non-null type"), "{err}");
+    }
+
+    #[test]
+    fn unsafe_method_call_on_a_null_value_has_a_clear_message() {
+        // `run`/`run_err` call `run_source` directly, which — unlike
+        // `ksl-cli` — doesn't run `static_check` first, so this exercises
+        // the interpreter's own runtime message directly, independent of
+        // the resolver's (separate) static rejection of the same script.
+        let err = run_err("val x: String? = null\nprintln(x.length())");
+        assert!(err.contains("cannot call method 'length' on a null value"), "{err}");
+        assert!(!err.contains("'Null' has no method"), "{err}");
+    }
+
+    #[test]
+    fn unsafe_field_access_on_a_null_value_has_a_clear_message() {
+        let err = run_err("val x: String? = null\nprintln(x.y)");
+        assert!(err.contains("cannot access field 'y' on a null value"), "{err}");
+        assert!(!err.contains("'Null' has no field"), "{err}");
+    }
+
+    #[test]
+    fn null_equality_is_never_a_type_error() {
+        assert_eq!(run("println(null == null)"), "true\n");
+        assert_eq!(run("println(null == 1)"), "false\n");
+        assert_eq!(run("println(1 == null)"), "false\n");
+    }
+
+    #[test]
+    fn chained_safe_calls_short_circuit_through_a_null_receiver() {
+        let src = r#"
+            val a: String? = null
+            println(a?.uppercase()?.length() ?: -1)
+        "#;
+        assert_eq!(run(src), "-1\n");
+    }
+
+    #[test]
+    fn assigning_null_to_a_non_nullable_declared_type_is_a_runtime_error() {
+        let err = run_err("val x: String = null\nprintln(x)");
+        assert!(err.contains("type mismatch"), "{err}");
     }
 
     #[test]

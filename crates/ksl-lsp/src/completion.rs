@@ -113,6 +113,16 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             BUILTIN_METHOD_SIGNATURES
                 .iter()
                 .filter(|(recv_ty, ..)| match &receiver_type {
+                    // A `T?` receiver dispatches against `T`'s own builtin
+                    // methods (`String?`'s methods are exactly `String`'s —
+                    // matches Kotlin's safe-call semantics), so unwrap one
+                    // `Nullable` layer before comparing names — otherwise
+                    // `ty.name()` would be e.g. `"String?"`, which never
+                    // matches any table entry (all bare `"String"`), and
+                    // completion on a nullable-typed receiver would wrongly
+                    // suggest nothing instead of falling back to "show
+                    // everything" (that fallback only triggers on `Unknown`).
+                    Some(ksl_core::types::Type::Nullable(inner)) => inner.name() == *recv_ty,
                     Some(ty) => ty.name() == *recv_ty,
                     None => true,
                 })
@@ -536,6 +546,21 @@ mod tests {
         // without needing an incomplete-parse fallback tree).
         let text = "val s = \"hi\"\ns.uppercase()\n";
         let names = labels(text, Position::new(1, 2));
+        assert!(names.contains(&"uppercase".to_string()), "{names:?}");
+        assert!(names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_nullable_string_local_still_offers_string_methods() {
+        // Regression test: a `String?`-typed local's static type is
+        // `Type::Nullable(String)`, whose `name()` is `"String?"` — the
+        // filter must unwrap one `Nullable` layer before comparing against
+        // `BUILTIN_METHOD_SIGNATURES`'s bare `"String"` entries, or this
+        // wrongly falls through to "offer nothing" instead of "offer
+        // everything" (the "show everything" fallback only triggers on
+        // `Type::Unknown`, which `Nullable(String)` is not).
+        let text = "fun f(s: String?) {\n    s.uppercase()\n}\n";
+        let names = labels(text, Position::new(1, 6));
         assert!(names.contains(&"uppercase".to_string()), "{names:?}");
         assert!(names.contains(&"length".to_string()), "{names:?}");
     }

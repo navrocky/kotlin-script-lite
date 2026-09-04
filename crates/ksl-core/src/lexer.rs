@@ -327,6 +327,7 @@ impl<'a> Lexer<'a> {
             "continue" => TokenKind::Continue,
             "package" => TokenKind::Package,
             "import" => TokenKind::Import,
+            "null" => TokenKind::Null,
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
             _ => TokenKind::Ident(text),
@@ -382,8 +383,22 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some('=') {
                     self.advance();
                     TokenKind::NotEq
+                } else if self.peek() == Some('!') {
+                    self.advance();
+                    TokenKind::BangBang
                 } else {
                     TokenKind::Not
+                }
+            }
+            '?' => {
+                if self.peek() == Some('.') {
+                    self.advance();
+                    TokenKind::QuestionDot
+                } else if self.peek() == Some(':') {
+                    self.advance();
+                    TokenKind::QuestionColon
+                } else {
+                    TokenKind::Question
                 }
             }
             '<' => {
@@ -615,6 +630,55 @@ mod tests {
                 TokenKind::StringEnd,
                 TokenKind::RParen,
                 TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn null_safety_tokens() {
+        assert_eq!(kinds("null"), vec![TokenKind::Null, TokenKind::Eof]);
+        assert_eq!(
+            kinds("a?.b"),
+            vec![TokenKind::Ident("a".into()), TokenKind::QuestionDot, TokenKind::Ident("b".into()), TokenKind::Eof]
+        );
+        assert_eq!(
+            kinds("a ?: b"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::QuestionColon,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("a!!"),
+            vec![TokenKind::Ident("a".into()), TokenKind::BangBang, TokenKind::Eof]
+        );
+        assert_eq!(kinds("String?"), vec![TokenKind::Ident("String".into()), TokenKind::Question, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn null_safety_tokens_require_immediate_adjacency() {
+        // A space breaks the multi-char token, same as every other
+        // multi-char operator in this lexer (e.g. `& &` isn't `&&`).
+        assert_eq!(
+            kinds("a ? . b"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Question,
+                TokenKind::Dot,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("a ! ! b"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Not,
+                TokenKind::Not,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof
             ]
         );
     }

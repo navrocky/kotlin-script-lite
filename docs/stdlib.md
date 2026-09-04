@@ -125,4 +125,5 @@ min(3.5, 2)     // 2.0 (printed as "2")
 | `String` | as-is |
 | `Unit` | `kotlin.Unit` |
 | `List` | `[a, b, c]`, elements formatted the same way, recursively |
+| `Null` | `null` |
 | Function/lambda | `<function name>` / `<function lambda>` |

@@ -10,6 +10,10 @@ use crate::error::Span;
 pub enum TypeAnnotation {
     Named(String, Span),
     Function(Vec<TypeAnnotation>, Box<TypeAnnotation>, Span),
+    /// `T?` — wraps any other annotation, including another `Nullable` in
+    /// principle (the parser only ever produces one layer, see
+    /// `Parser::parse_type_annotation`). `Span` covers the whole `T?`.
+    Nullable(Box<TypeAnnotation>, Span),
 }
 
 impl TypeAnnotation {
@@ -17,6 +21,7 @@ impl TypeAnnotation {
         match self {
             TypeAnnotation::Named(_, s) => *s,
             TypeAnnotation::Function(_, _, s) => *s,
+            TypeAnnotation::Nullable(_, s) => *s,
         }
     }
 }
@@ -100,6 +105,10 @@ pub enum ExprKind {
         receiver: Box<Expr>,
         field: String,
         field_span: Span,
+        /// `true` for `?.` — short-circuits to `Value::Null` without
+        /// erroring when the receiver is `Value::Null`, instead of the
+        /// usual "has no field" error.
+        safe: bool,
     },
     /// `receiver.method(args)` — a `.` access immediately followed by `(`.
     /// Same local-vs-package-qualified ambiguity as `FieldAccess`, resolved
@@ -111,6 +120,9 @@ pub enum ExprKind {
         method: String,
         method_span: Span,
         args: Vec<Arg>,
+        /// `true` for `?.` — short-circuits to `Value::Null` without
+        /// evaluating `args` when the receiver is `Value::Null`.
+        safe: bool,
     },
     Unary {
         op: UnaryOp,
@@ -118,6 +130,13 @@ pub enum ExprKind {
     },
     Binary {
         op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// `lhs ?: rhs` — short-circuits, evaluating `rhs` only when `lhs`
+    /// evaluates to `Value::Null`. Not a `BinaryOp` since it needs the same
+    /// non-eager evaluation `&&`/`||` get, not `apply_binary`'s eager rule.
+    Elvis {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
@@ -143,6 +162,7 @@ pub enum ExprKind {
         arms: Vec<WhenArm>,
     },
     Block(Vec<Stmt>),
+    NullLit,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +176,10 @@ pub enum UnaryOp {
     Neg,
     Pos,
     Not,
+    /// `x!!` — postfix, parsed in `parse_postfix` (not `parse_unary`), but
+    /// shares this node shape since the interpreter doesn't care which side
+    /// of the expression constructed it.
+    NotNullAssert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

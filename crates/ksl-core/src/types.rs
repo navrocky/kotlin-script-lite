@@ -50,6 +50,14 @@ pub enum Type {
     /// `Unknown` in `is_assignable` — erasure means there's no real
     /// constraint to check.
     Generic(Rc<str>),
+    /// The type of the `null` literal itself (Kotlin's `Nothing?`,
+    /// simplified to its own leaf since this type system has no `Nothing`).
+    /// Never appears as a *declared* annotation — only ever produced by
+    /// `Type::from_value(&Value::Null)` and `NullLit`'s own inferred type.
+    Null,
+    /// `T?` — any other type, wrapped as nullable. Composes with every
+    /// existing variant including `Function`/`Class`/`Generic`.
+    Nullable(Box<Type>),
     /// Statically unknowable → always compatible. See the module doc
     /// comment.
     Unknown,
@@ -73,6 +81,8 @@ impl Type {
                 format!("({params}) -> {}", ret.name())
             }
             Type::Class(name) | Type::Generic(name) => name.to_string(),
+            Type::Null => "Null".to_string(),
+            Type::Nullable(inner) => format!("{}?", inner.name()),
             Type::Unknown => "Unknown".to_string(),
         }
     }
@@ -95,6 +105,7 @@ impl Type {
             Value::Bool(_) => Type::Bool,
             Value::Str(_) => Type::String,
             Value::Unit => Type::Unit,
+            Value::Null => Type::Null,
             Value::List(_) => Type::List,
             Value::Function(f) => {
                 let empty_params: Vec<String> = Vec::new();
@@ -176,6 +187,9 @@ pub fn resolve_type_annotation(
             let ret_ty = resolve_type_annotation(ret, generic_params, known_classes);
             Type::Function(param_types, Box::new(ret_ty))
         }
+        TypeAnnotation::Nullable(inner, _) => {
+            Type::Nullable(Box::new(resolve_type_annotation(inner, generic_params, known_classes)))
+        }
     }
 }
 
@@ -195,6 +209,9 @@ pub fn is_assignable(from: &Type, to: &Type) -> bool {
     match (from, to) {
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Generic(_), _) | (_, Type::Generic(_)) => true,
+        (Type::Null, Type::Nullable(_)) => true,
+        (Type::Nullable(a), Type::Nullable(b)) => is_assignable(a, b),
+        (a, Type::Nullable(b)) => is_assignable(a, b),
         (Type::Class(a), Type::Class(b)) => a == b,
         (Type::Function(fp, fr), Type::Function(tp, tr)) => {
             if fp.is_empty() && **fr == Type::Unknown {
@@ -272,6 +289,44 @@ mod tests {
         assert_eq!(Type::from_value(&Value::Int(1)).name(), Value::Int(1).type_name());
         assert_eq!(Type::from_value(&Value::Bool(true)).name(), Value::Bool(true).type_name());
         assert_eq!(Type::from_value(&Value::str("x")).name(), Value::str("x").type_name());
+    }
+
+    #[test]
+    fn from_value_null_is_type_null() {
+        assert_eq!(Type::from_value(&Value::Null), Type::Null);
+        assert_eq!(Type::from_value(&Value::Null).name(), Value::Null.type_name());
+    }
+
+    #[test]
+    fn nullable_type_name_appends_question_mark() {
+        assert_eq!(Type::Nullable(Box::new(Type::String)).name(), "String?");
+        assert_eq!(Type::Null.name(), "Null");
+    }
+
+    #[test]
+    fn is_assignable_null_to_nullable_is_true() {
+        assert!(is_assignable(&Type::Null, &Type::Nullable(Box::new(Type::String))));
+    }
+
+    #[test]
+    fn is_assignable_bare_type_widens_to_nullable() {
+        assert!(is_assignable(&Type::String, &Type::Nullable(Box::new(Type::String))));
+    }
+
+    #[test]
+    fn is_assignable_nullable_does_not_narrow_to_bare_type() {
+        assert!(!is_assignable(&Type::Nullable(Box::new(Type::String)), &Type::String));
+    }
+
+    #[test]
+    fn is_assignable_null_to_non_nullable_is_false() {
+        assert!(!is_assignable(&Type::Null, &Type::String));
+    }
+
+    #[test]
+    fn is_assignable_nullable_to_nullable_recurses() {
+        assert!(is_assignable(&Type::Nullable(Box::new(Type::Int)), &Type::Nullable(Box::new(Type::Int))));
+        assert!(!is_assignable(&Type::Nullable(Box::new(Type::Int)), &Type::Nullable(Box::new(Type::String))));
     }
 
     #[test]
@@ -395,5 +450,34 @@ mod tests {
         );
         let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
         assert_eq!(resolved, Type::Function(vec![Type::Unknown], Box::new(Type::Int)));
+    }
+
+    #[test]
+    fn resolve_type_annotation_nullable_wraps_the_inner_type() {
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        let span = crate::error::Span::default();
+        let ann =
+            TypeAnnotation::Nullable(Box::new(TypeAnnotation::Named("String".to_string(), span)), span);
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        assert_eq!(resolved, Type::Nullable(Box::new(Type::String)));
+    }
+
+    #[test]
+    fn resolve_type_annotation_nullable_function_type() {
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        let span = crate::error::Span::default();
+        let fn_ann = TypeAnnotation::Function(
+            vec![TypeAnnotation::Named("Int".to_string(), span)],
+            Box::new(TypeAnnotation::Named("String".to_string(), span)),
+            span,
+        );
+        let ann = TypeAnnotation::Nullable(Box::new(fn_ann), span);
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        assert_eq!(
+            resolved,
+            Type::Nullable(Box::new(Type::Function(vec![Type::Int], Box::new(Type::String))))
+        );
     }
 }

@@ -37,6 +37,17 @@ Decisions already made that shape this plan:
 - **No `{k: v}` map-literal syntax** — real Kotlin doesn't have one either
   (`{ }` is already lambdas/blocks in ksl, so reusing it would be
   ambiguous). Maps are built via `mapOf(...)` stdlib sugar instead.
+- **No `[1, 2, 3]` list-literal syntax either — this was a mistake in the
+  original 9-feature backlog above, corrected during Phase 4's planning.**
+  "Rich collection literals" (this document's and `AGENTS.md`'s original
+  phrasing) doesn't describe a real Kotlin feature: Kotlin has no bracket
+  list-literal expression at all, only `listOf(...)`/`arrayOf(...)`/etc.
+  and `[i]` *indexing*. The free `LBracket`/`RBracket` tokens this backlog
+  item was going to spend are used for indexing instead — see Phase 3's
+  section, which was rewritten and moved later in the dependency order as
+  a result (it now needs classes/generics/properties/`operator fun`
+  support, none of which existed when it was originally sequenced right
+  after Phase 2).
 - **Tech-debt Phase 0 includes** the `NativeFn` span fix and the
   `break`/`continue` function-boundary fix (both parser/interpreter-only,
   low-risk). The `Double` formatting mismatch (`2.0` prints as `2`) is
@@ -59,8 +70,8 @@ Phase 1: `.` postfix member-access syntax  <-- blocks 6, 7, 8
    v
 Phase 2: static & runtime type system  <-- needs Phase 1 (type-aware completion hooks into MethodCall)
    |
-   +--> Phase 3: collection literals (list [1,2,3] + mapOf/pair)  [independent]
-   +--> Phase 4: null-safety (Value::Null, ?, ?., ?:, !!)          [independent]
+   v
+Phase 4: null-safety (Value::Null, ?, ?., ?:, !!)   [DONE]
    |
    v
 Phase 5: try/catch (Flow::Throw, minimal Value::Error)
@@ -78,12 +89,30 @@ Phase 8: extension functions  <-- needs Phase 1 (+ benefits from Phase 6's call_
 Phase 9: generics (parsed, fully erased — Phase 2 reserves Type::Generic for it)
    |
    v
+Phase 3 (renumbered, was pre-Phase-4): collection indexing (a[i], a[i]=v)
+as real operator overloading on a generic List<T> class  <-- needs Phase 6
+(classes), Phase 9 (generics), and properties + `operator fun get`/`set`
+support that no phase above defines yet — see the note below and Phase
+3's own section
+   |
+   v
 Phase 10: coroutines (sequence{}/yield() only) — separate design spike before committing
 ```
 
-Phases 3 and 4 can be built in either order or interleaved — they don't
-depend on each other. Every other phase after Phase 2 does, directly or
-indirectly.
+**Phase 3 was redefined during Phase 4's implementation planning**, after
+an audit found its original text specified invented syntax — see Phase
+3's own section below (still positioned physically where it originally
+was, right after Phase 2, purely so this document doesn't need a large
+reshuffle — its *dependency-graph* position, shown above, is what actually
+moved) for the full rationale. It's renamed from "collection literals" to
+"collection indexing", and now depends on classes (Phase 6), generics
+(Phase 9), and properties/`operator fun get`/`set` support that no
+existing phase defines yet, instead of sitting right after Phase 2. This
+is why Phase 4 was implemented *before* Phase 3 despite the number
+ordering — Phase 4 needed nothing Phase 3 (old or new) provides, and the
+audit that reordered Phase 3 happened during Phase 4's own planning pass.
+Every phase number is kept as originally assigned so cross-references
+elsewhere in this document stay valid.
 
 ---
 
@@ -371,43 +400,140 @@ LSP wiring) still holds.
 
 ---
 
-## Phase 3 — Collection literals
+## Phase 3 — Collection indexing (redefined; see below)
 
-Independent of Phase 1; can land any time after Phase 0.
+**This phase's original text (below the line) proposed `[1, 2, 3]` as
+list-literal syntax and a `mapOf`-backed `Value::Map`, and was audited and
+corrected before Phase 4 was implemented.** Two problems were found:
 
-- **List literals** `[1, 2, 3]`: tokens already exist (`LBracket`/
-  `RBracket` are lexed, `token.rs:40-41`). New `ExprKind::ListLit(Vec<Expr>)`
-  parsed in `parse_primary` alongside the existing `(`/`{` arms. Evaluates
-  to the existing `Value::List` — no new `Value` variant, pure sugar over
-  `listOf(...)`.
-- **Maps** (per the decision above, no bracket syntax): new
-  `Value::Map(Rc<RefCell<Vec<(Value, Value)>>>)` — association-list backed
-  since `Value` has no `Hash`/`Eq`, only a custom `values_equal`. New
-  stdlib: `mapOf(pairs...)`, `pair(a, b)` (or accept `listOf(k,v)` pairs
-  directly, needing no new stdlib entry beyond `mapOf`), `get`,
-  `containsKey`, `keys`, `values`. Needs `type_name`, `Display`
-  (`{k=v, ...}`), `values_equal`, and an `iterate()` arm (yielding 2-elem
-  lists, matching Kotlin's `Map.Entry` iteration) added alongside `List`'s
-  existing handling in `value.rs`/`interpreter.rs:401-406`.
+1. **`[1, 2, 3]` is not real Kotlin syntax.** Real Kotlin has no bracket
+   list-literal expression at all — `[` only ever means indexing
+   (`list[i]`, sugar over `operator fun get`/`set`) or, narrowly, an
+   array-valued annotation argument. Reusing the already-lexed-but-unused
+   `LBracket`/`RBracket` tokens for a literal would have been inventing
+   grammar, not implementing Kotlin. **Decision: use those tokens for real
+   indexing instead** — `a[i]` (read) and `a[i] = v` / `a[i] += v` (write),
+   both genuinely missing from ksl today and both real Kotlin, once the
+   type system has somewhere real to hang them: a generic `List<T>` with
+   actual `operator fun get(index: Int): T` / `operator fun set(index:
+   Int, value: T)` methods. That needs classes (Phase 6), generics (Phase
+   9), and object properties/`operator fun` declaration support that
+   **no phase in this document defines yet** — none of Phase 6/7/8/9 as
+   written scopes in `operator fun` overloading, only ordinary named
+   methods. Treat "properties + `operator fun get`/`set`" as an unscoped
+   extension of Phase 6 to design when this phase is actually picked up,
+   not something to design speculatively now. Until then, indexing stays
+   unimplemented — a builtin special-case over today's untyped
+   `Value::List` was considered and rejected, since it would need
+   reimplementing anyway once real operator overloading exists.
+2. **`mapOf`'s proposed pair representation doesn't match real Kotlin
+   either.** Real `mapOf(vararg pairs: Pair<K, V>)` takes actual `Pair`
+   objects built via the infix `to` function (`"a" to 1`) — ksl has none
+   of `Pair`, generics, or infix functions. **Decision: defer
+   `Value::Map`/`mapOf` entirely**, for the same reason as indexing —
+   build it properly once `Pair`/generics/infix functions exist, rather
+   than shipping a workaround (e.g. raw 2-element `List`s standing in for
+   pairs) now. Infix functions aren't even a scoped phase in this document
+   yet — flagged here as a known gap, not designed now.
 
-**LSP:** `resolver.rs` gets a `ListLit` arm (recurse into elements,
-mechanical); new stdlib functions flow through the existing
-`STDLIB_SIGNATURES`-driven LSP machinery automatically.
+Phase 4 (null-safety) was independently audited at the same time and found
+to already match real Kotlin syntax exactly (including elvis's precedence
+placement, corrected — see Phase 4's own section) — it needed no content
+changes and was implemented first, since it has no dependency on this
+phase either way.
 
-**Docs/tests:** `docs/syntax.md` literals section + remove from "Not
-supported"; `docs/stdlib.md` entries + `STDLIB_SIGNATURES`. Tests: empty/
-nested list literals, map round-trip (`get`/`containsKey`/`keys`/`values`),
-map equality, `for (entry in map)`. New `tests/examples/collections.ksl`.
+**Original text** (kept for context on what was rejected; superseded by
+the above):
+
+~~Independent of Phase 1; can land any time after Phase 0.~~
+
+~~**List literals** `[1, 2, 3]`: tokens already exist (`LBracket`/
+`RBracket` are lexed, `token.rs:40-41`). New `ExprKind::ListLit(Vec<Expr>)`
+parsed in `parse_primary` alongside the existing `(`/`{` arms. Evaluates
+to the existing `Value::List` — no new `Value` variant, pure sugar over
+`listOf(...)`.~~
+
+~~**Maps** (per the decision above, no bracket syntax): new
+`Value::Map(Rc<RefCell<Vec<(Value, Value)>>>)` — association-list backed
+since `Value` has no `Hash`/`Eq`, only a custom `values_equal`. New
+stdlib: `mapOf(pairs...)`, `pair(a, b)` (or accept `listOf(k,v)` pairs
+directly, needing no new stdlib entry beyond `mapOf`), `get`,
+`containsKey`, `keys`, `values`. Needs `type_name`, `Display`
+(`{k=v, ...}`), `values_equal`, and an `iterate()` arm (yielding 2-elem
+lists, matching Kotlin's `Map.Entry` iteration) added alongside `List`'s
+existing handling in `value.rs`/`interpreter.rs:401-406`.~~
 
 ---
 
-## Phase 4 — Null-safety
+## Phase 4 — Null-safety [DONE]
 
-Independent of Phase 1 and Phase 3; requires Phase 2 (its `Type`/
-`is_assignable` machinery is what makes nullability checkable both
+Independent of Phase 1 and (the redefined) Phase 3; requires Phase 2 (its
+`Type`/`is_assignable` machinery is what makes nullability checkable both
 statically and at runtime — see below). No `null` concept exists at all
 today (confirmed: no `Value::Null`, no nullable-hint handling in
 `check_type`) — this is from-scratch, not an extension.
+
+**Implemented as planned below, with a few corrections found during
+implementation** (kept here rather than silently editing the plan out from
+under itself):
+- **Nullable type hints are a `TypeAnnotation::Nullable(Box<TypeAnnotation>,
+  Span)` wrapper node**, not the `nullable: bool` field sketched below —
+  `TypeAnnotation` is already a recursive tree, so a wrapper composes with
+  `Named`/`Function` for free (`(Int) -> String?`, `((Int) -> String)?`)
+  without touching every construction/consumption site the way a flag
+  would have. `types::Type` gained the matching `Null`/`Nullable(Box<Type>)`
+  pair. Elvis's precedence, described below as "like `&&`/`||`", actually
+  needed its own grammar level: real Kotlin's `?:` binds looser than `<`/
+  `>`/`==`/`&&`/`||` but tighter than `..`/`+`/`-`, so it's a new
+  `parse_elvis()` between `parse_comparison` and `parse_range`, not handled
+  inside `parse_and`/`parse_or`.
+- **Two `ksl-lsp` bugs, not anticipated by the LSP note below**: once a
+  receiver's static type can be `Type::Nullable(T)`, both `completion.rs`'s
+  and `hover.rs`'s exact-string match against `BUILTIN_METHOD_SIGNATURES`
+  (comparing a receiver's `Type::name()`, e.g. `"String?"`, against the
+  table's bare `"String"` entries) silently produced no matches — so a
+  `T?`-typed local got no completion/hover for its own builtin methods.
+  Both were fixed by unwrapping one `Nullable` layer before the name
+  comparison.
+- **`parse_type_annotation`'s existing grammar had no support for grouping
+  parens around a non-function type annotation** — `((Int) -> String)?`
+  needs `(X)` to sometimes mean "just `X`, redundantly parenthesized" (to
+  attach the trailing `?` to the whole function type) rather than always
+  meaning "the start of a function type's own parameter list, `-> Ret`
+  mandatory afterward". Fixed: a parenthesized annotation list with no
+  following `->` and exactly one element is now that one element,
+  unwrapped, instead of a hard parse error.
+- **Reversed after initial shipping: real flow-sensitive smart-casting was
+  added, and an unsafe call on an un-narrowed nullable receiver is now a
+  static error, not silently accepted.** The bullet below ("best-effort,
+  not full Kotlin-grade flow-sensitive null tracking... no smart-casting
+  after an `if (x != null)` check") described the *shipped* v1 behavior
+  accurately at the time, but real usage immediately surfaced two
+  problems: an unsafe `.` call on a `T?` local was never rejected even
+  with no null check at all, and the only failure mode was a confusing
+  runtime `'Null' has no method 'X'` (the value's runtime type, not the
+  variable's declared nullable type). Fixed in `resolver.rs`: a new
+  `Resolver::narrowed: HashSet<usize>` field (symbol indices currently
+  proven non-null by the surrounding control flow) is read in the single
+  place a `Name`'s type is resolved (`resolve_name` — returns the
+  unwrapped inner type when narrowed, so every consumer benefits
+  uniformly with no special-casing) and written wherever Kotlin itself
+  narrows: `if`/`else` branches (plus carry-forward past an `if` whose
+  taken branch always `return`s/`break`s/`continue`s), `&&`/`||`
+  short-circuit's right operand, `while` loop bodies, and a subject-less
+  `when` arm with one condition — recognizing `x != null`/`x == null`
+  (either operand order) combined through `&&`/`||`/`!`. Deliberately
+  restricted, matching Kotlin's own rule, to `val`/parameter bindings
+  (never `var`) and bare-name receivers (never a method-call result).
+  `MethodCall`/`FieldAccess` now reject an unsafe access on a
+  `Type::Nullable` receiver outright with Kotlin's own wording (`only safe
+  (?.) or non-null asserted (!!) calls are allowed on a nullable receiver
+  of type 'X?'`); the interpreter's runtime message for the residual
+  dynamic-only case (a genuinely `Unknown`-typed value that turns out
+  `Value::Null`) was also clarified. See `docs/syntax.md`'s "Null safety"
+  section for the exact recognized patterns and remaining limits (no
+  narrowed-type hover, no `x ?: return`-style narrowing — moot today since
+  ksl has no `return`/`break`/`continue` in expression position at all).
 
 - **`Value::Null`** — new variant, touches every exhaustive match over
   `Value` (`type_name`, `is_truthy`, `values_equal`, `Display` in
@@ -428,11 +554,12 @@ today (confirmed: no `Value::Null`, no nullable-hint handling in
   `check_type` extension) *and* statically, by `resolver.rs`'s inference —
   a `val x: String = null` (or a provably-`Null`-typed expression assigned
   to a non-nullable hint) is flagged in `type_errors` under the same "both
-  sides statically known" gate as everything else. This is still
+  sides statically known" gate as everything else. ~~This is still
   best-effort, not full Kotlin-grade flow-sensitive null tracking (e.g. no
   smart-casting after an `if (x != null)` check) — a real, documented
   divergence from actual Kotlin null-safety, just a narrower one than "no
-  static checking at all."
+  static checking at all."~~ **Superseded** — see the "Reversed after
+  initial shipping" correction above; real smart-casting was added.
 - **`?.` safe call**: `safe: bool` flag on `FieldAccess`/`MethodCall`
   (Phase 1), set by a dedicated `?.` token. Short-circuits the whole chain
   to `Value::Null` if receiver is `Null`, without evaluating the member.
@@ -449,12 +576,17 @@ today (confirmed: no `Value::Null`, no nullable-hint handling in
 **LSP:** `resolver.rs` arms for `NullLit` and the `safe`-flag variants;
 `semantic_tokens.rs` classifies `null`/`?.`/`?:`/`!!`.
 
-**Docs/tests:** new "Null safety" section in `docs/syntax.md` with the
-best-effort (not full flow-sensitive) caveat spelled out explicitly;
-remove from "Not supported." Tests: `x?.length()` on null receiver, `?:`
-fallback and short-circuit, `!!` error + span, non-nullable assigned
-`null` errors both statically and at runtime, `null == null`, chained
-`a?.b?.c`. New `tests/examples/null_safety.ksl`.
+**Docs/tests:** new "Null safety" section in `docs/syntax.md`, now
+describing the real smart-cast support (recognized condition shapes, the
+`val`/parameter-only restriction) rather than a "no smart-casting" caveat
+— see the "Reversed after initial shipping" correction above; remove from
+"Not supported." Tests: `x?.length()` on null receiver, `?:` fallback and
+short-circuit, `!!` error + span, non-nullable assigned `null` errors both
+statically and at runtime, `null == null`, chained `a?.b?.c`, an unsafe
+call on an un-narrowed nullable receiver rejected with the new message,
+and one test per smart-cast source (`if`/`else`, early-exit carry-forward,
+`&&`/`||`, `while`, subject-less `when`, `var` never narrows, narrowing
+doesn't leak past a non-exiting `if`). New `tests/examples/null_safety.ksl`.
 
 ---
 

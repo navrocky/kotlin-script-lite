@@ -16,6 +16,7 @@ pub enum Value {
     Bool(bool),
     Str(Rc<str>),
     Unit,
+    Null,
     List(Rc<RefCell<Vec<Value>>>),
     Function(Rc<FunctionValue>),
     Native(Rc<NativeValue>),
@@ -49,6 +50,7 @@ impl Value {
             Value::Bool(_) => "Boolean",
             Value::Str(_) => "String",
             Value::Unit => "Unit",
+            Value::Null => "Null",
             Value::List(_) => "List",
             Value::Function(_) | Value::Native(_) => "Function",
         }
@@ -68,6 +70,7 @@ impl Value {
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::Str(x), Value::Str(y)) => x == y,
             (Value::Unit, Value::Unit) => true,
+            (Value::Null, Value::Null) => true,
             (Value::List(x), Value::List(y)) => {
                 Rc::ptr_eq(x, y) || {
                     let (xb, yb) = (x.borrow(), y.borrow());
@@ -88,6 +91,7 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Unit => write!(f, "kotlin.Unit"),
+            Value::Null => write!(f, "null"),
             Value::List(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.borrow().iter().enumerate() {

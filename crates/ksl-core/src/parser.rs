@@ -189,7 +189,7 @@ impl<'a> Parser<'a> {
     /// from expression position, so a leading `(` here is unambiguously a
     /// function type's parameter list, not a parenthesized expression.
     fn parse_type_annotation(&mut self) -> Result<TypeAnnotation, ParseError> {
-        if matches!(self.peek_kind(), TokenKind::LParen) {
+        let base = if matches!(self.peek_kind(), TokenKind::LParen) {
             let span = self.span();
             self.advance(); // '('
             let mut params = Vec::new();
@@ -202,13 +202,31 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(TokenKind::RParen, "')'")?;
-            self.expect(TokenKind::Arrow, "'->'")?;
-            let ret = self.parse_type_annotation()?;
-            let full_span = span.merge(&ret.span());
-            Ok(TypeAnnotation::Function(params, Box::new(ret), full_span))
+            if matches!(self.peek_kind(), TokenKind::Arrow) {
+                self.advance(); // '->'
+                let ret = self.parse_type_annotation()?;
+                let full_span = span.merge(&ret.span());
+                TypeAnnotation::Function(params, Box::new(ret), full_span)
+            } else if params.len() == 1 {
+                // Grouping parens around a single annotation, not a
+                // function-type parameter list — the only real use for
+                // this is `((Int) -> String)?`, suffixing `?` onto the
+                // whole function type rather than just its return type.
+                params.into_iter().next().unwrap()
+            } else {
+                return Err(self.err("expected '->' after a parenthesized type list".to_string()));
+            }
         } else {
             let (name, name_span) = self.expect_ident_spanned()?;
-            Ok(TypeAnnotation::Named(name, name_span))
+            TypeAnnotation::Named(name, name_span)
+        };
+        if matches!(self.peek_kind(), TokenKind::Question) {
+            let q_span = self.span();
+            self.advance(); // '?'
+            let full_span = base.span().merge(&q_span);
+            Ok(TypeAnnotation::Nullable(Box::new(base), full_span))
+        } else {
+            Ok(base)
         }
     }
 
@@ -551,7 +569,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_range()?;
+        let mut lhs = self.parse_elvis()?;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Lt => BinaryOp::Lt,
@@ -562,7 +580,7 @@ impl<'a> Parser<'a> {
             };
             let span = self.span();
             self.advance();
-            let rhs = self.parse_range()?;
+            let rhs = self.parse_elvis()?;
             lhs = Expr::new(
                 ExprKind::Binary {
                     op,
@@ -571,6 +589,28 @@ impl<'a> Parser<'a> {
                 },
                 span,
             );
+        }
+        Ok(lhs)
+    }
+
+    /// `?:` — binds looser than `<`/`>`/`==`/`&&`/`||` (see `parse_comparison`,
+    /// which calls this instead of `parse_range` directly) but tighter than
+    /// `..`/`+`/`-` (`parse_range`, below), matching real Kotlin's actual
+    /// precedence table. Right-recursive (not a loop) for right-associativity:
+    /// `a ?: b ?: c` groups as `a ?: (b ?: c)`, same as Kotlin.
+    fn parse_elvis(&mut self) -> Result<Expr, ParseError> {
+        let lhs = self.parse_range()?;
+        if matches!(self.peek_kind(), TokenKind::QuestionColon) {
+            let span = self.span();
+            self.advance();
+            let rhs = self.parse_elvis()?;
+            return Ok(Expr::new(
+                ExprKind::Elvis {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            ));
         }
         Ok(lhs)
     }
@@ -675,8 +715,9 @@ impl<'a> Parser<'a> {
                     },
                     span,
                 );
-            } else if matches!(self.peek_kind(), TokenKind::Dot) {
-                self.advance(); // '.'
+            } else if matches!(self.peek_kind(), TokenKind::Dot | TokenKind::QuestionDot) {
+                let safe = matches!(self.peek_kind(), TokenKind::QuestionDot);
+                self.advance(); // '.' or '?.'
                 let (member, member_span) = self.expect_ident_spanned()?;
                 let full_span = expr.span.merge(&member_span);
                 expr = if matches!(self.peek_kind(), TokenKind::LParen) {
@@ -687,6 +728,7 @@ impl<'a> Parser<'a> {
                             method: member,
                             method_span: member_span,
                             args,
+                            safe,
                         },
                         full_span,
                     )
@@ -696,10 +738,21 @@ impl<'a> Parser<'a> {
                             receiver: Box::new(expr),
                             field: member,
                             field_span: member_span,
+                            safe,
                         },
                         full_span,
                     )
                 };
+            } else if matches!(self.peek_kind(), TokenKind::BangBang) {
+                let span = self.span();
+                self.advance(); // '!!'
+                expr = Expr::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::NotNullAssert,
+                        expr: Box::new(expr),
+                    },
+                    span,
+                );
             } else {
                 break;
             }
@@ -744,6 +797,10 @@ impl<'a> Parser<'a> {
             TokenKind::Bool(v) => {
                 self.advance();
                 Ok(Expr::new(ExprKind::BoolLit(v), span))
+            }
+            TokenKind::Null => {
+                self.advance();
+                Ok(Expr::new(ExprKind::NullLit, span))
             }
             TokenKind::Ident(name) => {
                 self.advance();
@@ -987,6 +1044,141 @@ mod tests {
             StmtKind::ExprStmt(e) => match &e.kind {
                 ExprKind::Binary { op: BinaryOp::Or, lhs, .. } => {
                     assert!(matches!(lhs.kind, ExprKind::Binary { op: BinaryOp::And, .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_type_annotation_parses() {
+        let stmts = parse_src("val x: String? = null");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { type_annotation: Some(TypeAnnotation::Nullable(inner, _)), init, .. } => {
+                assert!(matches!(inner.as_ref(), TypeAnnotation::Named(n, _) if n == "String"));
+                assert!(matches!(init.kind, ExprKind::NullLit));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_function_type_annotations_both_shapes() {
+        // `(Int) -> String?` — nullable return type, no wrapping parens needed.
+        let stmts = parse_src("val f: (Int) -> String? = g");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { type_annotation: Some(TypeAnnotation::Function(_, ret, _)), .. } => {
+                assert!(matches!(ret.as_ref(), TypeAnnotation::Nullable(inner, _) if matches!(inner.as_ref(), TypeAnnotation::Named(n, _) if n == "String")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // `((Int) -> String)?` — the whole function type is nullable.
+        let stmts = parse_src("val f: ((Int) -> String)? = g");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { type_annotation: Some(TypeAnnotation::Nullable(inner, _)), .. } => {
+                assert!(matches!(inner.as_ref(), TypeAnnotation::Function(..)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_literal_parses() {
+        let stmts = parse_src("null");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => assert!(matches!(e.kind, ExprKind::NullLit)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elvis_binds_tighter_than_comparison_and_looser_than_range() {
+        // a < b ?: c  =>  a < (b ?: c)
+        let stmts = parse_src("a < b ?: c");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Binary { op: BinaryOp::Lt, rhs, .. } => {
+                    assert!(matches!(rhs.kind, ExprKind::Elvis { .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // a ?: b..c  =>  a ?: (b..c)
+        let stmts = parse_src("a ?: b..c");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Elvis { rhs, .. } => {
+                    assert!(matches!(rhs.kind, ExprKind::Range { .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elvis_is_right_associative() {
+        // a ?: b ?: c  =>  a ?: (b ?: c)
+        let stmts = parse_src("a ?: b ?: c");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Elvis { lhs, rhs } => {
+                    assert!(matches!(lhs.kind, ExprKind::Name(ref n) if n == "a"));
+                    assert!(matches!(rhs.kind, ExprKind::Elvis { .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_call_chain_nests_left_to_right() {
+        let stmts = parse_src("a?.b?.c");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::FieldAccess { receiver, field, safe: true, .. } => {
+                    assert_eq!(field, "c");
+                    match &receiver.kind {
+                        ExprKind::FieldAccess { receiver, field, safe: true, .. } => {
+                            assert_eq!(field, "b");
+                            assert!(matches!(receiver.kind, ExprKind::Name(ref n) if n == "a"));
+                        }
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_null_assert_parses_as_postfix_unary() {
+        let stmts = parse_src("x!!");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Unary { op: UnaryOp::NotNullAssert, expr } => {
+                    assert!(matches!(expr.kind, ExprKind::Name(ref n) if n == "x"));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_null_assert_composes_with_method_call() {
+        let stmts = parse_src("x!!.length()");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::MethodCall { receiver, method, safe: false, .. } => {
+                    assert_eq!(method, "length");
+                    assert!(matches!(receiver.kind, ExprKind::Unary { op: UnaryOp::NotNullAssert, .. }));
                 }
                 other => panic!("unexpected {other:?}"),
             },

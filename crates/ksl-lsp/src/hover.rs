@@ -41,8 +41,16 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
     // `String.uppercase()` by name alone.
     if let Some(method) = analysis.resolved.table.method_ref_at(line, col) {
         let receiver_ty = analysis.resolved.table.method_receiver_type_at(line, col);
+        // A `T?` receiver dispatches against `T`'s own builtin methods
+        // (matches Kotlin's safe-call semantics — see the identical
+        // unwrap in `completion.rs`), so unwrap one `Nullable` layer
+        // before comparing names.
+        let dispatch_name = receiver_ty.map(|t| match t {
+            ksl_core::types::Type::Nullable(inner) => inner.name(),
+            other => other.name(),
+        });
         if let Some((_, _, signature, doc)) = BUILTIN_METHOD_SIGNATURES.iter().find(|(recv_ty, name, ..)| {
-            *name == method && receiver_ty.map(|t| t.name() == *recv_ty).unwrap_or(true)
+            *name == method && dispatch_name.as_deref().map(|n| n == *recv_ty).unwrap_or(true)
         }) {
             return Some(build_builtin_method_hover(signature, doc));
         }
@@ -297,6 +305,21 @@ mod tests {
         // "println(\"hi\"." is 13 chars, so "length" starts at column 14.
         let h = hover_at(text, 1, 14).expect("length should hover");
         assert!(markdown_value(&h).contains("length"), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_a_builtin_method_call_on_a_nullable_string_receiver_still_shows_the_signature() {
+        // Regression test: `s`'s static type is `Type::Nullable(String)`,
+        // whose `name()` is `"String?"` — the receiver-type match must
+        // unwrap one `Nullable` layer, or a nonsensical exact-string
+        // comparison against `BUILTIN_METHOD_SIGNATURES`'s bare `"String"`
+        // entries would wrongly hide hover text for a perfectly legitimate
+        // call on a nullable-typed receiver.
+        let text = "fun f(s: String?) {\n    println(s.uppercase())\n}\n";
+        // "    println(s." is 14 chars, so "uppercase" starts at column 15.
+        let h = hover_at(text, 2, 15).expect("uppercase should hover");
+        assert!(markdown_value(&h).contains("uppercase"), "{}", markdown_value(&h));
+        assert!(markdown_value(&h).contains("builtin method"), "{}", markdown_value(&h));
     }
 
     #[test]

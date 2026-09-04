@@ -300,6 +300,7 @@ pub fn resolve(program: &Program) -> ResolveResult {
         generic_params: Vec::new(),
         known_classes: HashSet::new(),
         return_type_stack: Vec::new(),
+        narrowed: HashSet::new(),
     };
     let global = r.push_scope(None, 0, FILE_SPAN);
     r.walk_stmts(&program.stmts, global, FILE_END);
@@ -340,6 +341,23 @@ struct Resolver {
     /// pushed/popped around walking a body, so `Return` checks/collects
     /// against the right one even when nested. See `ReturnTypeContext`.
     return_type_stack: Vec<ReturnTypeContext>,
+    /// Flow-sensitive null-safety smart-cast state: symbol indices (into
+    /// `table.symbols`) currently proven non-null at this exact point in
+    /// the walk, purely because of a `!= null`/`== null` check (and
+    /// `&&`/`||`/`!` combinations of those) somewhere in the enclosing
+    /// control flow — never because of the symbol's own *declared* type,
+    /// which stays `Nullable` in `table.symbols` regardless. Read by
+    /// `resolve_name` (the single place this changes an expression's
+    /// observed type) and written by whichever construct establishes a
+    /// narrowed region (`If`, short-circuit `Binary`, `While`, `When`) —
+    /// see each one's own comment. Scoped by `walk_stmts`, which
+    /// snapshots/restores this set around its own statement list, so a
+    /// narrowing established inside one block never leaks to a sibling or
+    /// outer block. Only ever contains indices of `!mutable` symbols
+    /// (`val`/parameter) — matches Kotlin's own restriction against
+    /// smart-casting a `var`, which could change between the check and the
+    /// use.
+    narrowed: HashSet<usize>,
 }
 
 /// What to do with a `return`'s type, for the innermost enclosing fun/
@@ -410,6 +428,34 @@ fn always_returns(stmt: &Stmt) -> bool {
             ExprKind::When { arms, .. } => {
                 arms.iter().any(|a| a.is_else)
                     && arms.iter().all(|a| a.body.last().map(always_returns).unwrap_or(false))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Same shape as `always_returns` (best-effort, single-level), but for a
+/// different question: "does this statement always exit the *normal
+/// control flow*" — used only by null-safety smart-cast (see
+/// `Resolver::narrowed`) to decide whether an `if (x == null) { ... }`
+/// with no `else` narrows `x` for the rest of the enclosing block. Unlike
+/// `always_returns`, this also counts `break`/`continue` (the other two
+/// ways a statement can prevent fallthrough) — deliberately a *separate*
+/// function rather than extending `always_returns` itself, since that one
+/// means specifically "returns a value" for return-type inference, and
+/// must keep meaning exactly that.
+fn always_exits(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue => true,
+        StmtKind::ExprStmt(e) => match &e.kind {
+            ExprKind::If { then_branch, else_branch: Some(eb), .. } => {
+                then_branch.last().map(always_exits).unwrap_or(false)
+                    && eb.last().map(always_exits).unwrap_or(false)
+            }
+            ExprKind::When { arms, .. } => {
+                arms.iter().any(|a| a.is_else)
+                    && arms.iter().all(|a| a.body.last().map(always_exits).unwrap_or(false))
             }
             _ => false,
         },
@@ -542,6 +588,7 @@ impl Resolver {
                 }
                 self.diagnose_unknown_names(ret);
             }
+            TypeAnnotation::Nullable(inner, _) => self.diagnose_unknown_names(inner),
         }
     }
 
@@ -553,17 +600,89 @@ impl Resolver {
     /// stdlib functions like `println` are never declared in the AST at all
     /// — so it's checked against the known stdlib names too before being
     /// flagged as a diagnostic.
+    ///
+    /// **Smart-cast integration point**: if the symbol's declared type is
+    /// `Nullable(inner)` and its index is currently in `self.narrowed`, the
+    /// *unwrapped* `inner` type is returned instead — this is the single
+    /// place null-safety narrowing takes effect, so every consumer of a
+    /// `Name`'s type (method/field access, arithmetic, comparisons, elvis,
+    /// ...) benefits uniformly with no special-casing anywhere else. See
+    /// `Resolver::narrowed`'s own doc comment for where narrowing is
+    /// established.
     fn resolve_name(&mut self, scope: usize, name: &str, use_span: Span) -> Type {
         self.touch(scope, use_span);
         if let Some(idx) = self.resolve_symbol_index(scope, name) {
             self.table.occurrences.push((use_span, idx));
-            return self.table.symbols[idx].ty.clone();
+            let ty = self.table.symbols[idx].ty.clone();
+            if let Type::Nullable(inner) = &ty {
+                if self.narrowed.contains(&idx) {
+                    return (**inner).clone();
+                }
+            }
+            return ty;
         }
         if crate::stdlib::is_known(name) || self.imported_names.contains(name) || self.has_file_imports {
             return Type::Unknown;
         }
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
         Type::Unknown
+    }
+
+    /// Structural, read-only analysis of a boolean condition expression for
+    /// null-safety smart-cast: returns `(positive, negative)` — the symbol
+    /// indices proven non-null when `cond` evaluates to `true`, and when it
+    /// evaluates to `false`, respectively. Recurses through `&&`/`||`/`!`
+    /// so a compound condition like `x != null && y != null` narrows both;
+    /// anything not recognized contributes no narrowing (always sound,
+    /// just uninformative) rather than a false claim.
+    fn narrowing_for_condition(&self, cond: &Expr, scope: usize) -> (HashSet<usize>, HashSet<usize>) {
+        match &cond.kind {
+            ExprKind::Binary { op: BinaryOp::NotEq, lhs, rhs } => match self.null_check_symbol(lhs, rhs, scope) {
+                Some(idx) => (HashSet::from([idx]), HashSet::new()),
+                None => (HashSet::new(), HashSet::new()),
+            },
+            ExprKind::Binary { op: BinaryOp::Eq, lhs, rhs } => match self.null_check_symbol(lhs, rhs, scope) {
+                Some(idx) => (HashSet::new(), HashSet::from([idx])),
+                None => (HashSet::new(), HashSet::new()),
+            },
+            ExprKind::Binary { op: BinaryOp::And, lhs, rhs } => {
+                let (lpos, lneg) = self.narrowing_for_condition(lhs, scope);
+                let (rpos, rneg) = self.narrowing_for_condition(rhs, scope);
+                (lpos.union(&rpos).copied().collect(), lneg.intersection(&rneg).copied().collect())
+            }
+            ExprKind::Binary { op: BinaryOp::Or, lhs, rhs } => {
+                let (lpos, lneg) = self.narrowing_for_condition(lhs, scope);
+                let (rpos, rneg) = self.narrowing_for_condition(rhs, scope);
+                (lpos.intersection(&rpos).copied().collect(), lneg.union(&rneg).copied().collect())
+            }
+            ExprKind::Unary { op: UnaryOp::Not, expr: inner } => {
+                let (pos, neg) = self.narrowing_for_condition(inner, scope);
+                (neg, pos)
+            }
+            _ => (HashSet::new(), HashSet::new()),
+        }
+    }
+
+    /// If exactly one of `lhs`/`rhs` is the `null` literal and the other is
+    /// a bare `Name` resolving to a narrowing-eligible symbol (immutable —
+    /// `val`/parameter, matching Kotlin's own restriction against
+    /// smart-casting a `var` — and declared `Nullable`), returns that
+    /// symbol's index. This is the shared "is this an `x != null`/`x ==
+    /// null` check" pattern behind both `narrowing_for_condition` arms
+    /// (the caller decides which side — true or false — the match implies).
+    fn null_check_symbol(&self, lhs: &Expr, rhs: &Expr, scope: usize) -> Option<usize> {
+        let name_expr = match (&lhs.kind, &rhs.kind) {
+            (ExprKind::NullLit, ExprKind::Name(_)) => rhs,
+            (ExprKind::Name(_), ExprKind::NullLit) => lhs,
+            _ => return None,
+        };
+        let ExprKind::Name(name) = &name_expr.kind else { return None };
+        let idx = self.resolve_symbol_index(scope, name)?;
+        let sym = &self.table.symbols[idx];
+        if sym.mutable || !matches!(sym.ty, Type::Nullable(_)) {
+            return None;
+        }
+        Some(idx)
     }
 
     /// If `expr` is a chain of bare-identifier `.` access (`a`, `a.b`,
@@ -621,12 +740,23 @@ impl Resolver {
     /// `Interpreter::exec_block`'s identical runtime rule exactly, since
     /// every non-`ExprStmt` arm of `walk_stmt` below returns `Type::Unit`
     /// for itself.
+    ///
+    /// **Smart-cast scoping**: also snapshots/restores `self.narrowed`
+    /// around the whole list — any narrowing established while walking
+    /// these statements (a branch-local one from a nested `If`/`While`, or
+    /// carry-forward from an early-exiting `if` earlier in *this* list) is
+    /// reverted once the list finishes, so it never leaks to a sibling
+    /// block or back out to the caller. Every statement list ultimately
+    /// funnels through here (directly, or via `walk_block`), so this one
+    /// snapshot/restore correctly scopes every narrowing source.
     fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize, following: Span) -> Type {
+        let narrowed_on_entry = self.narrowed.clone();
         let mut last = Type::Unit;
         for (i, s) in stmts.iter().enumerate() {
             let next = stmts.get(i + 1).map(|s| s.span).unwrap_or(following);
             last = self.walk_stmt(s, scope, next);
         }
+        self.narrowed = narrowed_on_entry;
         last
     }
 
@@ -900,7 +1030,13 @@ impl Resolver {
             }
             StmtKind::While { cond, body } => {
                 self.walk_expr(cond, scope, following);
+                // Same null-safety smart-cast as `If`'s then-branch: the
+                // body only ever runs when `cond` is true.
+                let (pos, _neg) = self.narrowing_for_condition(cond, scope);
+                let ambient = self.narrowed.clone();
+                self.narrowed.extend(pos);
                 self.walk_block(body, scope, stmt.span, following);
+                self.narrowed = ambient;
                 Type::Unit
             }
             StmtKind::For { var_name, var_name_span, iterable, body } => {
@@ -1210,12 +1346,30 @@ impl Resolver {
             // receiver's own type is itself `Unknown` (an already-reported
             // problem elsewhere — don't cascade a second diagnostic onto
             // it here).
-            ExprKind::FieldAccess { receiver, field, .. } => {
+            ExprKind::FieldAccess { receiver, field, safe, .. } => {
                 match self.dotted_path_if_not_local(expr, scope) {
                     Some(path) => self.table.qualified_refs.push((expr.span, path)),
                     None => {
                         let recv_ty = self.walk_expr(receiver, scope, following);
-                        if recv_ty != Type::Unknown {
+                        // An unsafe (`.`) access on a still-nullable
+                        // receiver is rejected outright, matching Kotlin's
+                        // own compile error — this is what makes an
+                        // un-narrowed `chain.length()` a clear diagnostic
+                        // instead of a confusing runtime "'Null' has no
+                        // field" message. A narrowed receiver never reaches
+                        // here as `Nullable` in the first place (see
+                        // `resolve_name`'s smart-cast integration).
+                        if let Type::Nullable(_) = &recv_ty {
+                            if !*safe {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!(
+                                        "only safe (?.) or non-null asserted (!!) calls are allowed on a nullable receiver of type '{}'",
+                                        recv_ty.name()
+                                    ),
+                                    expr.span,
+                                ));
+                            }
+                        } else if recv_ty != Type::Unknown {
                             self.type_errors.push(RuntimeError::new(
                                 format!("'{}' has no field '{field}'", recv_ty.name()),
                                 expr.span,
@@ -1225,7 +1379,7 @@ impl Resolver {
                 }
                 Type::Unknown
             }
-            ExprKind::MethodCall { receiver, method, method_span, args } => {
+            ExprKind::MethodCall { receiver, method, method_span, args, safe } => {
                 self.table.method_refs.push((*method_span, method.clone()));
                 let recv_ty = match self.dotted_path_if_not_local(receiver, scope) {
                     Some(mut path) => {
@@ -1241,26 +1395,65 @@ impl Resolver {
                 for a in args {
                     self.walk_expr(&a.value, scope, following);
                 }
-                match &recv_ty {
-                    // `Unknown` receiver: deferred, no immediate error —
-                    // could be a real method once the receiver's type is
-                    // itself resolvable.
-                    Some(Type::Unknown) => Type::Unknown,
-                    Some(t) => {
-                        let known = crate::stdlib::BUILTIN_METHOD_SIGNATURES
-                            .iter()
-                            .any(|(recv_type, name, ..)| *recv_type == t.name() && *name == method);
-                        if known {
-                            crate::stdlib::builtin_method_return_type(&t.name(), method)
-                        } else {
-                            self.type_errors.push(RuntimeError::new(
-                                format!("'{}' has no method '{method}'", t.name()),
-                                *method_span,
-                            ));
-                            Type::Unknown
+                // An unsafe (`.`) call on a still-nullable receiver is
+                // rejected outright, matching Kotlin's own compile error —
+                // see the identical check in `FieldAccess` above. Never
+                // fires for a narrowed or `!!`-unwrapped receiver, since
+                // both already observe a concretely non-nullable type by
+                // this point (see `resolve_name`).
+                let unchecked_nullable = !*safe && matches!(&recv_ty, Some(Type::Nullable(_)));
+                if unchecked_nullable {
+                    let t = recv_ty.as_ref().unwrap();
+                    self.type_errors.push(RuntimeError::new(
+                        format!(
+                            "only safe (?.) or non-null asserted (!!) calls are allowed on a nullable receiver of type '{}'",
+                            t.name()
+                        ),
+                        *method_span,
+                    ));
+                }
+                let result_ty = if unchecked_nullable {
+                    Type::Unknown
+                } else {
+                    match &recv_ty {
+                        // `Unknown` receiver: deferred, no immediate error —
+                        // could be a real method once the receiver's type is
+                        // itself resolvable.
+                        Some(Type::Unknown) => Type::Unknown,
+                        Some(t) => {
+                            // A `Nullable(T)` receiver here can only be a
+                            // *safe* (`?.`) call at this point (the unsafe
+                            // case already returned above) — dispatches
+                            // against `T`'s own builtin-method table
+                            // (`String?`'s methods are exactly `String`'s —
+                            // matches Kotlin's own safe-call semantics).
+                            let dispatch_name = match t {
+                                Type::Nullable(inner) => inner.name(),
+                                other => other.name(),
+                            };
+                            let known = crate::stdlib::BUILTIN_METHOD_SIGNATURES
+                                .iter()
+                                .any(|(recv_type, name, ..)| *recv_type == dispatch_name && *name == method);
+                            if known {
+                                crate::stdlib::builtin_method_return_type(&dispatch_name, method)
+                            } else {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!("'{}' has no method '{method}'", t.name()),
+                                    *method_span,
+                                ));
+                                Type::Unknown
+                            }
                         }
+                        None => Type::Unknown,
                     }
-                    None => Type::Unknown,
+                };
+                // A safe (`?.`) call's own result is nullable whenever it
+                // produced a real type — matches Kotlin (`s?.length()` is
+                // `Int?`, not `Int`).
+                if *safe && result_ty != Type::Unknown {
+                    Type::Nullable(Box::new(result_ty))
+                } else {
+                    result_ty
                 }
             }
             ExprKind::Unary { op, expr: inner } => {
@@ -1269,6 +1462,11 @@ impl Resolver {
                     (UnaryOp::Neg | UnaryOp::Pos, Type::Int) => Type::Int,
                     (UnaryOp::Neg | UnaryOp::Pos, Type::Double) => Type::Double,
                     (UnaryOp::Not, Type::Bool) => Type::Bool,
+                    // `!!` unwraps one layer of `Nullable`; on a
+                    // non-nullable operand it's a no-op pass-through.
+                    (UnaryOp::NotNullAssert, Type::Nullable(inner)) => (**inner).clone(),
+                    (UnaryOp::NotNullAssert, Type::Null) => Type::Unknown,
+                    (UnaryOp::NotNullAssert, other) if other != &Type::Unknown => other.clone(),
                     // `Unknown` (couldn't be determined) is never an
                     // immediate error here, only a concretely-known-but-
                     // wrong type — matches `apply_binary`'s runtime
@@ -1287,7 +1485,23 @@ impl Resolver {
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.walk_expr(lhs, scope, following);
-                let r = self.walk_expr(rhs, scope, following);
+                // `&&`/`||` short-circuit at runtime, and Kotlin smart-
+                // casts accordingly: `x != null && x.foo()` only evaluates
+                // `x.foo()` once `x != null` is known true, so `rhs` is
+                // walked with `lhs`'s implied narrowing already applied
+                // (`pos` for `&&`, `neg` for `||` — the same halves
+                // `narrowing_for_condition` would compute for `lhs` as a
+                // standalone `If`/`While` condition), restored right after.
+                let r = if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    let (lpos, lneg) = self.narrowing_for_condition(lhs, scope);
+                    let ambient = self.narrowed.clone();
+                    self.narrowed.extend(if *op == BinaryOp::And { lpos } else { lneg });
+                    let r = self.walk_expr(rhs, scope, following);
+                    self.narrowed = ambient;
+                    r
+                } else {
+                    self.walk_expr(rhs, scope, following)
+                };
                 match op {
                     // `==`/`!=`/`&&`/`||` are total at runtime (structural
                     // equality/truthiness accept any value, never a type
@@ -1509,11 +1723,36 @@ impl Resolver {
             ExprKind::Lambda { params, body } => self.walk_lambda(expr, params, body, scope, following, expected),
             ExprKind::If { cond, then_branch, else_branch } => {
                 self.walk_expr(cond, scope, following);
+                // Null-safety smart-cast: `pos`/`neg` are what `cond`
+                // proves non-null when true/false — see
+                // `narrowing_for_condition`. Each branch is walked with the
+                // ambient narrowing extended accordingly, restored right
+                // after so one branch's narrowing never leaks into the
+                // other or beyond the `if`.
+                let (pos, neg) = self.narrowing_for_condition(cond, scope);
+                let ambient = self.narrowed.clone();
+                self.narrowed.extend(pos);
                 let then_ty = self.walk_block(then_branch, scope, expr.span, following);
+                self.narrowed = ambient.clone();
                 let else_ty = match else_branch {
-                    Some(eb) => self.walk_block(eb, scope, expr.span, following),
+                    Some(eb) => {
+                        self.narrowed.extend(neg.iter().copied());
+                        let ty = self.walk_block(eb, scope, expr.span, following);
+                        self.narrowed = ambient.clone();
+                        ty
+                    }
                     None => Type::Unit,
                 };
+                // Carry-forward: when the then-branch always exits the
+                // normal control flow (`return`/`break`/`continue`),
+                // whatever continues past this `if` in the same statement
+                // list only does so because `cond` was false — so `neg`
+                // holds for the rest of the enclosing block (reverted, like
+                // any other narrowing, when `walk_stmts` for that block
+                // finishes — see its own doc comment).
+                if then_branch.last().map(always_exits).unwrap_or(false) {
+                    self.narrowed.extend(neg);
+                }
                 if then_ty == else_ty {
                     then_ty
                 } else {
@@ -1557,7 +1796,21 @@ impl Resolver {
                             }
                         }
                     }
+                    // Null-safety smart-cast for the subject-less form
+                    // only, and only for a single-condition arm: comma-
+                    // separated conditions are OR'd together (`2, 3 ->`),
+                    // so no single narrowing would be sound across all of
+                    // them the way it is for one `Bool` condition.
+                    let arm_narrowing = match (subject, arm.conditions.as_slice()) {
+                        (None, [WhenCondition::Bool(e)]) => Some(self.narrowing_for_condition(e, scope).0),
+                        _ => None,
+                    };
+                    let ambient = self.narrowed.clone();
+                    if let Some(pos) = arm_narrowing {
+                        self.narrowed.extend(pos);
+                    }
                     let arm_ty = self.walk_block(&arm.body, scope, expr.span, following);
+                    self.narrowed = ambient;
                     acc = Some(match acc {
                         None => arm_ty,
                         Some(prev) if prev == arm_ty => prev,
@@ -1579,6 +1832,31 @@ impl Resolver {
                 acc.unwrap_or(Type::Unknown)
             }
             ExprKind::Block(stmts) => self.walk_block(stmts, scope, expr.span, following),
+            ExprKind::NullLit => Type::Null,
+            ExprKind::Elvis { lhs, rhs } => {
+                let l = self.walk_expr(lhs, scope, following);
+                let r = self.walk_expr(rhs, scope, following);
+                let unwrapped_l = match &l {
+                    Type::Nullable(inner) => (**inner).clone(),
+                    // An always-null lhs carries no real type info of its
+                    // own to join against `r` with.
+                    Type::Null => Type::Unknown,
+                    other => other.clone(),
+                };
+                if unwrapped_l == r {
+                    unwrapped_l
+                } else if unwrapped_l == Type::Unknown || r == Type::Unknown {
+                    Type::Unknown
+                } else if is_primitive(&unwrapped_l) && is_primitive(&r) {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("elvis operands have incompatible types: {} and {}", unwrapped_l.name(), r.name()),
+                        expr.span,
+                    ));
+                    Type::Unknown
+                } else {
+                    Type::Unknown
+                }
+            }
         }
     }
 }
@@ -1594,6 +1872,7 @@ fn type_annotation_display(ann: &TypeAnnotation) -> String {
             let params = params.iter().map(type_annotation_display).collect::<Vec<_>>().join(", ");
             format!("({params}) -> {}", type_annotation_display(ret))
         }
+        TypeAnnotation::Nullable(inner, _) => format!("{}?", type_annotation_display(inner)),
     }
 }
 
@@ -2242,5 +2521,173 @@ mod tests {
             result.table.symbol_at(1, 5).unwrap().ty,
             Type::Function(vec![Type::Int], Box::new(Type::Int))
         );
+    }
+
+    // ---- null-safety ----
+
+    #[test]
+    fn assigning_null_to_a_non_nullable_declared_type_is_flagged() {
+        let result = resolve_src("val x: String = null\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn assigning_null_to_a_nullable_declared_type_is_not_flagged() {
+        let result = resolve_src("val x: String? = null\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().ty, Type::Nullable(Box::new(Type::String)));
+    }
+
+    #[test]
+    fn unknown_name_inside_a_nullable_annotation_is_flagged() {
+        let result = resolve_src("val x: Sting? = null\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("unknown type 'Sting'"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn elvis_infers_the_join_of_the_unwrapped_lhs_and_the_rhs() {
+        let result = resolve_src("fun f(s: String?): Int = s?.length() ?: -1\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().return_type, Type::Int);
+    }
+
+    #[test]
+    fn safe_call_result_is_inferred_as_nullable() {
+        let result = resolve_src("val s: String? = \"hi\"\nval n = s?.length()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.table.symbol_at(2, 5).unwrap().ty, Type::Nullable(Box::new(Type::Int)));
+    }
+
+    #[test]
+    fn unsafe_call_on_an_un_narrowed_nullable_typed_local_is_rejected() {
+        // Reverses the old accepted-gap decision: this resolver now does
+        // real flow-sensitive smart-casting (see `Resolver::narrowed`), so
+        // an unsafe `.` call on a `T?`-typed local with no preceding null
+        // check is a clear, Kotlin-shaped compile-time error instead of a
+        // silently-accepted gap that only NPE'd at runtime.
+        let result = resolve_src("fun f(s: String?): Int = s.length()\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("only safe (?.) or non-null asserted (!!)"),
+            "{}",
+            result.type_errors[0].message
+        );
+        assert!(result.type_errors[0].message.contains("'String?'"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn unsafe_field_access_on_an_un_narrowed_nullable_receiver_is_rejected() {
+        let result = resolve_src("fun f(s: String?): Int {\n    return s.x\n}\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("only safe (?.) or non-null asserted (!!)"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    // ---- smart-cast ----
+
+    #[test]
+    fn if_not_null_then_branch_narrows() {
+        let result = resolve_src("fun f(s: String?): Int {\n    if (s != null) {\n        return s.length()\n    }\n    return -1\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn if_null_reversed_operand_order_then_branch_still_narrows() {
+        // `null != s` (operands swapped) narrows exactly like `s != null`.
+        let result = resolve_src("fun f(s: String?): Int {\n    if (null != s) {\n        return s.length()\n    }\n    return -1\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn if_equals_null_else_branch_narrows() {
+        let result = resolve_src("fun f(s: String?): Int {\n    if (s == null) {\n        return -1\n    } else {\n        return s.length()\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn if_equals_null_then_branch_stays_nullable() {
+        // Inside the `then` branch of `s == null`, `s` is still nullable —
+        // an unsafe call there must still be rejected.
+        let result = resolve_src("fun f(s: String?): Int {\n    if (s == null) {\n        return s.length()\n    }\n    return -1\n}\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn early_return_carries_narrowing_forward() {
+        // `if (s == null) { return -1 }` always exits when taken, so `s`
+        // is narrowed for the rest of the function body — the single most
+        // common real-world null-check idiom.
+        let result = resolve_src("fun f(s: String?): Int {\n    if (s == null) {\n        return -1\n    }\n    return s.length()\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn early_continue_in_a_loop_carries_narrowing_forward() {
+        let result = resolve_src(
+            "fun f(s: String?) {\n    while (true) {\n        if (s == null) {\n            continue\n        }\n        println(s.length())\n    }\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn narrowing_does_not_leak_past_a_non_exiting_if() {
+        // The `then` branch here doesn't always exit, so nothing about `s`
+        // is known after the `if` — an unsafe call afterward must still be
+        // rejected.
+        let result = resolve_src(
+            "fun f(s: String?): Int {\n    if (s != null) {\n        println(\"checked\")\n    }\n    return s.length()\n}\n",
+        );
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn and_short_circuit_narrows_the_right_operand() {
+        let result = resolve_src("fun f(s: String?): Boolean = s != null && s.length() > 0\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn or_short_circuit_narrows_the_right_operand() {
+        let result = resolve_src("fun f(s: String?): Boolean = s == null || s.length() > 0\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn while_condition_narrows_the_loop_body() {
+        let result = resolve_src(
+            "fun f(s: String?) {\n    while (s != null) {\n        println(s.length())\n    }\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn subject_less_when_arm_narrows_its_own_body() {
+        let result = resolve_src(
+            "fun f(s: String?): Int {\n    return when {\n        s != null -> s.length()\n        else -> -1\n    }\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn var_never_narrows() {
+        // Kotlin itself never smart-casts a mutable local — it could
+        // change between the check and the use — and neither does this
+        // resolver.
+        let result = resolve_src(
+            "fun f() {\n    var s: String? = \"hi\"\n    if (s != null) {\n        println(s.length())\n    }\n}\n",
+        );
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn not_operator_flips_narrowing() {
+        // `!(s == null)` is equivalent to `s != null` for narrowing
+        // purposes.
+        let result = resolve_src("fun f(s: String?): Int {\n    if (!(s == null)) {\n        return s.length()\n    }\n    return -1\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 }

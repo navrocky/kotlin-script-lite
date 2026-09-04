@@ -31,7 +31,7 @@ fn token_type_index(kind: &TokenKind) -> Option<u32> {
     use TokenKind::*;
     let idx = match kind {
         Fun | Val | Var | If | Else | When | While | For | In | Return | Break | Continue
-        | Package | Import | Bool(_) => KEYWORD,
+        | Package | Import | Null | Bool(_) => KEYWORD,
 
         Int(_) | Double(_) => NUMBER,
 
@@ -41,7 +41,8 @@ fn token_type_index(kind: &TokenKind) -> Option<u32> {
 
         Assign | Eq | NotEq | Lt | Gt | LtEq | GtEq | AndAnd | OrOr | Not | Plus | Minus | Star
         | Slash | Percent | PlusAssign | MinusAssign | StarAssign | SlashAssign
-        | PercentAssign | Arrow | Range | At | TemplateExprStart | TemplateExprEnd => OPERATOR,
+        | PercentAssign | Arrow | Range | At | TemplateExprStart | TemplateExprEnd
+        | Question | QuestionDot | QuestionColon | BangBang => OPERATOR,
 
         Ident(_) | LParen | RParen | LBrace | RBrace | LBracket | RBracket | Comma | Colon
         | Dot | Semicolon | Newline | Eof => return None,
@@ -122,6 +123,23 @@ mod tests {
                 SemanticToken { delta_line: 0, delta_start: 2, length: 1, token_type: NUMBER, token_modifiers_bitset: 0 },
             ]
         );
+    }
+
+    #[test]
+    fn null_safety_tokens_classify_as_keyword_or_operator() {
+        let toks = tokens("val x: String? = null");
+        // val(keyword) x(skip,ident) :(skip,colon) String(skip,ident)
+        // ?(operator) =(operator) null(keyword)
+        let kinds: Vec<u32> = toks.iter().map(|t| t.token_type).collect();
+        assert_eq!(kinds, vec![KEYWORD, OPERATOR, OPERATOR, KEYWORD]);
+    }
+
+    #[test]
+    fn safe_call_elvis_and_not_null_assert_classify_as_operator() {
+        let toks = tokens("a?.b ?: c!!");
+        let kinds: Vec<u32> = toks.iter().map(|t| t.token_type).collect();
+        // a(skip) ?.(operator) b(skip) ?:(operator) c(skip) !!(operator)
+        assert_eq!(kinds, vec![OPERATOR, OPERATOR, OPERATOR]);
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub enum TokenKind {
     Continue,
     Package,
     Import,
+    Null,
 
     // Punctuation
     LParen,
@@ -68,6 +69,10 @@ pub enum TokenKind {
     PercentAssign,
     Arrow,
     Range,
+    Question,
+    QuestionDot,
+    QuestionColon,
+    BangBang,
 
     Newline,
     Eof,
@@ -92,6 +97,8 @@ impl TokenKind {
                 | TokenKind::Return
                 | TokenKind::Break
                 | TokenKind::Continue
+                | TokenKind::Null
+                | TokenKind::BangBang
         )
     }
 }

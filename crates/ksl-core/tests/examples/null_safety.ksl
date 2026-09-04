@@ -1,0 +1,41 @@
+// null literal, T? annotations, ?. safe call, ?: elvis, !!, chained safe
+// calls, and flow-sensitive smart-cast (if/else, early-return, &&/||, while).
+
+fun describe(s: String?): String {
+    return "length is ${s?.length() ?: -1}"
+}
+
+println(describe("hello"))
+println(describe(null))
+
+val name: String? = "Kotlin"
+println(name?.uppercase() ?: "NONE")
+
+val missing: String? = null
+println(missing?.uppercase() ?: "NONE")
+
+val notNull: Int? = 42
+println(notNull!!)
+
+println(null == null)
+println(null == 1)
+
+val chain: String? = null
+println(chain?.uppercase()?.length() ?: -1)
+
+// Smart-cast: an unsafe call is accepted once the null check proves the
+// value can't be null in this branch — no ?./!! needed here.
+fun greet(s: String?): String {
+    if (s == null) {
+        return "stranger"
+    }
+    return s.uppercase()
+}
+println(greet(null))
+println(greet("world"))
+
+if (name != null) {
+    println("smart-cast length: ${name.length()}")
+}
+
+println(name != null && name.length() > 0)
