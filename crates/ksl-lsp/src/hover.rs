@@ -88,6 +88,10 @@ fn build_hover(symbol: &Symbol, range_span: Option<Span>, is_current: bool) -> H
         SymbolKind::Param => "parameter",
     };
     let mut value = format!("```ksl\n{}\n```\n\n*{}*", symbol.signature, kind_label);
+    if let Some(doc) = &symbol.doc {
+        value.push_str("\n\n");
+        value.push_str(doc);
+    }
     if !is_current {
         value.push_str("\n\n_(from the last version of this file that parsed successfully)_");
     }
@@ -142,6 +146,100 @@ mod tests {
         let text2 = "fun add(a: Int, b: Int) = a + b\nprintln(add(1, 2))\n";
         let h2 = hover_at(text2, 1, 5).expect("add should hover");
         assert!(markdown_value(&h2).contains("fun add(a: Int, b: Int): Int"), "{}", markdown_value(&h2));
+    }
+
+    #[test]
+    fn hover_on_a_documented_fun_shows_its_summary_and_returns() {
+        let text = "/**\n * Adds two numbers.\n * @param a the first number\n * @param b the second number\n * @return the sum\n */\nfun add(a: Int, b: Int): Int {\n    return a + b\n}\nprintln(add(1, 2))\n";
+        let h = hover_at(text, 7, 5).expect("add should hover");
+        let value = markdown_value(&h);
+        assert!(value.contains("Adds two numbers."), "{value}");
+        assert!(value.contains("**Returns:** the sum"), "{value}");
+    }
+
+    #[test]
+    fn hover_on_a_documented_fun_also_lists_its_parameters() {
+        // Hovering the *function* shows every `@param`'s description too,
+        // not just its own summary/returns -- no need to hover each
+        // parameter separately to see the full picture.
+        let text = "/**\n * Adds two numbers.\n * @param a the first number\n * @param b the second number\n * @return the sum\n */\nfun add(a: Int, b: Int): Int {\n    return a + b\n}\nprintln(add(1, 2))\n";
+        let h = hover_at(text, 7, 5).expect("add should hover");
+        let value = markdown_value(&h);
+        assert!(value.contains("**Parameters:**"), "{value}");
+        assert!(value.contains("`a` — the first number"), "{value}");
+        assert!(value.contains("`b` — the second number"), "{value}");
+    }
+
+    #[test]
+    fn hover_on_a_fun_with_only_param_docs_and_no_summary_still_shows_them() {
+        let text = "/**\n * @param n the number\n */\nfun square(n: Int): Int {\n    return n * n\n}\nprintln(square(2))\n";
+        let h = hover_at(text, 4, 5).expect("square should hover");
+        let value = markdown_value(&h);
+        assert!(value.contains("**Parameters:**"), "{value}");
+        assert!(value.contains("`n` — the number"), "{value}");
+    }
+
+    #[test]
+    fn hover_on_a_documented_funs_parameter_shows_its_own_param_text_not_the_summary() {
+        let text = "/**\n * Adds two numbers.\n * @param a the first number\n */\nfun add(a: Int, b: Int): Int {\n    return a + b\n}\n";
+        // "    return a" -- "a" starts at column 12.
+        let h = hover_at(text, 6, 12).expect("a should hover");
+        let value = markdown_value(&h);
+        assert!(value.contains("the first number"), "{value}");
+        assert!(!value.contains("Adds two numbers"), "{value}");
+    }
+
+    #[test]
+    fn hover_on_a_param_documented_without_star_per_line_prefixes() {
+        // Not every doc comment uses the `* ` per-line style the other
+        // tests here do -- plain indented text (no leading `*` at all) and
+        // non-ASCII content must work identically.
+        let text = "/**\n  Factorial.\n  \n  @param n the number\n*/\nfun factorial(n: Int): Int {\n    if (n <= 1) {\n        return 1\n    }\n    return n * factorial(n - 1)\n}\n";
+        // Declaration site: "fun factorial(n: Int)" -- "n" at column 15.
+        let h_decl = hover_at(text, 6, 15).expect("n should hover at its declaration");
+        assert!(markdown_value(&h_decl).contains("the number"), "{}", markdown_value(&h_decl));
+        // A use inside the body: "return n * factorial(n - 1)" -- first "n" at column 12.
+        let h_use = hover_at(text, 10, 12).expect("n should hover at a use site");
+        assert!(markdown_value(&h_use).contains("the number"), "{}", markdown_value(&h_use));
+    }
+
+    #[test]
+    fn hover_on_a_documented_val_shows_its_summary() {
+        let text = "/** The current count. */\nval count = 0\nprintln(count)\n";
+        let h = hover_at(text, 2, 5).expect("count should hover");
+        assert!(markdown_value(&h).contains("The current count."), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_an_undocumented_fun_shows_no_extra_doc_block() {
+        let text = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nprintln(add(1, 2))\n";
+        let h = hover_at(text, 1, 5).expect("add should hover");
+        assert_eq!(markdown_value(&h), "```ksl\nfun add(a: Int, b: Int): Int\n```\n\n*function*");
+    }
+
+    #[test]
+    fn hover_on_a_documented_cross_file_function_shows_its_doc() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_hover_doc_cross_file_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("greeter.ksl"),
+            "/**\n * Greets someone by name.\n */\nfun greet(name: String): String {\n    return name\n}\n",
+        )
+        .unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"greeter.ksl\")\nprintln(greet(\"World\"))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        // "println(" is 8 chars, so "greet" starts at column 9.
+        let h = hover(&a, Position::new(1, 8)).expect("greet should hover");
+        assert!(markdown_value(&h).contains("Greets someone by name."), "{}", markdown_value(&h));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -221,3 +319,4 @@ mod tests {
         assert!(h.is_none());
     }
 }
+

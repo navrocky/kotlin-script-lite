@@ -73,6 +73,17 @@ pub struct Symbol {
     /// (`f(a = 1)`) be checked by name instead of position. Empty for
     /// every other kind.
     pub param_names: Vec<String>,
+    /// Doc-comment text for hover/completion, already rendered to a final
+    /// display string (mirrors `signature`'s "pre-rendered once" shape,
+    /// no separate structured type on `Symbol`). For `Fun`/`Val`/`Var`:
+    /// the parsed `/** ... */`'s summary, plus a `**Returns:**` line when
+    /// an `@return` tag was present (see `walk_stmt`). For a named `fun`'s
+    /// own `Param`: just that parameter's own `@param` description, pulled
+    /// from the *function's* doc comment (see `walk_params`) — a lambda's
+    /// parameters never get one, since a lambda can't carry its own KDoc
+    /// comment. `None` whenever there's nothing worth showing (no comment,
+    /// or a `doc_comment::ParsedDoc` that turned out entirely empty).
+    pub doc: Option<String>,
 }
 
 /// A `following` hint (see `Resolver::walk_stmt`) meaning "there's no
@@ -466,6 +477,7 @@ impl Resolver {
         return_type: Type,
         param_types: Vec<Type>,
         param_names: Vec<String>,
+        doc: Option<String>,
     ) -> usize {
         if self.table.scopes[scope].names.contains_key(name) {
             self.diagnostics.push(RuntimeError::new(
@@ -484,6 +496,7 @@ impl Resolver {
             return_type,
             param_types,
             param_names,
+            doc,
         });
         self.table.scopes[scope].names.insert(name.to_string(), idx);
         self.table.occurrences.push((def_span, idx));
@@ -636,7 +649,7 @@ impl Resolver {
         self.touch(scope, stmt.span);
         match &stmt.kind {
             StmtKind::ExprStmt(e) => self.walk_expr(e, scope, following),
-            StmtKind::ValDecl { name, name_span, init, mutable, type_annotation } => {
+            StmtKind::ValDecl { name, name_span, init, mutable, type_annotation, doc_comment } => {
                 let kind = if *mutable { SymbolKind::Var } else { SymbolKind::Val };
                 let keyword = if *mutable { "var" } else { "val" };
                 let declared_ty = self.resolve_type_annotation_here(type_annotation.as_ref());
@@ -683,7 +696,15 @@ impl Resolver {
                         *name_span,
                     ));
                 }
-                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new());
+                // Only the summary matters for a `val`/`var` — `@param`/
+                // `@return` tags aren't meaningful here (a plain value has
+                // neither), so they're simply ignored if present.
+                let doc = doc_comment
+                    .as_deref()
+                    .map(crate::doc_comment::parse)
+                    .map(|d| d.summary)
+                    .filter(|s| !s.is_empty());
+                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new(), doc);
                 Type::Unit
             }
             StmtKind::Assign { name, op, value } => {
@@ -710,7 +731,41 @@ impl Resolver {
                 }
                 Type::Unit
             }
-            StmtKind::FunDecl { name, name_span, params, return_type, body } => {
+            StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment } => {
+                // Parsed once, up front: `fun_doc` (the function's own
+                // hover doc, summary + an optional `**Returns:**` line) is
+                // consumed right here at `define()`; `parsed_doc` itself
+                // stays alive for `walk_params` below, which pulls each
+                // parameter's own description out of its `@param` tags.
+                let parsed_doc = doc_comment.as_deref().map(crate::doc_comment::parse);
+                let fun_doc = parsed_doc.as_ref().and_then(|d| {
+                    if d.summary.is_empty() && d.returns.is_none() && d.params.is_empty() {
+                        None
+                    } else {
+                        let mut parts = Vec::new();
+                        if !d.summary.is_empty() {
+                            parts.push(d.summary.clone());
+                        }
+                        // Each parameter's own description also appears on
+                        // its own `Symbol` (see `walk_params` below, which
+                        // is where hovering the *parameter itself* picks
+                        // this same text up) — repeated here too so
+                        // hovering the *function* shows the full picture
+                        // without needing to hover each parameter one by
+                        // one, same as real Kotlin IDEs' quick-doc popup.
+                        if !d.params.is_empty() {
+                            let mut block = String::from("**Parameters:**");
+                            for (name, desc) in &d.params {
+                                block.push_str(&format!("\n- `{name}` — {desc}"));
+                            }
+                            parts.push(block);
+                        }
+                        if let Some(returns) = &d.returns {
+                            parts.push(format!("**Returns:** {returns}"));
+                        }
+                        Some(parts.join("\n\n"))
+                    }
+                });
                 let ret_ty = self.resolve_type_annotation_here(return_type.as_ref());
                 // Resolved quietly (no "unknown type" diagnostic here) —
                 // `walk_params` below resolves each param's annotation
@@ -752,9 +807,10 @@ impl Resolver {
                     ret_ty.clone(),
                     param_types.clone(),
                     param_names,
+                    fun_doc,
                 );
                 let fn_scope = self.open_scope(scope, stmt.span, following);
-                self.walk_params(params, fn_scope, following);
+                self.walk_params(params, fn_scope, following, parsed_doc.as_ref());
                 self.return_type_stack.push(if has_return_annotation {
                     ReturnTypeContext::Expected(ret_ty.clone())
                 } else {
@@ -875,6 +931,7 @@ impl Resolver {
                     Type::Unknown,
                     Vec::new(),
                     Vec::new(),
+                    None,
                 );
                 self.walk_stmts(body, for_scope, following);
                 Type::Unit
@@ -922,7 +979,13 @@ impl Resolver {
     /// through `walk_lambda_params` instead, which infers a missing
     /// annotation from an expected type at the lambda's use site rather
     /// than requiring one outright.
-    fn walk_params(&mut self, params: &[Param], fn_scope: usize, following: Span) {
+    fn walk_params(
+        &mut self,
+        params: &[Param],
+        fn_scope: usize,
+        following: Span,
+        fun_doc: Option<&crate::doc_comment::ParsedDoc>,
+    ) {
         for p in params {
             if let Some(default) = &p.default {
                 self.walk_expr(default, fn_scope, following);
@@ -938,7 +1001,11 @@ impl Resolver {
                 Type::Unknown => format!("param {}", p.name),
                 t => format!("param {}: {}", p.name, t.name()),
             };
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new());
+            // Pulled from the enclosing function's own `@param` tag, if
+            // any named this parameter — a param has no doc-comment syntax
+            // of its own (see `ast::Param`'s doc comment).
+            let doc = fun_doc.and_then(|d| d.param(&p.name)).map(str::to_string);
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new(), doc);
         }
     }
 
@@ -995,6 +1062,7 @@ impl Resolver {
                 Type::Unknown,
                 Vec::new(),
                 Vec::new(),
+                None,
             );
             return vec![inferred];
         }
@@ -1023,7 +1091,7 @@ impl Resolver {
                 Type::Unknown => format!("param {}", p.name),
                 t => format!("param {}: {}", p.name, t.name()),
             };
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new());
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new(), None);
             param_types.push(inferred);
         }
         param_types

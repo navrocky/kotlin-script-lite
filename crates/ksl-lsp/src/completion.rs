@@ -37,6 +37,15 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
 
+    // Checked first, ahead of every other (line-local) context below: a
+    // KDoc tag (`@param`, `@return`, ...) can only ever appear inside a
+    // `/** ... */` doc comment, which is usually multi-line — unlike the
+    // other detectors here, this one needs the text from the *start of the
+    // document*, not just the current line.
+    if kdoc_tag_context(&text_up_to_position(text, position)).is_some() {
+        return kdoc_tag_completions();
+    }
+
     if let Some(ctx) = file_import_context(&up_to_cursor) {
         return match ctx {
             FileImportContext::AtHead => file_head_completion(),
@@ -96,6 +105,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
                 label: m.symbol.name.clone(),
                 kind: Some(symbol_completion_kind(m.symbol.kind)),
                 detail: Some(m.symbol.signature.clone()),
+                documentation: m.symbol.doc.clone().map(Documentation::String),
                 ..Default::default()
             })
             .collect();
@@ -126,6 +136,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             label: symbol.name.clone(),
             kind: Some(symbol_completion_kind(symbol.kind)),
             detail: Some(symbol.signature.clone()),
+            documentation: symbol.doc.clone().map(Documentation::String),
             ..Default::default()
         });
     }
@@ -158,6 +169,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             label: member.symbol.name.clone(),
             kind: Some(symbol_completion_kind(member.symbol.kind)),
             detail: Some(member.symbol.signature.clone()),
+            documentation: member.symbol.doc.clone().map(Documentation::String),
             ..Default::default()
         });
     }
@@ -399,6 +411,82 @@ fn file_path_completions(own_file: &std::path::Path, partial: &str) -> Vec<Compl
     items
 }
 
+/// All full lines of `text` up to `position.line`, plus the current line
+/// truncated to `position.character` — unlike every other completion
+/// context in this file (which only ever look at the current line), KDoc
+/// tag detection needs the whole document up to the cursor, since a doc
+/// comment is usually multi-line.
+fn text_up_to_position(text: &str, position: Position) -> String {
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        if i as u32 > position.line {
+            break;
+        }
+        if i as u32 == position.line {
+            out.extend(line.chars().take(position.character as usize));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Whether the cursor sits inside a still-open `/** ... */` doc comment,
+/// right after an `@` (optionally with a partial tag name already typed,
+/// e.g. `@par` while typing `@param`) — returns that partial text (`""` if
+/// nothing's typed yet after the `@`). Finds the *last* `/**` before the
+/// cursor; if a `*/` already closes it before the cursor too, we're not
+/// inside it anymore. Known, harmless imprecision (in the spirit of this
+/// file's other text-only heuristics): an empty `/**/` reads as "still
+/// open" here, since this is a plain substring check, not the lexer's own
+/// (correct) open/close scan — see `lexer.rs`'s doc comment on exactly
+/// that distinction. Doesn't overlap with `file_import_context`: an `@`
+/// a real KDoc comment would realistically contain never looks like
+/// `@file:Import(...)`'s own shape, and vice versa.
+fn kdoc_tag_context(text_up_to_cursor: &str) -> Option<String> {
+    let last_open = text_up_to_cursor.rfind("/**")?;
+    let after_open = &text_up_to_cursor[last_open + 3..];
+    if after_open.contains("*/") {
+        return None;
+    }
+    let last_at = after_open.rfind('@')?;
+    let partial = &after_open[last_at + 1..];
+    partial.chars().all(|c| c.is_ascii_alphabetic()).then(|| partial.to_string())
+}
+
+/// Every KDoc block tag (kotlinlang.org/docs/kotlin-doc.html) this project
+/// recognizes — see `doc_comment.rs` for which ones are actually rendered
+/// in hover today (`@param`/`@return`); the rest are still offered here so
+/// completion doesn't undersell what's valid to write, even before a later
+/// phase starts rendering them too.
+const KDOC_TAGS: &[(&str, &str)] = &[
+    ("param", "Documents a value parameter of a function."),
+    ("return", "Documents the return value of a function."),
+    ("constructor", "Documents the primary constructor of a class."),
+    ("receiver", "Documents the receiver of an extension function or property."),
+    ("property", "Documents a property of a class."),
+    ("throws", "Documents an exception that can be thrown by a function."),
+    ("exception", "Alias for `@throws`."),
+    ("sample", "Embeds the body of a function into the documentation, as an example."),
+    ("see", "Adds a link to another symbol, or to no symbol for a general link."),
+    ("author", "Documents the author of the element."),
+    ("since", "Documents the version this element was introduced in."),
+    ("suppress", "Excludes an element from the generated documentation."),
+];
+
+fn kdoc_tag_completions() -> Vec<CompletionItem> {
+    KDOC_TAGS
+        .iter()
+        .map(|(name, doc)| CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            documentation: Some(Documentation::String(doc.to_string())),
+            ..Default::default()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +672,75 @@ mod tests {
         assert!(names.contains(&"greet".to_string()), "{names:?}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_after_at_inside_an_open_doc_comment_offers_kdoc_tags() {
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let text = "/**\n * @\n */\nfun f() {}\n";
+        // " * @" is 4 chars -- cursor right after the "@".
+        let names: Vec<String> = completion(&a, text, Position::new(1, 4)).into_iter().map(|i| i.label).collect();
+        assert!(names.contains(&"param".to_string()), "{names:?}");
+        assert!(names.contains(&"return".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_partial_tag_name_still_offers_the_full_kdoc_tag_list() {
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let text = "/**\n * @par\n */\nfun f() {}\n";
+        // " * @par" is 7 chars -- cursor right after "par".
+        let names: Vec<String> =
+            completion(&a, text, Position::new(1, 7)).into_iter().map(|i| i.label).collect();
+        assert!(names.contains(&"param".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_at_in_a_closed_doc_comment_does_not_offer_kdoc_tags() {
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let text = "/** already closed */\n@file:Import(\"x.ksl\")\n";
+        // Cursor right after the "@" of "@file:Import" on line 2 -- must be
+        // recognized as the file-import head, not confused with kdoc tags.
+        let names: Vec<String> =
+            completion(&a, text, Position::new(1, 1)).into_iter().map(|i| i.label).collect();
+        assert_eq!(names, vec!["file".to_string()]);
+    }
+
+    #[test]
+    fn completion_after_at_outside_any_doc_comment_does_not_offer_kdoc_tags() {
+        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let names: Vec<String> =
+            completion(&a, "@f\n", Position::new(0, 2)).into_iter().map(|i| i.label).collect();
+        assert_eq!(names, vec!["file".to_string()], "must still resolve to the file-import head, not kdoc tags");
+    }
+
+    #[test]
+    fn kdoc_tag_context_recognizes_the_open_close_and_outside_cases() {
+        assert!(kdoc_tag_context("/**\n * @").is_some());
+        assert_eq!(kdoc_tag_context("/**\n * @par").unwrap(), "par");
+        assert!(kdoc_tag_context("/** closed */\n@").is_none());
+        assert!(kdoc_tag_context("@file:Import(\"x\")").is_none());
+        assert!(kdoc_tag_context("").is_none());
+    }
+
+    #[test]
+    fn completion_includes_documentation_for_a_documented_local_symbol() {
+        let text = "/** The current count. */\nval count = 0\nprintln(count)\n";
+        let a = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let items = completion(&a, text, Position::new(2, 5));
+        let count = items.iter().find(|i| i.label == "count").expect("count should be offered");
+        match &count.documentation {
+            Some(Documentation::String(s)) => assert!(s.contains("The current count."), "{s}"),
+            other => panic!("expected documentation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_has_no_documentation_for_an_undocumented_local_symbol() {
+        let text = "val count = 0\nprintln(count)\n";
+        let a = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let items = completion(&a, text, Position::new(1, 5));
+        let count = items.iter().find(|i| i.label == "count").expect("count should be offered");
+        assert!(count.documentation.is_none());
     }
 
     #[test]

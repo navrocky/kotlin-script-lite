@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod doc_comment;
 pub mod environment;
 pub mod error;
 pub mod importer;
@@ -23,8 +24,8 @@ use interpreter::Interpreter;
 /// like an LSP invoke this on every keystroke, where the buffer is
 /// syntactically incomplete much of the time.
 pub fn parse_only(src: &str) -> Result<ast::Program, ParseError> {
-    let tokens = lexer::tokenize(src)?;
-    parser::parse(&tokens)
+    let (tokens, docs) = lexer::tokenize_with_docs(src)?;
+    parser::parse_with_docs(&tokens, docs)
 }
 
 /// Runs the static type checker (parse + `resolver::resolve`, no execution,

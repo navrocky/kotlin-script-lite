@@ -228,6 +228,10 @@ pub enum StmtKind {
         type_annotation: Option<TypeAnnotation>,
         mutable: bool,
         init: Expr,
+        /// Raw text of an immediately-preceding `/** ... */` doc comment,
+        /// if any (see `parser::parse_with_docs`) — resolved into a
+        /// `doc_comment::ParsedDoc` by the resolver, not here.
+        doc_comment: Option<String>,
     },
     Assign {
         name: String,
@@ -243,6 +247,9 @@ pub enum StmtKind {
         /// into a real `types::Type` by the resolver/interpreter, not here.
         return_type: Option<TypeAnnotation>,
         body: FunBody,
+        /// Raw text of an immediately-preceding `/** ... */` doc comment,
+        /// if any — see `ValDecl::doc_comment`.
+        doc_comment: Option<String>,
     },
     While {
         cond: Expr,

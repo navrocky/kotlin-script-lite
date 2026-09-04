@@ -1,9 +1,19 @@
+use std::collections::HashMap;
+
 use crate::ast::*;
 use crate::error::{ParseError, Span};
 use crate::token::{Token, TokenKind};
 
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
-    let mut p = Parser { tokens, pos: 0, loop_depth: 0 };
+    parse_with_docs(tokens, HashMap::new())
+}
+
+/// Like `parse`, but also attaches doc comments (see
+/// `lexer::Lexer::doc_comments`) to the `val`/`var`/`fun` declarations they
+/// immediately precede — `doc_comments` is keyed by source line number,
+/// exactly as the lexer produces it.
+pub fn parse_with_docs(tokens: &[Token], doc_comments: HashMap<u32, String>) -> Result<Program, ParseError> {
+    let mut p = Parser { tokens, pos: 0, loop_depth: 0, doc_comments };
     p.parse_program()
 }
 
@@ -18,6 +28,11 @@ struct Parser<'a> {
     /// rejection (this interpreter has no type/scope checking otherwise,
     /// so this is done at parse time instead).
     loop_depth: u32,
+    /// Doc-comment text (see `lexer::Lexer::doc_comments`), keyed by the
+    /// line a comment immediately precedes. Consulted only in
+    /// `parse_val_decl`/`parse_fun_decl` — the only two constructs KDoc
+    /// ever attaches to.
+    doc_comments: HashMap<u32, String>,
 }
 
 impl<'a> Parser<'a> {
@@ -343,6 +358,7 @@ impl<'a> Parser<'a> {
 
     fn parse_val_decl(&mut self) -> Result<Stmt, ParseError> {
         let span = self.span();
+        let doc_comment = self.doc_comments.remove(&span.line);
         let mutable = matches!(self.peek_kind(), TokenKind::Var);
         self.advance(); // val/var
         let (name, name_span) = self.expect_ident_spanned()?;
@@ -357,6 +373,7 @@ impl<'a> Parser<'a> {
                 type_annotation,
                 mutable,
                 init,
+                doc_comment,
             },
             span,
         ))
@@ -390,6 +407,7 @@ impl<'a> Parser<'a> {
 
     fn parse_fun_decl(&mut self) -> Result<Stmt, ParseError> {
         let span = self.span();
+        let doc_comment = self.doc_comments.remove(&span.line);
         self.advance(); // fun
         let (name, name_span) = self.expect_ident_spanned()?;
         let params = self.parse_params()?;
@@ -403,7 +421,7 @@ impl<'a> Parser<'a> {
         };
         self.loop_depth = saved_loop_depth;
         Ok(Stmt::new(
-            StmtKind::FunDecl { name, name_span, params, return_type, body: body? },
+            StmtKind::FunDecl { name, name_span, params, return_type, body: body?, doc_comment },
             span,
         ))
     }

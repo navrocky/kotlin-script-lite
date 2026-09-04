@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::error::{ParseError, Span};
 use crate::token::{Token, TokenKind};
 
@@ -19,6 +21,15 @@ pub struct Lexer<'a> {
     col: u32,
     mode_stack: Vec<LexMode>,
     tokens: Vec<Token>,
+    /// Raw text of every `/** ... */` doc comment found in `LexMode::Normal`
+    /// (never inside a `${ ... }` interpolation), keyed by the source line
+    /// immediately after its closing `*/` — i.e. "a doc comment attaches to
+    /// this exact next line" (no blank line allowed in between, matching
+    /// real KDoc/IntelliJ convention). Comments are otherwise fully
+    /// discarded, exactly as before (see `lex_normal_token`'s block-comment
+    /// branch) — this is a side channel, not a token in `tokens`, so it
+    /// never affects the main token stream `tokenize()` produces.
+    doc_comments: HashMap<u32, String>,
     _source: &'a str,
 }
 
@@ -31,11 +42,27 @@ impl<'a> Lexer<'a> {
             col: 1,
             mode_stack: vec![LexMode::Normal],
             tokens: Vec::new(),
+            doc_comments: HashMap::new(),
             _source: source,
         }
     }
 
+    /// Tokenizes `source`, discarding any doc comments found — the token
+    /// stream this produces is identical whether or not the source has any
+    /// `/** ... */` comments (see `run`/`tokenize_with_docs`).
     pub fn tokenize(mut self) -> Result<Vec<Token>, ParseError> {
+        self.run()?;
+        Ok(self.tokens)
+    }
+
+    /// Like `tokenize`, but also returns the doc-comment index (see
+    /// `doc_comments`'s doc comment) built along the way.
+    pub fn tokenize_with_docs(mut self) -> Result<(Vec<Token>, HashMap<u32, String>), ParseError> {
+        self.run()?;
+        Ok((self.tokens, self.doc_comments))
+    }
+
+    fn run(&mut self) -> Result<(), ParseError> {
         self.skip_shebang();
         loop {
             match self.mode_stack.last().expect("mode stack never empty") {
@@ -51,7 +78,7 @@ impl<'a> Lexer<'a> {
             kind: TokenKind::Eof,
             span: self.span(),
         });
-        Ok(self.tokens)
+        Ok(())
     }
 
     fn span(&self) -> Span {
@@ -145,17 +172,41 @@ impl<'a> Lexer<'a> {
                 Some('/') if self.peek_at(1) == Some('*') => {
                     self.advance();
                     self.advance();
-                    loop {
+                    // Accumulate the body regardless of whether this turns
+                    // out to be a doc comment — cheap, and it's the only
+                    // way to tell `/**` (doc) from `/*` (plain) correctly.
+                    // A naive "is the very next char also '*'" check run
+                    // *before* scanning for the close gets `/**/` wrong:
+                    // consuming the 2-char `/*` opener leaves the scanner
+                    // sitting on the 3rd character, and for `/**/` that 3rd
+                    // character (`*`) is simultaneously the first half of
+                    // the *closing* `*/` — so it's consumed as part of the
+                    // close, never makes it into `body`, and `body` ends up
+                    // empty. Checking `body.starts_with('*')` *after* the
+                    // scan is what correctly rejects that case (an empty
+                    // `/**/` isn't a doc comment — same convention as
+                    // Javadoc/KDoc, which need at least one more character
+                    // to hold a body) while still accepting a real
+                    // `/** ... */`, whose leading `*` survives into `body`
+                    // because the actual close is further along.
+                    let mut body = String::new();
+                    let end_line = loop {
                         match self.peek() {
                             None => return Err(self.err("unterminated block comment")),
                             Some('*') if self.peek_at(1) == Some('/') => {
                                 self.advance();
                                 self.advance();
-                                break;
+                                break self.line;
                             }
-                            _ => {
+                            Some(c) => {
+                                body.push(c);
                                 self.advance();
                             }
+                        }
+                    };
+                    if matches!(self.mode_stack.last(), Some(LexMode::Normal)) {
+                        if let Some(doc_text) = body.strip_prefix('*') {
+                            self.doc_comments.insert(end_line + 1, doc_text.to_string());
                         }
                     }
                 }
@@ -495,6 +546,13 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
     Lexer::new(source).tokenize()
 }
 
+/// Like `tokenize`, but also returns a `/** ... */` doc-comment index (see
+/// `Lexer::doc_comments`'s doc comment) alongside the identical token
+/// stream `tokenize` would have produced.
+pub fn tokenize_with_docs(source: &str) -> Result<(Vec<Token>, HashMap<u32, String>), ParseError> {
+    Lexer::new(source).tokenize_with_docs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +651,49 @@ mod tests {
             kinds("1 /* block */ + 2"),
             vec![TokenKind::Int(1), TokenKind::Plus, TokenKind::Int(2), TokenKind::Eof]
         );
+    }
+
+    #[test]
+    fn tokenize_with_docs_produces_the_same_tokens_as_tokenize() {
+        let src = "/** doc */\nfun f() {}\n";
+        assert_eq!(tokenize(src).unwrap(), tokenize_with_docs(src).unwrap().0);
+    }
+
+    #[test]
+    fn doc_comment_is_indexed_on_the_line_right_after_it() {
+        let src = "/** summary */\nfun f() {}\n";
+        let (_, docs) = tokenize_with_docs(src).unwrap();
+        assert_eq!(docs.get(&2).map(String::as_str), Some(" summary "));
+    }
+
+    #[test]
+    fn multi_line_doc_comment_is_indexed_on_the_line_after_its_close() {
+        let src = "/**\n * line one\n * line two\n */\nfun f() {}\n";
+        let (_, docs) = tokenize_with_docs(src).unwrap();
+        assert!(docs.contains_key(&5), "{docs:?}");
+        assert!(docs.get(&5).unwrap().contains("line two"));
+    }
+
+    #[test]
+    fn empty_or_plain_block_comments_are_never_indexed_as_docs() {
+        for src in ["/**/\nfun f() {}\n", "/* plain */\nfun f() {}\n"] {
+            let (_, docs) = tokenize_with_docs(src).unwrap();
+            assert!(docs.is_empty(), "{src:?} -> {docs:?}");
+        }
+    }
+
+    #[test]
+    fn a_stray_extra_star_still_only_strips_one_leading_star() {
+        let src = "/*** blah */\nfun f() {}\n";
+        let (_, docs) = tokenize_with_docs(src).unwrap();
+        assert_eq!(docs.get(&2).map(String::as_str), Some("* blah "));
+    }
+
+    #[test]
+    fn doc_comment_inside_a_template_expression_is_not_indexed() {
+        let src = "val x = \"${/** not a doc */ 1}\"\nfun f() {}\n";
+        let (_, docs) = tokenize_with_docs(src).unwrap();
+        assert!(docs.is_empty(), "{docs:?}");
     }
 
     #[test]
