@@ -1870,13 +1870,28 @@ impl Resolver {
                         }
                         Type::Bool
                     }
+                    // `String`/`List` deliberately asymmetric here,
+                    // matching `apply_binary`'s own runtime rules exactly
+                    // (`interpreter.rs`'s `Add` arm): a `String` on the
+                    // *left* concatenates anything (real Kotlin's
+                    // `String.plus(other: Any?)`) — a `String` on the
+                    // right with a non-`String` left has no such
+                    // operator, at runtime or here. `List` only combines
+                    // with another `List`, on *either* side, but never a
+                    // non-`List` — `(List, List)` covers both directions
+                    // by construction (no separate one-sided arm needed).
+                    // A previous, symmetric `(_, Type::String) | (_,
+                    // Type::List)` version of this let `2 + ""` and
+                    // `5 + listOf(1, 2)` type-check with no error and only
+                    // fail at runtime — a real static/runtime split found
+                    // via direct testing, fixed here.
                     BinaryOp::Add => match (&l, &r) {
                         (Type::Int, Type::Int) => Type::Int,
                         (Type::Double, Type::Double) | (Type::Double, Type::Int) | (Type::Int, Type::Double) => {
                             Type::Double
                         }
-                        (Type::String, _) | (_, Type::String) => Type::String,
-                        (Type::List, _) | (_, Type::List) => Type::List,
+                        (Type::String, _) => Type::String,
+                        (Type::List, Type::List) => Type::List,
                         (Type::Unknown, _) | (_, Type::Unknown) => Type::Unknown,
                         _ => {
                             self.type_errors.push(RuntimeError::new(
@@ -2816,6 +2831,56 @@ mod tests {
         let result = resolve_src("val x = 1 + 2.0\n");
         let sym = result.table.symbol_at(1, 5).unwrap();
         assert_eq!(sym.ty, Type::Double);
+    }
+
+    // ---- `+`'s String/List asymmetry (matches apply_binary's own
+    // runtime rules exactly — regression tests for a real static/runtime
+    // split: these two used to type-check with no error and only fail at
+    // runtime) ----
+
+    #[test]
+    fn string_plus_anything_infers_string_string_must_be_on_the_left() {
+        let result = resolve_src("println(\"\" + 2)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn int_plus_string_is_a_type_error_not_silently_string() {
+        let result = resolve_src("println(2 + \"\")\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("unsupported operand types for '+': Int and String"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    #[test]
+    fn list_plus_list_infers_list() {
+        let result = resolve_src("println(listOf(1) + listOf(2))\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn int_plus_list_is_a_type_error_not_silently_list() {
+        let result = resolve_src("println(5 + listOf(1, 2))\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("unsupported operand types for '+': Int and List"),
+            "{}",
+            result.type_errors[0].message
+        );
+    }
+
+    #[test]
+    fn list_plus_int_is_also_a_type_error() {
+        let result = resolve_src("println(listOf(1) + 2)\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(
+            result.type_errors[0].message.contains("unsupported operand types for '+': List and Int"),
+            "{}",
+            result.type_errors[0].message
+        );
     }
 
     #[test]
