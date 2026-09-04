@@ -4,13 +4,6 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Documentation, Po
 
 use crate::analysis::Analysis;
 
-/// From `TokenKind`'s keyword variants (`token.rs`) plus the two boolean
-/// literals — not itself a `TokenKind`, but a reserved word from the
-/// user's point of view.
-const KEYWORDS: &[&str] = &[
-    "fun", "val", "var", "if", "else", "when", "while", "for", "in", "return", "break",
-    "continue", "true", "false",
-];
 
 /// Completion candidates at `position` (0-based, LSP convention) within
 /// `text` (needed, alongside `analysis`, to detect a package-qualified
@@ -68,9 +61,9 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     }
 
     if type_position_before_cursor(&up_to_cursor) {
-        return ksl_core::types::PRIMITIVE_TYPE_NAMES
+        return ksl_core::types::PRIMITIVE_TYPES
             .iter()
-            .map(|name| CompletionItem {
+            .map(|(name, _)| CompletionItem {
                 label: name.to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 ..Default::default()
@@ -159,7 +152,11 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         });
     }
 
-    for kw in KEYWORDS {
+    // Derived straight from `ksl_core::token::KEYWORDS` — the lexer's own
+    // canonical keyword table — rather than a hand-maintained copy, so a
+    // keyword added there (as `package`/`import`/`null` once were, without
+    // a matching update here) always shows up in completion too.
+    for (kw, _) in ksl_core::token::KEYWORDS {
         items.push(CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
@@ -620,6 +617,22 @@ mod tests {
         assert!(names.contains(&"fun".to_string()));
     }
 
+    /// Regression test: `completion.rs`'s own keyword list used to be a
+    /// hand-maintained copy of `token::KEYWORDS` that had drifted out of
+    /// sync — `package`/`import`/`null` were real keywords (`token.rs`)
+    /// the lexer recognized, but never offered as completions, because
+    /// nobody remembered to add them to the separate copy here by hand.
+    /// Now that the list is derived directly from `token::KEYWORDS`, this
+    /// can't happen again — this test would fail the moment it did.
+    #[test]
+    fn every_real_keyword_is_offered_as_a_completion() {
+        let text = "val outer = 1\nfun f(p: Int): Int {\n    val inner = 2\n    return inner\n}\n";
+        let names = labels(text, Position::new(3, 4));
+        for (kw, _) in ksl_core::token::KEYWORDS {
+            assert!(names.contains(&kw.to_string()), "'{kw}' is a real keyword but wasn't offered as a completion");
+        }
+    }
+
     #[test]
     fn falls_back_to_last_good_tree_when_mid_typing() {
         let good = "fun f(p: Int): Int {\n    return p\n}\n";
@@ -964,6 +977,20 @@ mod tests {
         let names = labels(text, Position::new(0, 16)); // right after "val f: (Int) -> "
         assert!(names.contains(&"Int".to_string()), "{names:?}");
         assert!(!names.contains(&"fun".to_string()), "{names:?}");
+    }
+
+    /// Regression test: `Nothing` is a real, working type (Phase 4.5) but
+    /// used to never be offered in a type-annotation position, because
+    /// `ksl-core`'s old `PRIMITIVE_TYPE_NAMES` list (a hand-maintained
+    /// copy of `resolve_type_hint`'s primitive arms) had silently drifted
+    /// out of sync and was missing it — same shape as the `import`/
+    /// `package`/`null` keyword-completion bug. Now that both are derived
+    /// from one `PRIMITIVE_TYPES` table, this can't happen again.
+    #[test]
+    fn completion_in_type_position_offers_nothing() {
+        let text = "val f: (Int) -> Int = { x -> x + 1 }\n";
+        let names = labels(text, Position::new(0, 16));
+        assert!(names.contains(&"Nothing".to_string()), "{names:?}");
     }
 
     #[test]

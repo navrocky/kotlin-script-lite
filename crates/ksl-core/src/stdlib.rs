@@ -206,13 +206,17 @@ pub fn is_known(name: &str) -> bool {
 /// anything" (never flagged incompatible), matching `println(value: Any?)`
 /// in real Kotlin.
 ///
-/// Returns `None` for a name with no single checkable signature — `listOf`
-/// is deliberately absent (variadic; every arg would need `Type::List`'s
-/// still-untracked element type to check meaningfully, and its return type
-/// is already just `Type::List` regardless) and so are `abs`/`max`/`min`
-/// (numeric-polymorphic overloads with *different* return types per
-/// overload — handled directly in `resolver.rs`'s `Call` arm instead,
-/// since there's no one fixed `Type` to report here).
+/// Returns `None` for a name with no single checkable *return* type —
+/// `abs`/`max`/`min` (numeric-polymorphic overloads with *different*
+/// return types per overload — handled directly in `resolver.rs`'s `Call`
+/// arm instead, since there's no one fixed `Type` to report here). A
+/// variadic function like `listOf` still gets a real entry here (empty
+/// param list, real `Type::List` return): every argument goes unchecked
+/// (there's no fixed arity to check against, and `Type::List`'s own
+/// element type isn't tracked anyway), but its *return* type is always
+/// known regardless of how many arguments were passed, so a hint-less
+/// `val l = listOf(1, 2, 3)` can still infer `l: List` instead of
+/// incorrectly erroring "cannot infer type" (see `call_types_from_entries`).
 ///
 /// Also covers `kotlin.test`'s names, even though that package isn't
 /// `default_imported` (see `STDLIB_PACKAGES`'s doc comment) — this
@@ -225,7 +229,7 @@ pub fn is_known(name: &str) -> bool {
 /// imported* one get real argument-type checking instead of falling back
 /// to `Unknown`.
 pub fn stdlib_call_types(name: &str) -> Option<(Vec<Type>, Type)> {
-    call_types_from_entries(STDLIB_PACKAGES.iter().flat_map(|p| p.symbols).filter(|s| s.name == name && s.variadic_param.is_none()))
+    call_types_from_entries(STDLIB_PACKAGES.iter().flat_map(|p| p.symbols).filter(|s| s.name == name))
 }
 
 /// Same as `stdlib_call_types`, but for a fully package-qualified call
@@ -244,7 +248,7 @@ pub fn stdlib_qualified_call_types(path: &[String]) -> Option<(Vec<Type>, Type)>
     let (name, package_segs) = path.split_last()?;
     let package_name = package_segs.join(".");
     let pkg = STDLIB_PACKAGES.iter().find(|p| p.name == package_name)?;
-    call_types_from_entries(pkg.symbols.iter().filter(|s| s.name == name && s.variadic_param.is_none()))
+    call_types_from_entries(pkg.symbols.iter().filter(|s| s.name == name))
 }
 
 /// Shared derivation both `stdlib_call_types` and `stdlib_qualified_call_types`
@@ -256,14 +260,33 @@ pub fn stdlib_qualified_call_types(path: &[String]) -> Option<(Vec<Type>, Type)>
 /// return type (true for `sqrt`'s two overloads, both returning Double) —
 /// otherwise (abs/max/min, where Int vs Double overloads return different
 /// types) there's no safe single signature, so this returns `None`.
-/// `resolver.rs`'s own `abs`/`max`/`min` special case (picks the type from
-/// the actual first argument, bare-name calls only) is unaffected by this
-/// and still handles those.
+/// `resolver.rs`'s own numeric-polymorphic special case (picks the type
+/// from the actual first argument, bare-name calls only — see
+/// `is_numeric_polymorphic` below) is unaffected by this and still
+/// handles those.
+///
+/// A variadic entry (`listOf`) has no fixed arity to check individual
+/// arguments against, but its return type is still real and known
+/// regardless — reported as `(vec![], return_type)` (an empty param list,
+/// so every argument goes unchecked rather than being falsely flagged as
+/// "too many arguments"), not `None`. `None` would make the whole call's
+/// type `Unknown`, which used to make a hint-less `val l = listOf(1, 2,
+/// 3)` incorrectly fail resolver.rs's "cannot infer type" check — a real,
+/// user-reported bug, since `listOf(...)` obviously has a real type
+/// (`List`) regardless of how many arguments it's given. No stdlib name
+/// is both variadic and overloaded today, so this case is only ever
+/// reached with exactly one entry.
 fn call_types_from_entries<'a>(entries: impl Iterator<Item = &'a BuiltinSymbol>) -> Option<(Vec<Type>, Type)> {
     let entries: Vec<&BuiltinSymbol> = entries.collect();
     let first = *entries.first()?;
     if entries.len() == 1 {
+        if first.variadic_param.is_some() {
+            return Some((Vec::new(), first.return_type.clone()));
+        }
         return Some((first.params.iter().map(BuiltinParam::real_type).collect(), first.return_type.clone()));
+    }
+    if entries.iter().any(|s| s.variadic_param.is_some()) {
+        return None;
     }
     let arity = first.params.len();
     let ret = first.return_type.clone();
@@ -272,6 +295,32 @@ fn call_types_from_entries<'a>(entries: impl Iterator<Item = &'a BuiltinSymbol>)
     } else {
         None
     }
+}
+
+/// True for a stdlib name whose every overload has the shape `fn(T, ...,
+/// T): T` for some numeric `T` (every parameter and the return type all
+/// equal one common numeric type, which varies by overload) — `abs`/
+/// `max`/`min` today. `resolver.rs`'s `Call` arm uses this, instead of a
+/// hardcoded name list, to decide when a call's return type should be
+/// inferred from its own first argument's numeric type — the one case
+/// `call_types_from_entries` can't report as a single fixed `Type`
+/// because the overloads genuinely disagree on return type. Computed
+/// structurally from `STDLIB_PACKAGES`, so a future stdlib overload set
+/// with this exact shape is picked up automatically — nothing to
+/// remember to update by hand (the way `resolver.rs`'s old hardcoded
+/// `"abs" | "max" | "min"` match could have silently missed one).
+pub fn is_numeric_polymorphic(name: &str) -> bool {
+    let entries: Vec<&BuiltinSymbol> = STDLIB_PACKAGES
+        .iter()
+        .flat_map(|p| p.symbols)
+        .filter(|s| s.name == name && s.variadic_param.is_none())
+        .collect();
+    entries.len() > 1
+        && entries.iter().all(|s| {
+            matches!(s.return_type, Type::Int | Type::Double)
+                && !s.params.is_empty()
+                && s.params.iter().all(|p| p.ty == s.return_type)
+        })
 }
 
 /// Defines a native function `name` on `env` — the one primitive every
@@ -477,6 +526,38 @@ mod tests {
         assert_eq!(stdlib_qualified_call_types(&path(&["kotlin", "test", "nope"])), None);
         // Too short to have both a package and a member.
         assert_eq!(stdlib_qualified_call_types(&path(&["assertFalse"])), None);
+    }
+
+    /// Regression/documentation test for `is_numeric_polymorphic`:
+    /// confirms it derives exactly the same three names `resolver.rs`
+    /// used to hardcode (`abs`/`max`/`min`), and correctly excludes
+    /// `sqrt` (same-Double-return overloads, not param-equals-return) and
+    /// any non-overloaded or non-numeric name.
+    #[test]
+    fn is_numeric_polymorphic_matches_the_old_hardcoded_name_list() {
+        assert!(is_numeric_polymorphic("abs"));
+        assert!(is_numeric_polymorphic("max"));
+        assert!(is_numeric_polymorphic("min"));
+        assert!(!is_numeric_polymorphic("sqrt"));
+        assert!(!is_numeric_polymorphic("println"));
+        assert!(!is_numeric_polymorphic("length"));
+        assert!(!is_numeric_polymorphic("assertEquals"));
+        assert!(!is_numeric_polymorphic("nope"));
+    }
+
+    /// Regression test: `listOf` (variadic) used to be entirely excluded
+    /// from `stdlib_call_types`, returning `None` — which made a
+    /// hint-less `val l = listOf(1, 2, 3)` resolve to `Type::Unknown` and
+    /// incorrectly fail `resolver.rs`'s "cannot infer type" check, even
+    /// though `listOf(...)`'s return type (`List`) is always known
+    /// regardless of its arguments.
+    #[test]
+    fn stdlib_call_types_reports_list_of_s_return_type_despite_being_variadic() {
+        assert_eq!(stdlib_call_types("listOf"), Some((Vec::new(), Type::List)));
+        assert_eq!(
+            stdlib_qualified_call_types(&["kotlin".to_string(), "collections".to_string(), "listOf".to_string()]),
+            Some((Vec::new(), Type::List)),
+        );
     }
 
     /// `is_known`/`default_imported_symbols` must track `default_imported`

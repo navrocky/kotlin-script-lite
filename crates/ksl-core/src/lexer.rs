@@ -333,25 +333,9 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        let kind = match text.as_str() {
-            "fun" => TokenKind::Fun,
-            "val" => TokenKind::Val,
-            "var" => TokenKind::Var,
-            "if" => TokenKind::If,
-            "else" => TokenKind::Else,
-            "when" => TokenKind::When,
-            "while" => TokenKind::While,
-            "for" => TokenKind::For,
-            "in" => TokenKind::In,
-            "return" => TokenKind::Return,
-            "break" => TokenKind::Break,
-            "continue" => TokenKind::Continue,
-            "package" => TokenKind::Package,
-            "import" => TokenKind::Import,
-            "null" => TokenKind::Null,
-            "true" => TokenKind::Bool(true),
-            "false" => TokenKind::Bool(false),
-            _ => TokenKind::Ident(text),
+        let kind = match crate::token::KEYWORDS.iter().find(|(kw, _)| *kw == text) {
+            Some((_, kind)) => kind.clone(),
+            None => TokenKind::Ident(text),
         };
         self.push(kind, start);
     }

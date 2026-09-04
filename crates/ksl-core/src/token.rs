@@ -80,6 +80,33 @@ pub enum TokenKind {
     Eof,
 }
 
+/// Every keyword text the lexer recognizes, paired with the `TokenKind` it
+/// produces — the single source of truth both `lex_ident_or_keyword`
+/// (`lexer.rs`) and `ksl-lsp`'s keyword completion derive from, so the two
+/// can never drift apart the way a hand-maintained keyword list in
+/// `completion.rs` once could (it was missing `package`/`import`/`null` —
+/// present here, but never added there by hand when these three were
+/// added to the lexer).
+pub const KEYWORDS: &[(&str, TokenKind)] = &[
+    ("fun", TokenKind::Fun),
+    ("val", TokenKind::Val),
+    ("var", TokenKind::Var),
+    ("if", TokenKind::If),
+    ("else", TokenKind::Else),
+    ("when", TokenKind::When),
+    ("while", TokenKind::While),
+    ("for", TokenKind::For),
+    ("in", TokenKind::In),
+    ("return", TokenKind::Return),
+    ("break", TokenKind::Break),
+    ("continue", TokenKind::Continue),
+    ("package", TokenKind::Package),
+    ("import", TokenKind::Import),
+    ("null", TokenKind::Null),
+    ("true", TokenKind::Bool(true)),
+    ("false", TokenKind::Bool(false)),
+];
+
 impl TokenKind {
     /// True for tokens that can legally be the last token of a statement or
     /// expression — used by the lexer's automatic-semicolon-insertion: a

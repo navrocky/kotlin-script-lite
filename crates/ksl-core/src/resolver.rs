@@ -1763,15 +1763,17 @@ impl Resolver {
 
                 let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
 
-                // `abs`/`max`/`min` are numeric-polymorphic (their return
-                // type mirrors whichever numeric type the caller actually
-                // passed) — doesn't fit the "one fixed Type" shape every
+                // A numeric-polymorphic stdlib name (`abs`/`max`/`min` —
+                // see `stdlib::is_numeric_polymorphic`'s doc comment for
+                // exactly which shape qualifies) has a return type that
+                // mirrors whichever numeric type the caller actually
+                // passed — doesn't fit the "one fixed Type" shape every
                 // other signature above has, so it's handled directly here
                 // instead of via `stdlib::stdlib_call_types` (and, being
                 // stdlib functions, never matched a real `signature` above
                 // anyway).
                 if let ExprKind::Name(name) = &callee.kind {
-                    if matches!(name.as_str(), "abs" | "max" | "min") {
+                    if crate::stdlib::is_numeric_polymorphic(name) {
                         return arg_infos
                             .first()
                             .map(|(_, t)| t.clone())
@@ -2391,6 +2393,17 @@ mod tests {
         // trailing name matches.
         let src = "kotlin.math.assertFalse(true, 123)\n";
         let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    /// Regression test: a hint-less `val`/`var` initialized from a
+    /// variadic stdlib call (`listOf`) used to incorrectly fail the
+    /// "cannot infer type" check — `listOf(...)`'s return type (`List`)
+    /// is always known regardless of its argument count, unlike a
+    /// genuinely un-inferable initializer.
+    #[test]
+    fn hint_less_val_from_list_of_infers_list_not_an_error() {
+        let result = resolve_src("val l = listOf(1, 2, 3)\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 

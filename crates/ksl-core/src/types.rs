@@ -162,25 +162,37 @@ impl Type {
 /// (formalizes `check_type`'s old whitelist-plus-fallback as one named
 /// function instead of a duplicated match).
 /// Every primitive type name `resolve_type_hint` recognizes directly (not
-/// generics or classes) — the source of truth for anything outside this
-/// function that needs to list "the built-in type names", e.g. `ksl-lsp`'s
-/// completion when the cursor sits in type-annotation position.
-pub const PRIMITIVE_TYPE_NAMES: &[&str] = &["Int", "Double", "Boolean", "String", "Unit", "List", "Any"];
+/// generics or classes), paired with the `Type` it resolves to — the
+/// single source of truth both `resolve_type_hint` and anything outside
+/// this function that needs to list "the built-in type names" (e.g.
+/// `ksl-lsp`'s completion when the cursor sits in type-annotation
+/// position) derive from, so the two can never drift apart the way a
+/// separate hand-written name-only list once could (it was missing
+/// `"Nothing"`, present here but never added to that list by hand when
+/// `Nothing` was added — see `git log` on this file for the pre-
+/// unification shape, if curious).
+pub const PRIMITIVE_TYPES: &[(&str, Type)] = &[
+    ("Int", Type::Int),
+    ("Double", Type::Double),
+    ("Boolean", Type::Bool),
+    ("String", Type::String),
+    ("Unit", Type::Unit),
+    ("List", Type::List),
+    ("Any", Type::Any),
+    ("Nothing", Type::Nothing),
+];
 
 fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
-    match hint {
-        "Int" => Type::Int,
-        "Double" => Type::Double,
-        "Boolean" => Type::Bool,
-        "String" => Type::String,
-        "Unit" => Type::Unit,
-        "List" => Type::List,
-        "Any" => Type::Any,
-        "Nothing" => Type::Nothing,
-        _ if generic_params.iter().any(|p| p == hint) => Type::Generic(hint.into()),
-        _ if known_classes.contains(hint) => Type::Class(hint.into()),
-        _ => Type::Unknown,
+    if let Some((_, ty)) = PRIMITIVE_TYPES.iter().find(|(name, _)| *name == hint) {
+        return ty.clone();
     }
+    if generic_params.iter().any(|p| p == hint) {
+        return Type::Generic(hint.into());
+    }
+    if known_classes.contains(hint) {
+        return Type::Class(hint.into());
+    }
+    Type::Unknown
 }
 
 /// Resolves a full `TypeAnnotation` tree (a plain name, or a function type
@@ -271,15 +283,19 @@ mod tests {
     }
 
     #[test]
-    fn primitive_type_names_all_resolve_to_a_known_primitive() {
-        // Guards `PRIMITIVE_TYPE_NAMES` against drifting out of sync with
-        // `resolve_type_hint`'s own match arms.
+    fn primitive_types_all_resolve_to_the_type_they_declare() {
+        // `resolve_type_hint` now reads its primitive arms directly from
+        // `PRIMITIVE_TYPES`, so this also structurally guarantees the
+        // reverse direction (every primitive `resolve_type_hint` arm is
+        // listed here) — not just that every listed name resolves to
+        // *some* primitive, which is all the pre-unification version of
+        // this test could check (and which is exactly how `"Nothing"`
+        // went missing from the old name-only list without being caught).
         let empty_params: Vec<String> = Vec::new();
         let empty_classes: HashSet<Rc<str>> = HashSet::new();
-        for name in PRIMITIVE_TYPE_NAMES {
+        for (name, expected_ty) in PRIMITIVE_TYPES {
             let ty = resolve_type_hint(name, &empty_params, &empty_classes);
-            assert_ne!(ty, Type::Unknown, "{name} should resolve to a primitive");
-            assert!(!matches!(ty, Type::Generic(_) | Type::Class(_)), "{name} resolved to {ty:?}");
+            assert_eq!(&ty, expected_ty, "{name} should resolve to {expected_ty:?}");
         }
     }
 
@@ -310,9 +326,44 @@ mod tests {
 
     #[test]
     fn from_value_matches_value_type_name() {
+        // Every `Value` variant whose `Type::from_value` result names
+        // itself the same way `Value::type_name()` does — i.e. every
+        // variant except `Function`/`Native`, covered separately below,
+        // since those two are a deliberate exception, not an oversight.
         assert_eq!(Type::from_value(&Value::Int(1)).name(), Value::Int(1).type_name());
+        assert_eq!(Type::from_value(&Value::Double(1.5)).name(), Value::Double(1.5).type_name());
         assert_eq!(Type::from_value(&Value::Bool(true)).name(), Value::Bool(true).type_name());
         assert_eq!(Type::from_value(&Value::str("x")).name(), Value::str("x").type_name());
+        assert_eq!(Type::from_value(&Value::Unit).name(), Value::Unit.type_name());
+        let list = Value::List(Rc::new(std::cell::RefCell::new(Vec::new())));
+        assert_eq!(Type::from_value(&list).name(), list.type_name());
+    }
+
+    /// `Function`/`Native` are the one deliberate exception to the rule
+    /// `from_value_matches_value_type_name` checks: `Value::type_name()`
+    /// reports the literal word `"Function"` for both, but
+    /// `Type::from_value` gives each a real structural
+    /// `Type::Function(params, ret)`, whose `.name()` renders as a
+    /// signature like `"() -> Unknown"`, not the word `"Function"` — so
+    /// these two are *expected* to disagree, not a gap in the test above.
+    #[test]
+    fn from_value_function_and_native_intentionally_diverge_from_type_name() {
+        let f = Value::Function(Rc::new(crate::value::FunctionValue {
+            name: Some("f".to_string()),
+            params: Vec::new(),
+            return_type: None,
+            body: crate::ast::FunBody::Block(Vec::new()),
+            closure: crate::environment::Env::new(),
+        }));
+        assert_eq!(f.type_name(), "Function");
+        assert_ne!(Type::from_value(&f).name(), f.type_name());
+
+        let native = Value::Native(Rc::new(crate::value::NativeValue {
+            name: "n".to_string(),
+            func: Box::new(|_, _, _| Ok(Value::Unit)),
+        }));
+        assert_eq!(native.type_name(), "Function");
+        assert_ne!(Type::from_value(&native).name(), native.type_name());
     }
 
     #[test]
