@@ -2190,25 +2190,37 @@ impl Resolver {
             ExprKind::Elvis { lhs, rhs } => {
                 let l = self.walk_expr(lhs, scope, following);
                 let r = self.walk_expr(rhs, scope, following);
-                let unwrapped_l = match &l {
-                    Type::Nullable(inner) => (**inner).clone(),
-                    // An always-null lhs carries no real type info of its
-                    // own to join against `r` with.
-                    Type::Null => Type::Unknown,
-                    other => other.clone(),
-                };
-                if unwrapped_l == r {
-                    unwrapped_l
-                } else if unwrapped_l == Type::Unknown || r == Type::Unknown {
-                    Type::Unknown
-                } else if is_primitive(&unwrapped_l) && is_primitive(&r) {
-                    self.type_errors.push(RuntimeError::new(
-                        format!("elvis operands have incompatible types: {} and {}", unwrapped_l.name(), r.name()),
-                        expr.span,
-                    ));
-                    Type::Unknown
+                // `lhs` is the bare literal `null` (always null, not just
+                // possibly-null) — the elvis can never take the lhs
+                // branch, so the whole expression's type is simply
+                // `rhs`'s, with no join needed at all (real Kotlin: `null`
+                // alone is `Nothing?`, and `Nothing?` joined with any `T`
+                // is just `T`). Previously this fell through to the
+                // `unwrapped_l == Type::Unknown` case below regardless of
+                // `r`, so e.g. `null ?: "OK"` inferred `Unknown` instead
+                // of `String` — a real bug (`fun box() = null ?: null ?:
+                // "OK"` couldn't infer a return type at all), not a
+                // deliberate simplification.
+                if l == Type::Null {
+                    r
                 } else {
-                    Type::Unknown
+                    let unwrapped_l = match &l {
+                        Type::Nullable(inner) => (**inner).clone(),
+                        other => other.clone(),
+                    };
+                    if unwrapped_l == r {
+                        unwrapped_l
+                    } else if unwrapped_l == Type::Unknown || r == Type::Unknown {
+                        Type::Unknown
+                    } else if is_primitive(&unwrapped_l) && is_primitive(&r) {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("elvis operands have incompatible types: {} and {}", unwrapped_l.name(), r.name()),
+                            expr.span,
+                        ));
+                        Type::Unknown
+                    } else {
+                        Type::Unknown
+                    }
                 }
             }
         }
@@ -3180,6 +3192,20 @@ mod tests {
         let result = resolve_src("fun f(s: String?): Int = s?.length() ?: -1\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
         assert_eq!(result.table.symbol_at(1, 5).unwrap().return_type, Type::Int);
+    }
+
+    /// Regression test: a bare-literal-`null` lhs used to make the whole
+    /// elvis infer `Unknown` regardless of `rhs`'s real type — since a
+    /// literal `null` lhs can *only* ever take the rhs branch, the correct
+    /// type is simply `rhs`'s, no join needed. This specific chain
+    /// (`fun box() = null ?: null ?: "OK"`) is a vendored Kotlin box test
+    /// (`kotlin-box-pending/elvis/nullNullOk.ksl`) that couldn't infer a
+    /// return type at all before this fix.
+    #[test]
+    fn elvis_with_a_literal_null_lhs_infers_the_rhs_type_not_unknown() {
+        let result = resolve_src("fun box() = null ?: null ?: \"OK\"\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.table.symbol_at(1, 5).unwrap().return_type, Type::String);
     }
 
     #[test]
