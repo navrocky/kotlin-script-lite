@@ -120,10 +120,17 @@ at runtime inside the interpreter itself.
   (`5.uppercase()`) or accessing a field on a real local value (nothing has
   fields until classes exist).
 - Mismatched `if`/`when` branch types where every branch is a primitive
-  (`if (b) 1 else "two"`) — there's no common supertype to join to without
-  a class hierarchy, so this is an error, not a silent `Unknown`. A branch
-  that's a class/generic/unresolvable type still joins leniently for now
-  (deferred until classes exist).
+  **and there's a real, explicit `else`/`else ->`** (`if (b) 1 else
+  "two"`) — there's no common supertype to join to without a class
+  hierarchy, so this is an error, not a silent `Unknown`. A branch that's
+  a class/generic/unresolvable type still joins leniently for now
+  (deferred until classes exist). An **absent** `else` never triggers
+  this, no matter what the present branch's type is — `if (true) 10` (no
+  `else`, e.g. used as a statement with the value discarded, or assigned
+  to a hint-less `val` that then just can't rely on a specific type) is
+  not a mismatch: the implicit Unit is only what the whole expression
+  evaluates to when no branch is taken (see "Control flow" below), not a
+  second real value the present branch is obligated to agree with.
 - A named argument whose type doesn't match its parameter's declared type,
   or that names a parameter the callee doesn't have.
 

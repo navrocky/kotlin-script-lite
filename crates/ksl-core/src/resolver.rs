@@ -1761,8 +1761,15 @@ impl Resolver {
                     // `is_primitive`'s doc comment) — an immediate error,
                     // per the strict-typing decision, rather than the
                     // lenient `Unknown` join every other mismatch still
-                    // gets.
-                    if is_primitive(&then_ty) && is_primitive(&else_ty) {
+                    // gets. Only when there's a *real, explicit* `else`,
+                    // though: with no `else`, `else_ty` above is just the
+                    // implicit-Unit fallback for "the condition was false"
+                    // (matching `eval_expr`'s identical runtime rule), not
+                    // a second real value the then-branch is obligated to
+                    // agree with — `if (true) 10` used as a statement (or
+                    // assigned to a `val`, which then simply can't rely on
+                    // a specific type) is valid Kotlin, not a mismatch.
+                    if else_branch.is_some() && is_primitive(&then_ty) && is_primitive(&else_ty) {
                         self.type_errors.push(RuntimeError::new(
                             format!("branches have incompatible types: {} and {}", then_ty.name(), else_ty.name()),
                             expr.span,
@@ -1815,7 +1822,14 @@ impl Resolver {
                         None => arm_ty,
                         Some(prev) if prev == arm_ty => prev,
                         Some(prev) => {
-                            if is_primitive(&prev) && is_primitive(&arm_ty) {
+                            // Same reasoning as `If`'s identical guard: with
+                            // no explicit `else` arm, `acc`'s seed is just
+                            // the implicit-Unit "no arm matched" fallback
+                            // (see `eval_when`'s matching runtime rule), not
+                            // a second real value every arm must agree
+                            // with — `when { true -> 10 }` used as a
+                            // statement is valid, not a mismatch.
+                            if has_else && is_primitive(&prev) && is_primitive(&arm_ty) {
                                 self.type_errors.push(RuntimeError::new(
                                     format!(
                                         "branches have incompatible types: {} and {}",
@@ -2323,6 +2337,38 @@ mod tests {
         // then-branch is itself Unit (last stmt not a bare expr) -> matches implicit else.
         let result2 = resolve_src("val x = if (true) { val y = 1 }\n");
         assert_eq!(result2.table.symbol_at(1, 5).unwrap().ty, Type::Unit);
+    }
+
+    #[test]
+    fn if_without_else_used_as_a_bare_statement_is_never_a_type_error() {
+        // `if (true) 10` with no `else`, its value unused — the implicit
+        // Unit "else" is a runtime fallback for the untaken path, not a
+        // second real value the then-branch is obligated to match, so
+        // this must not be flagged even though `Int`/`Unit` are both
+        // primitives (the same combination `if_branches_with_mismatched_primitives_is_a_type_error`,
+        // below, confirms *does* still error with an explicit `else`).
+        let result = resolve_src("if (true) 10\nprintln(\"done\")\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn when_without_else_used_as_a_bare_statement_is_never_a_type_error() {
+        let result = resolve_src("when { true -> 10 }\nprintln(\"done\")\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn if_with_an_explicit_mismatched_else_still_errors() {
+        // Regression guard for the fix above: a *real* else must still be
+        // held to the same-type requirement.
+        let result = resolve_src("if (true) 1 else \"two\"\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn when_with_an_explicit_mismatched_else_arm_still_errors() {
+        let result = resolve_src("when { true -> 1\nelse -> \"two\" }\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
     }
 
     #[test]

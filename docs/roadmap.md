@@ -372,6 +372,20 @@ LSP wiring) still holds.
   parameter that doesn't exist (`Symbol` gained `param_names: Vec<String>`
   for this, matched by the same two-pass claim-named-then-positional
   algorithm `call_function` already used at runtime).
+  **Correction (found via a user report after shipping):** the
+  branch-mismatch check above originally fired even with no `else`/
+  `else ->` at all, by comparing the present branch's type against the
+  implicit-Unit fallback substituted for the missing one — so `if (true)
+  10` used as a statement (value discarded) or assigned to a hint-less
+  `val` wrongly errored `branches have incompatible types: Int and Unit`,
+  even though this is valid Kotlin (an else-less `if`/`when`'s implicit
+  Unit is only what the *runtime* falls back to when no branch is taken,
+  never a second real value the present branch must agree with — see
+  `eval_expr`/`eval_when`'s own matching rule, unchanged). Fixed by gating
+  the error on a real, explicit `else` being present (`else_branch.is_some()`
+  for `If`, `has_else` for `When`) — an absent one still joins to
+  `Type::Unknown` on any mismatch, same as before, just without the false
+  positive.
 - **Lambda type inference** (`resolver.rs`'s `walk_lambda`/
   `walk_lambda_params`): a lambda's own type is always a real
   `Type::Function`, never left unresolved. Parameter types come from (in
