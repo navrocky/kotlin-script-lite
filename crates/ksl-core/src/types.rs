@@ -58,6 +58,19 @@ pub enum Type {
     /// `T?` — any other type, wrapped as nullable. Composes with every
     /// existing variant including `Function`/`Class`/`Generic`.
     Nullable(Box<Type>),
+    /// Kotlin's real top type — supertype of everything. Unlike `Unknown`,
+    /// this is a sound, one-directional relationship: anything is
+    /// assignable *into* `Any`, but an `Any`-typed value isn't assignable
+    /// back to a concrete type without an explicit cast (which the
+    /// language doesn't have yet). See `is_assignable`.
+    Any,
+    /// Kotlin's real bottom type — subtype of everything, the type of
+    /// `throw`/a call that never returns normally. Has no values: nothing
+    /// in `Type::from_value` ever produces it. Assignable to anything,
+    /// including `Nullable(T)`. Also the identity element for `if`/`when`
+    /// branch-type joins (`LUB(Nothing, T) = T`) — see `resolver.rs`'s
+    /// `ExprKind::If`/`When` handling.
+    Nothing,
     /// Statically unknowable → always compatible. See the module doc
     /// comment.
     Unknown,
@@ -83,6 +96,8 @@ impl Type {
             Type::Class(name) | Type::Generic(name) => name.to_string(),
             Type::Null => "Null".to_string(),
             Type::Nullable(inner) => format!("{}?", inner.name()),
+            Type::Any => "Any".to_string(),
+            Type::Nothing => "Nothing".to_string(),
             Type::Unknown => "Unknown".to_string(),
         }
     }
@@ -150,7 +165,7 @@ impl Type {
 /// generics or classes) — the source of truth for anything outside this
 /// function that needs to list "the built-in type names", e.g. `ksl-lsp`'s
 /// completion when the cursor sits in type-annotation position.
-pub const PRIMITIVE_TYPE_NAMES: &[&str] = &["Int", "Double", "Boolean", "String", "Unit", "List"];
+pub const PRIMITIVE_TYPE_NAMES: &[&str] = &["Int", "Double", "Boolean", "String", "Unit", "List", "Any"];
 
 fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
     match hint {
@@ -160,6 +175,8 @@ fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &Hash
         "String" => Type::String,
         "Unit" => Type::Unit,
         "List" => Type::List,
+        "Any" => Type::Any,
+        "Nothing" => Type::Nothing,
         _ if generic_params.iter().any(|p| p == hint) => Type::Generic(hint.into()),
         _ if known_classes.contains(hint) => Type::Class(hint.into()),
         _ => Type::Unknown,
@@ -194,9 +211,14 @@ pub fn resolve_type_annotation(
 }
 
 /// Whether a value of type `from` can be used where `to` is expected.
-/// `Unknown` or `Generic` on **either** side is always compatible (the
-/// named escape hatch — see the module doc comment); `Class` compares by
-/// exact name only (no subtyping yet); `Function` compares structurally,
+/// `Nothing` on the `from` side is always compatible (it has no values, so
+/// there's nothing that could fail); `Unknown` or `Generic` on **either**
+/// side is always compatible (the named escape hatch — see the module doc
+/// comment); anything is assignable **into** `Any` on the `to` side, but
+/// (unlike `Unknown`) not the other way around — an `Any`-typed value isn't
+/// assignable back to a concrete type without an explicit cast; `Class`
+/// compares by exact name only (no subtyping yet); `Function` compares
+/// structurally,
 /// element-wise (no variance — matching the approved plan's "exact
 /// equality in v1"), except for the `Value::Native` sentinel shape (empty
 /// params, `Unknown` return — see `Type::from_value`), which has nothing
@@ -207,8 +229,10 @@ pub fn resolve_type_annotation(
 /// 5` is already a type-mismatch error today).
 pub fn is_assignable(from: &Type, to: &Type) -> bool {
     match (from, to) {
+        (Type::Nothing, _) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Generic(_), _) | (_, Type::Generic(_)) => true,
+        (_, Type::Any) => true,
         (Type::Null, Type::Nullable(_)) => true,
         (Type::Nullable(a), Type::Nullable(b)) => is_assignable(a, b),
         (a, Type::Nullable(b)) => is_assignable(a, b),
@@ -334,6 +358,46 @@ mod tests {
         assert!(is_assignable(&Type::Unknown, &Type::Int));
         assert!(is_assignable(&Type::Int, &Type::Unknown));
         assert!(is_assignable(&Type::Unknown, &Type::Unknown));
+    }
+
+    #[test]
+    fn resolve_type_hint_any_and_nothing() {
+        let empty_params: Vec<String> = Vec::new();
+        let empty_classes: HashSet<Rc<str>> = HashSet::new();
+        assert_eq!(resolve_type_hint("Any", &empty_params, &empty_classes), Type::Any);
+        assert_eq!(resolve_type_hint("Nothing", &empty_params, &empty_classes), Type::Nothing);
+    }
+
+    #[test]
+    fn any_and_nothing_type_names() {
+        assert_eq!(Type::Any.name(), "Any");
+        assert_eq!(Type::Nothing.name(), "Nothing");
+    }
+
+    #[test]
+    fn is_assignable_anything_widens_to_any() {
+        assert!(is_assignable(&Type::Int, &Type::Any));
+        assert!(is_assignable(&Type::String, &Type::Any));
+        assert!(is_assignable(&Type::Null, &Type::Any));
+        assert!(is_assignable(&Type::Class("Dog".into()), &Type::Any));
+    }
+
+    #[test]
+    fn is_assignable_any_does_not_narrow_back() {
+        // Distinguishes `Any` (a sound, one-directional top type) from
+        // `Unknown` (bidirectionally permissive) — an `Any`-typed value
+        // can't flow back into a concrete type without an explicit cast.
+        assert!(!is_assignable(&Type::Any, &Type::Int));
+        assert!(!is_assignable(&Type::Any, &Type::String));
+    }
+
+    #[test]
+    fn is_assignable_nothing_is_assignable_to_anything() {
+        assert!(is_assignable(&Type::Nothing, &Type::Int));
+        assert!(is_assignable(&Type::Nothing, &Type::String));
+        assert!(is_assignable(&Type::Nothing, &Type::Any));
+        assert!(is_assignable(&Type::Nothing, &Type::Nullable(Box::new(Type::Int))));
+        assert!(is_assignable(&Type::Nothing, &Type::Nothing));
     }
 
     #[test]

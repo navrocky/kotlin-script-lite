@@ -130,7 +130,11 @@ at runtime inside the interpreter itself.
   to a hint-less `val` that then just can't rely on a specific type) is
   not a mismatch: the implicit Unit is only what the whole expression
   evaluates to when no branch is taken (see "Control flow" below), not a
-  second real value the present branch is obligated to agree with.
+  second real value the present branch is obligated to agree with. This
+  hard error is a placeholder for real least-upper-bound inference (e.g.
+  `if (b) 1 else "two"` inferring `Comparable<*>`, matching real Kotlin)
+  — planned once interfaces and statically-parameterized generics exist,
+  see `docs/roadmap.md`'s Phase 6.5/9.
 - A named argument whose type doesn't match its parameter's declared type,
   or that names a parameter the callee doesn't have.
 
@@ -172,12 +176,21 @@ mismatch: expected Int, got String`; an unrecognized annotation looks like
 
 **Type annotation syntax**: a plain name — one of the 6 recognized
 primitives, `Int`, `Double`, `Boolean`, `String`, `Unit`, `List` (no
-class/generic types exist yet, see "Not supported" below) — or a
-function type, `(ParamType, ...) -> ReturnType`, e.g. `(Int, String) ->
-Boolean` or `() -> Unit`. Function types nest (`((Int) -> Int) -> String`)
-and are compared structurally: same parameter count, each parameter and
-the return type individually compatible — no named function-type
-declaration to match by identity.
+class/generic types exist yet, see "Not supported" below), plus Kotlin's
+real top and bottom types, `Any` (supertype of everything — anything is
+assignable *into* `Any`, but not back out to a concrete type without an
+explicit cast, which ksl doesn't have yet) and `Nothing` (subtype of
+everything — assignable to anything, including a nullable type; the type
+of `throw`/a call that never returns normally, once `docs/roadmap.md`'s
+Phase 5 lands `throw`) — or a function type, `(ParamType, ...) ->
+ReturnType`, e.g. `(Int, String) -> Boolean` or `() -> Unit`. Function
+types nest (`((Int) -> Int) -> String`) and are compared structurally:
+same parameter count, each parameter and the return type individually
+compatible — no named function-type declaration to match by identity.
+`Nothing` is also the identity element for `if`/`when` branch-type joins
+(`LUB(Nothing, T) = T`) — a never-returning branch (e.g. `throw`, once
+Phase 5 lands) never causes a "branches have incompatible types" error,
+the whole expression just takes the other branch's type.
 
 Any of the above — a primitive, or a function type — may be suffixed with
 `?` to make it nullable, e.g. `String?`, `(Int) -> String?` (nullable

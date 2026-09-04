@@ -473,7 +473,11 @@ fn is_numeric(t: &Type) -> bool {
 /// `Function` are excluded: computing a real common supertype needs a class
 /// hierarchy that doesn't exist yet (deferred to a later phase, see the
 /// approved plan's central-principle section), so those keep the existing
-/// lenient join-to-`Unknown` behavior for now.
+/// lenient join-to-`Unknown` behavior for now. `Any`/`Nothing` are excluded
+/// too — `Nothing` always joins cleanly (see the `If`/`When` handling
+/// below, checked before this function is even consulted) and `Any` isn't
+/// a "concrete primitive" that can genuinely disagree with another one, the
+/// same reasoning that already excludes `Class`/`Generic`/`Unknown`.
 fn is_primitive(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Double | Type::Bool | Type::String | Type::Unit | Type::List)
 }
@@ -1753,7 +1757,19 @@ impl Resolver {
                 if then_branch.last().map(always_exits).unwrap_or(false) {
                     self.narrowed.extend(neg);
                 }
-                if then_ty == else_ty {
+                if then_ty == Type::Nothing {
+                    // `Nothing` is the identity element of least-upper-bound
+                    // (`LUB(Nothing, T) = T`) — a branch that never returns
+                    // normally (e.g. `throw`, once Phase 5 lands) carries no
+                    // real type info of its own to join against the other
+                    // branch with, so the whole `if` just takes the other
+                    // branch's type. Checked before the equality/mismatch
+                    // logic below so it applies unconditionally, even when
+                    // the other branch is itself a primitive.
+                    else_ty
+                } else if else_ty == Type::Nothing {
+                    then_ty
+                } else if then_ty == else_ty {
                     then_ty
                 } else {
                     // Two different primitives have no common supertype to
@@ -1820,6 +1836,12 @@ impl Resolver {
                     self.narrowed = ambient;
                     acc = Some(match acc {
                         None => arm_ty,
+                        // Same `Nothing`-is-the-join-identity rule as `If`
+                        // above: a never-returning arm carries no real type
+                        // of its own, so the accumulated join just becomes
+                        // whichever side isn't `Nothing`.
+                        Some(prev) if prev == Type::Nothing => arm_ty,
+                        Some(prev) if arm_ty == Type::Nothing => prev,
                         Some(prev) if prev == arm_ty => prev,
                         Some(prev) => {
                             // Same reasoning as `If`'s identical guard: with
@@ -2434,6 +2456,24 @@ mod tests {
     #[test]
     fn if_branches_with_matching_primitives_is_not_a_type_error() {
         let result = resolve_src("val x = if (true) 1 else 2\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn any_type_annotation_resolves_and_accepts_any_value() {
+        let result = resolve_src("val x: Any = 1\nval y: Any = \"hi\"\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn any_typed_value_is_not_assignable_back_to_a_concrete_type() {
+        let result = resolve_src("val x: Any = 1\nval y: Int = x\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn nothing_type_annotation_resolves() {
+        let result = resolve_src("fun f(x: Nothing) { }\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 

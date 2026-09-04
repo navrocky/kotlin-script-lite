@@ -20,9 +20,9 @@ Decisions already made that shape this plan:
   `var` reassignment were never type-checked at all, and there was no
   structured type for the resolver or `ksl-lsp` to reason about. See Phase
   2 below; every later phase in this document was written (or rewritten)
-  assuming it exists, in particular Phases 4 (null-safety), 6 (classes), 7
-  (inheritance), and 9 (generics), which each have a note on exactly how
-  they build on it.
+  assuming it exists, in particular Phases 4 (null-safety), 4.5
+  (`Any`/`Nothing`), 6 (classes), 6.5 (interfaces), 7 (inheritance), and 9
+  (generics), which each have a note on exactly how they build on it.
 - **Coroutines are scoped down** to cooperative `sequence {}`/`yield()`
   generators only — no `launch`/`async`/`Deferred`/dispatchers. Real
   async/await-style concurrency conflicts with the interpreter's
@@ -48,6 +48,23 @@ Decisions already made that shape this plan:
   a result (it now needs classes/generics/properties/`operator fun`
   support, none of which existed when it was originally sequenced right
   after Phase 2).
+- **`Any`/`Nothing` (Kotlin's real top/bottom types) are added as their
+  own Phase 4.5**, ahead of everything except the already-shipped type
+  system (Phase 2) and null-safety (Phase 4) — motivated concretely by
+  `throw`'s own type (Phase 5's text already says "matches real Kotlin
+  where `throw` has type `Nothing`" but never actually wired that up) and
+  by Phase 6.5's least-upper-bound branch inference (below), which needs
+  `Any` as its fallback when two branches share no common interface. See
+  Phase 4.5's own section.
+- **Phase 9 (generics)'s original "parsed, fully erased" scope was
+  revised** after the concrete `Comparable<*>`-for-`if`/`when`-branches
+  example (below, Phase 6.5) surfaced a real need for statically-retained
+  generic parameterization — `Box<Int>`/`Box<String>` need to stay
+  distinguishable *types* to the resolver, not collapse to the same
+  erased placeholder. Erasure survives, but moves to mean only "the
+  *runtime* doesn't specialize on a type argument" (exactly Kotlin/JVM's
+  own erasure, not an ksl-specific simplification) rather than "the type
+  system doesn't track one at all." See Phase 9's own section.
 - **Tech-debt Phase 0 includes** the `NativeFn` span fix and the
   `break`/`continue` function-boundary fix (both parser/interpreter-only,
   low-risk). The `Double` formatting mismatch (`2.0` prints as `2`) is
@@ -74,19 +91,26 @@ Phase 2: static & runtime type system  <-- needs Phase 1 (type-aware completion 
 Phase 4: null-safety (Value::Null, ?, ?., ?:, !!)   [DONE]
    |
    v
-Phase 5: try/catch (Flow::Throw, minimal Value::Error)
+Phase 4.5: Any & Nothing (top/bottom types) [DONE]  <-- needs only Phase 2 (types.rs); no classes/interfaces required
+   |
+   v
+Phase 5: try/catch (Flow::Throw, minimal Value::Error)  <-- Throw's type is Phase 4.5's Type::Nothing
    |
    v
 Phase 6: classes/objects  <-- needs Phase 1 (+ Phase 2 reserves Type::Class for it)
    |
    v
-Phase 7: inheritance  <-- needs Phase 6 (+ extends Phase 2's is_assignable for subtyping)
+Phase 6.5: interfaces  <-- needs Phase 6 (classes to implement them, class.rs to extend)
    |
+   v
+Phase 7: inheritance  <-- needs Phase 6 (+ extends Phase 2's is_assignable for subtyping,
+   |    now also covering Phase 6.5's interface-conformance subtyping)
    v
 Phase 8: extension functions  <-- needs Phase 1 (+ benefits from Phase 6's call_method path)
    |
    v
-Phase 9: generics (parsed, fully erased — Phase 2 reserves Type::Generic for it)
+Phase 9: generics (statically parameterized, runtime-erased — revised, see
+   Phase 9's own section; Phase 2 reserves Type::Generic for it)
    |
    v
 Phase 3 (renumbered, was pre-Phase-4): collection indexing (a[i], a[i]=v)
@@ -604,14 +628,92 @@ doesn't leak past a non-exiting `if`). New `tests/examples/null_safety.ksl`.
 
 ---
 
+## Phase 4.5 — `Any` and `Nothing` (top and bottom types) [DONE]
+
+Needs only Phase 2 (`types.rs`) — no classes, no interfaces, nothing else
+below this line. Added early, deliberately ahead of `try`/`catch` and
+classes, because both need it: `throw` (Phase 5) is only correctly typed
+once `Nothing` exists, and least-upper-bound branch inference (Phase 6.5)
+needs `Any` as its fallback supertype. Real Kotlin has no type literally
+named `Unknown` — this phase is specifically about `Any`/`Nothing`, kept
+distinct from ksl's own, unrelated `Type::Unknown` (an internal "couldn't
+statically determine a type" escape hatch, not a real declarable type;
+see below for exactly how they differ).
+
+- **`Type::Any`** — new leaf in `types.rs`'s `Type`, alongside `Unknown`/
+  `Null` (not part of `is_primitive()`'s set — like `Unknown`/`Generic`/
+  `Class`, not a "concrete primitive" that can genuinely disagree with
+  another one). `resolve_type_hint`/`PRIMITIVE_TYPE_NAMES` gain `"Any"`.
+  **The key difference from `Type::Unknown`**: `is_assignable` for `Any`
+  is a **one-directional** rule, `(_, Type::Any) => true` (anything is
+  assignable *into* `Any`) — deliberately **not** `(Type::Any, _) =>
+  true` (an `Any`-typed value is *not* assignable back to a concrete type
+  without an explicit cast, which the language doesn't have yet, so `val
+  x: Int = someAnyTypedVal` stays a type error, correctly). This is the
+  opposite of `Unknown`'s bidirectional leniency ("can't tell, so don't
+  block either direction") — `Any` isn't an escape hatch, it's a real,
+  sound top type, exactly like Kotlin's.
+- **`Type::Nothing`** — new leaf alongside. `resolve_type_hint` gains
+  `"Nothing"`. `is_assignable`: `(Type::Nothing, _) => true`,
+  unconditionally — `Nothing` is assignable to anything, including a
+  `Nullable(T)` (already covered by the same general rule, no special
+  nullable case needed) — placed near the existing `Unknown`/`Generic`
+  rules at the top of the match.
+- **New join rule for `if`/`when` branches** (`resolver.rs`'s
+  `ExprKind::If`/`When`, the same code the recent "else-less is never a
+  mismatch" fix touched): when either branch's type is `Type::Nothing`,
+  the whole join's result is simply the *other* branch's type, no further
+  comparison — `Nothing` is the identity element of least-upper-bound
+  (`LUB(Nothing, T) = T`, always, in any type lattice). This is what
+  makes `if (cond) 5 else throw Foo()` type-check as `Int`, not an error
+  or `Unknown` — the concrete motivating case for `Nothing`, and exactly
+  what Phase 5's own text below already promises ("`throw` has type
+  `Nothing`") without yet having anything to back it up.
+- **No runtime changes at all** — `Nothing` has no values (`throw` never
+  returns control flow normally, only via `Flow::Throw`), so
+  `Type::from_value` never produces it; `Any` doesn't need a
+  `Type::from_value` arm either (that function already returns the most
+  specific type a value has — `Any` only ever appears on the annotation
+  side, never as an inferred result).
+- **Optional future cleanup, not required now**: once `Nothing` exists,
+  the already-shipped (Phase 4) `Type::Null` could in principle be
+  redefined as `Type::Nullable(Box::new(Type::Nothing))` — exactly
+  matching real Kotlin, where `null : Nothing?`, instead of keeping its
+  own separate `Null` leaf. Not blocking anything and not required —
+  `Type::Null` already works correctly for what it does today; this is a
+  purely cosmetic/theoretical convergence with Kotlin, left to whoever
+  eventually touches this code.
+
+**Docs/tests:** `docs/syntax.md`'s "Types" section gains `Any`/`Nothing`
+in the recognized-type-names list. Tests in `types.rs` for the
+`is_assignable` rules above (including `Any`'s one-directionality,
+explicitly distinguishing it from `Unknown`'s two-directionality); once
+Phase 5 lands `Throw`, an end-to-end test that `if (cond) 5 else throw
+Foo()` type-checks as `Int` with no errors.
+
+---
+
 ## Phase 5 — `try`/`catch`
+
+Requires Phase 4.5 (`Type::Nothing` is `throw`'s real static type — see
+below; without it this phase would have nowhere correct to put that type
+and would either fall back to `Unknown` or reintroduce the exact
+branch-mismatch false-positive the `if`/`when` fix and Phase 4.5 both
+already address).
 
 **`Flow::Throw(Value)`** — new variant on `Flow` (`error.rs:90-95`),
 exactly the extension point AGENTS.md calls for. `throw expr` is an
 **expression** (`ExprKind::Throw(Box<Expr>)`, not a statement), matching
 real Kotlin where `throw` has type `Nothing` and is usable in expression
 position (`if (cond) 1 else throw Foo()`) — consistent with ksl already
-treating `if`/`when`/blocks as expressions.
+treating `if`/`when`/blocks as expressions. **Concretely**: `resolver.rs`'s
+new `ExprKind::Throw(inner)` arm walks `inner` (for diagnostics) and
+unconditionally returns `Type::Nothing` (Phase 4.5) — this, combined with
+Phase 4.5's new `If`/`When` join rule ("either branch `Nothing` → use the
+other branch's type"), is what makes `if (cond) 1 else throw Foo()`
+type-check as `Int` cleanly. `ExprKind::Try`'s own join (the `try` body's
+value vs. each `catch`'s, when used as an expression) reuses the same
+Nothing-is-the-join-identity rule.
 
 **`try { } catch (e: T) { } finally { }`** as `ExprKind::Try { body,
 catches: Vec<CatchClause>, finally }`, usable as an expression like
@@ -720,9 +822,81 @@ New `tests/examples/classes.ksl`.
 
 ---
 
+## Phase 6.5 — Interfaces
+
+Requires Phase 6 (needs a class to implement one; extends `class.rs`).
+Not part of the original 9-feature backlog — added to make real
+least-upper-bound (LUB) branch inference possible (see below), the
+concrete motivating example being real Kotlin's own `val v = if (true) 10
+else "hello"`, which infers `v: Comparable<*>` rather than erroring or
+losing precision, because `Int` and `String` both implement
+`Comparable<T>`. Today's roadmap has nothing like this at all — Phase 6
+(classes) and Phase 7 (inheritance) only ever cover a single `superclass`,
+never multiple-interface implementation.
+
+- **Grammar**: `interface Comparable<T> { fun compareTo(other: T): Int }`
+  — new `interface` keyword; a method inside is either a bare signature
+  (abstract, no body) or has a body (a default implementation, same as
+  Kotlin). `class`'s supertype list after `:` (already reserved by Phase
+  7) generalizes to **one optional superclass with constructor-call
+  syntax, plus any number of comma-separated interfaces**, e.g. `class
+  Dog : Animal(name), Comparable<Dog> { override fun compareTo(...) =
+  ... }`.
+- **Runtime**: new `InterfaceValue { name: Rc<str>, methods:
+  HashMap<String, Option<Rc<FunctionValue>>> }` in `class.rs` (already
+  planned by Phase 6); `ClassValue` gains `interfaces:
+  Vec<Rc<InterfaceValue>>`. Method dispatch (class → superclass chain,
+  already Phase 6/7) gains a third step — an implemented interface's
+  default methods.
+- **Interface conformance is accepted syntactically but not fully
+  enforced** in this first cut — the same already-established pattern
+  this document uses for `open`/`override` in Phase 7 ("accepted but not
+  enforced"): a class not implementing one of an interface's abstract
+  methods isn't caught by the resolver yet; that's separate, explicitly
+  deferred work.
+- **Built-in primitives formally implement standard interfaces** — the
+  new piece that specifically exists to make LUB/`Comparable<*>` work:
+  `Int`/`Double`/`String`/`Boolean` are registered as implementing
+  `Comparable<Self>` (a deliberately minimal starting set — exactly what
+  the motivating example needs; other stdlib interfaces like
+  `Iterable<T>` can be added to the registry later with no redesign). The
+  registry is a new table (e.g. `stdlib.rs`'s `builtin_implements: &[(&str,
+  &str)]`, mirrored into the resolver's own `known_interfaces` the same
+  way `Resolver::known_classes` already works).
+- **Type-system integration — real LUB for `if`/`when`**: the exact code
+  the recent "else-less `if`/`when` is never a mismatch" fix touched
+  (`resolver.rs`'s `ExprKind::If`/`When`, the `is_primitive`-gated
+  "branches have incompatible types" error). Instead of an immediate
+  error/`Unknown` on a primitive mismatch: intersect the set of
+  interfaces each branch's type implements (directly, or via Phase 7's
+  superclass chain) — a non-empty intersection's result is a real type
+  representing the shared interface (star-projected in the type-argument
+  slot when the branches' own arguments differ — see Phase 9's revision,
+  below, for how that's represented); an empty intersection falls back to
+  `Type::Any` (Phase 4.5 — already exists by this point, nothing new to
+  add, already assignable-target-for-everything). `is_assignable` gains
+  the mirror rule: type `X` is assignable to interface `I` when `X`
+  implements `I` (directly or via inheritance).
+
+**LSP:** `resolver.rs` gets an interface table alongside Phase 6's own
+class table; `completion.rs`/`hover.rs` surface interface methods
+alongside class methods; `semantic_tokens.rs` classifies `interface` as a
+keyword.
+
+**Docs/tests:** "Interfaces" section in `docs/syntax.md`. Tests: multiple
+interface implementation, default methods, class-vs-interface dispatch
+precedence, and — the actual payoff — an end-to-end test that `val v =
+if (true) 10 else "hello"` type-checks as `Comparable<*>` with no error.
+
+---
+
 ## Phase 7 — Inheritance
 
 Requires Phase 6 (`superclass` field already reserved on `ClassValue`).
+Doesn't strictly require Phase 6.5 (interfaces) to land first, but the
+`is_assignable` subtyping work below ends up shared: once both exist,
+subtyping covers the `superclass` chain *and* interface conformance
+through the same lookup.
 
 - `class Dog : Animal(name) { override fun speak() { } }` — new `:` class
   header syntax (reuses existing `Colon` token), superclass name +
@@ -791,44 +965,87 @@ confirming real-method-over-extension precedence.
 
 ---
 
-## Phase 9 — Generics (parsed, fully erased)
+## Phase 9 — Generics (statically parameterized, runtime-erased)
 
 Requires Phase 6 (class headers are the primary place `<T>` appears).
-Erasure here is a **deliberate, sound design choice**, not an accident of
-there being no type system to hook into (Phase 2 added one) — `<T>` is
-parsed and stored (for hover text) but never checked or specialized.
 
-- **Grammar-ambiguity constraint**: `<`/`>` are already `Lt`/`Gt`
-  comparison tokens — `Box<T>` vs. `a < b` is ambiguous in a
+**Revised** from this phase's original "parsed, fully erased" scope (kept
+below, in the "Grammar-ambiguity constraint"/`type_params` bullets, as
+still-valid groundwork) after Phase 6.5's motivating example
+(`Comparable<*>` as the join of `Int`/`String`) showed that erasing
+parameterization *statically* throws away exactly the information LUB
+inference needs — the resolver must actually know that `Int` implements
+`Comparable<Int>` specifically (not just "implements `Comparable` of
+something") to compute that both sides converge on `Comparable<*>`. The
+fix keeps erasure exactly where it was always legitimate — **erasure is
+now a property of the runtime, not the type system** — matching how real
+Kotlin/JVM generics actually work: `List<Int>` and `List<String>` are
+statically distinct, fully checked types to the compiler, and only
+collapse to the same erased runtime class at the bytecode level. This was
+never an ksl-specific simplification to begin with; it's just where the
+original text drew the line one layer too high.
+
+- **Static parameterization is retained, not erased.** `Type::Class`/a
+  new `Type::Interface` (Phase 6.5) carry a real type-argument list
+  (`Vec<Type>`), not just a bare name — `Box<Int>` and `Box<String>` are
+  distinct, distinguishable static types, and `is_assignable` compares
+  their argument lists element-wise (invariantly, in this first pass —
+  real variance for generic parameters/joins is an open question, left
+  for whoever implements this to resolve against the actual code by
+  then, not decided speculatively here). This also needs a way to
+  represent Kotlin's star projection (`Comparable<*>` — "argument
+  intentionally unconstrained," not "argument `Unknown` because
+  something went wrong") — a dedicated marker, or a reserved slot value
+  in that `Vec<Type>`; exact Rust-level shape left to implementation
+  time.
+- **Runtime erasure is unchanged** — `interpreter.rs` still never
+  specializes on a type argument, preserving the original "zero
+  interpreter changes needed" property, just now correctly scoped to
+  mean "the interpreter," not "the whole type system."
+- **Call-site type arguments in expression position remain unsupported,
+  unchanged** — `identity<Int>(5)` still isn't parsed, for the same real
+  reason as before: `<`/`>` collide with `Lt`/`Gt` in expression position
+  or a backtracking-free recursive-descent parser. This doesn't conflict
+  with retaining parameterization above: `Box<Int>` in **type-annotation**
+  position (`val b: Box<Int>`, `val c: Comparable<Int>`) is already
+  grammatically unambiguous today, for the same reason function types
+  `(A, B) -> C` already parse fine there — that's the position this
+  revision actually needs to parse and keep, not expression position.
+
+- **Grammar-ambiguity constraint** (unchanged): `<`/`>` are already
+  `Lt`/`Gt` comparison tokens — `Box<T>` vs. `a < b` is ambiguous in a
   backtracking-free recursive-descent parser. Resolve by **restricting
-  `<...>` type-parameter parsing to declaration headers only**
-  (immediately after `class Name` or `fun`, before the parameter list),
-  never in general expression position. **Do not support call-site type
-  arguments** (`identity<Int>(5)`) — they'd reintroduce the ambiguity in
-  expression position for zero runtime benefit, since there's nothing to
-  specialize against anyway.
+  `<...>` type-parameter parsing to declaration headers and type-annotation
+  position** (immediately after `class Name`/`fun` before the parameter
+  list, or wherever a type annotation is already being parsed — see the
+  revision above), never in general expression position.
 - `ClassDecl`/`FunDecl` gain an optional `type_params: Vec<String>` (names
-  + spans, for hover only). Push this list onto `Resolver::generic_params`
-  (Phase 2, always empty until now) while walking the declaration's body,
-  so a type-hint like `x: T` resolves to `types::Type::Generic("T")` —
-  reserved back in Phase 2 for exactly this — instead of an accidental
-  `Unknown`. `Generic` behaves identically to `Unknown` in `is_assignable`,
-  so **zero interpreter changes are needed** — a useful confirmation that
-  erased generics fit the type system's existing rules; only `resolver.rs`
-  needs the `type_params` plumbing.
+  + spans). Push this list onto `Resolver::generic_params` (Phase 2,
+  always empty until now) while walking the declaration's body, so a
+  type-hint like `x: T` resolves to `types::Type::Generic("T")` —
+  reserved back in Phase 2 for exactly this, and still distinct from a
+  *parameterized* `Type::Class`/`Type::Interface` above (`Generic("T")` is
+  an unbound type-parameter reference inside a generic declaration's own
+  body; the parameterized-class shape is a real, instantiated argument
+  list at a use site) — instead of an accidental `Unknown`. `Generic`
+  still behaves like `Unknown` in `is_assignable` (erasure inside a
+  generic body itself is unaffected by this revision — there's genuinely
+  nothing more specific to check there without real specialization).
 
 **LSP:** `resolver.rs`/`hover.rs` show the declared `type_params` names in
-hover text for `class`/`fun` declarations (documentation value only, no
-type-checking implied — hover for a `Type::Generic("T")`-typed symbol
-should read as "T", not "Unknown"); `semantic_tokens.rs` classifies
+hover text for `class`/`fun` declarations, and now also show real
+parameterized types correctly (`Box<Int>`, not just `Box`) wherever hover
+already shows a `Type::name()`; `semantic_tokens.rs` classifies
 type-parameter names distinctly from ordinary identifiers so they read as
 generic placeholders in the editor.
 
-**Docs/tests:** `docs/syntax.md` must be explicit that this is purely
-syntactic — no checking, no specialization. Tests: `class Box<T>(val
-value: T)` works with any value type; `fun <T> identity(x: T): T = x`
-works interchangeably; regression test that `a < b` in ordinary expression
-position is unaffected.
+**Docs/tests:** `docs/syntax.md` must be explicit about the revised split
+— statically checked parameterization, runtime erasure, no call-site type
+arguments. Tests: `class Box<T>(val value: T)` works with any value type;
+`fun <T> identity(x: T): T = x` works interchangeably; regression test
+that `a < b` in ordinary expression position is unaffected; `Box<Int>` and
+`Box<String>` are rejected as mismatched when one is used where the other
+is declared; the Phase 6.5 end-to-end `Comparable<*>` test.
 
 ---
 
@@ -898,7 +1115,7 @@ better, capturing) the `.out` fixture.
 - `crates/ksl-core/src/parser.rs`, `ast.rs`, `interpreter.rs`, `value.rs`,
   `error.rs`, `stdlib.rs`, `resolver.rs` — core language work.
 - `crates/ksl-core/src/types.rs` — the static/runtime type system (Phase 2).
-- `crates/ksl-core/src/class.rs` — new module for Phase 6/7.
+- `crates/ksl-core/src/class.rs` — new module for Phase 6/6.5/7.
 - `crates/ksl-lsp/src/*.rs` — LSP-side updates, per phase, in lockstep.
 - `docs/syntax.md`, `docs/stdlib.md` — spec updates per phase.
 - `AGENTS.md` — update "Explicitly out of scope" as each item lands.
