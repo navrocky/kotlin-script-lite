@@ -1,0 +1,57 @@
+// Newlines between a control-flow header's ')' and its body/branch, and
+// inside condition/call parens, are never statement separators.
+
+val x = true
+if (x)
+    println("brace-less body on the next line")
+
+if (x)
+{
+    println("brace on its own line")
+}
+else
+{
+    println("not reached")
+}
+
+var i = 0
+while (i < 3)
+{
+    println("while: $i")
+    i = i + 1
+}
+
+for (n in 1..3)
+{
+    println("for: $n")
+}
+
+val label = when (x)
+{
+    true -> "yes"
+    else -> "no"
+}
+println(label)
+
+fun square(n: Int): Int
+    = n * n
+println(square(5))
+
+fun cube(n: Int): Int
+{
+    return n * n * n
+}
+println(cube(3))
+
+// Newline before the closing ')' of a condition or a call's argument list.
+if (
+    x
+) {
+    println("condition spread across lines")
+}
+
+println(
+    square(
+        4
+    )
+)

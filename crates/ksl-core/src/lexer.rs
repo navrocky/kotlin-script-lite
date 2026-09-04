@@ -20,6 +20,21 @@ pub struct Lexer<'a> {
     line: u32,
     col: u32,
     mode_stack: Vec<LexMode>,
+    /// Stack of every currently-open `(`/`[`/`{` (the literal char),
+    /// pushed/popped in `lex_operator_or_punct` alongside their matching
+    /// closer — independent of `mode_stack`/`LexMode::TemplateExpr`'s own
+    /// `brace_depth` (which exists only to find a `${...}` interpolation's
+    /// own closing `}`). Consulted by the `Some('\n')` arm of
+    /// `lex_normal_token`: a newline while the top is `(` or `[` is always
+    /// insignificant (pure grouping — a call's argument list, a condition's
+    /// parens, ...), never a statement separator, regardless of the
+    /// previous token; a newline while the top is `{` (or the stack is
+    /// empty) falls back to the existing `can_end_statement`-based rule,
+    /// since `{` always starts a fresh statement list (a block/lambda body)
+    /// where newlines matter again, even when that block sits inside an
+    /// enclosing `(...)` (e.g. a multi-statement lambda passed as a call
+    /// argument).
+    bracket_stack: Vec<char>,
     tokens: Vec<Token>,
     /// Raw text of every `/** ... */` doc comment found in `LexMode::Normal`
     /// (never inside a `${ ... }` interpolation), keyed by the source line
@@ -41,6 +56,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             col: 1,
             mode_stack: vec![LexMode::Normal],
+            bracket_stack: Vec::new(),
             tokens: Vec::new(),
             doc_comments: HashMap::new(),
             _source: source,
@@ -153,7 +169,12 @@ impl<'a> Lexer<'a> {
                     self.advance();
                 }
                 Some('\n') => {
-                    let emit = self.prev_can_end_statement();
+                    // Inside an open `(`/`[` (pure grouping — call args, a
+                    // condition's parens, ...), a newline is never
+                    // significant, regardless of the previous token — see
+                    // `bracket_stack`'s doc comment.
+                    let inside_grouping = matches!(self.bracket_stack.last(), Some('(') | Some('['));
+                    let emit = !inside_grouping && self.prev_can_end_statement();
                     let span = self.span();
                     self.advance();
                     if emit {
@@ -338,12 +359,24 @@ impl<'a> Lexer<'a> {
     fn lex_operator_or_punct(&mut self, start: Span) -> Result<(), ParseError> {
         let c = self.advance().unwrap();
         let kind = match c {
-            '(' => TokenKind::LParen,
-            ')' => TokenKind::RParen,
+            '(' => {
+                self.bracket_stack.push('(');
+                TokenKind::LParen
+            }
+            ')' => {
+                self.bracket_stack.pop();
+                TokenKind::RParen
+            }
             '{' => {
                 if let Some(LexMode::TemplateExpr { brace_depth }) = self.mode_stack.last_mut() {
                     *brace_depth += 1;
                 }
+                // The `{` that opens a `${...}` interpolation is consumed
+                // directly by `lex_template_text` and never reaches here —
+                // only an ordinary block/lambda brace, or one nested inside
+                // an interpolation, does — so this is always a real,
+                // bracket_stack-tracked open.
+                self.bracket_stack.push('{');
                 TokenKind::LBrace
             }
             '}' => {
@@ -351,14 +384,25 @@ impl<'a> Lexer<'a> {
                     *brace_depth -= 1;
                     if *brace_depth == 0 {
                         self.mode_stack.pop();
+                        // Symmetric with `{`'s own doc comment: this `}`
+                        // closes the interpolation itself, whose opening
+                        // `{` never pushed onto `bracket_stack` — so this
+                        // path must not pop it either.
                         self.push(TokenKind::TemplateExprEnd, start);
                         return Ok(());
                     }
                 }
+                self.bracket_stack.pop();
                 TokenKind::RBrace
             }
-            '[' => TokenKind::LBracket,
-            ']' => TokenKind::RBracket,
+            '[' => {
+                self.bracket_stack.push('[');
+                TokenKind::LBracket
+            }
+            ']' => {
+                self.bracket_stack.pop();
+                TokenKind::RBracket
+            }
             ',' => TokenKind::Comma,
             ':' => TokenKind::Colon,
             ';' => TokenKind::Semicolon,
@@ -780,6 +824,112 @@ mod tests {
                 TokenKind::Plus,
                 TokenKind::Ident("b".into()),
                 TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_inside_parens_is_never_a_statement_separator() {
+        // `f(\n  x\n)` — a newline right before the closing `)` of a call's
+        // argument list (after `x`, an `Ident`, which is normally
+        // `can_end_statement`) must not become a real `Newline` token.
+        assert_eq!(
+            kinds("f(\n  x\n)"),
+            vec![
+                TokenKind::Ident("f".into()),
+                TokenKind::LParen,
+                TokenKind::Ident("x".into()),
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_inside_brackets_is_never_a_statement_separator() {
+        assert_eq!(
+            kinds("[\n  x\n]"),
+            vec![
+                TokenKind::LBracket,
+                TokenKind::Ident("x".into()),
+                TokenKind::RBracket,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_right_after_a_closing_paren_is_still_a_statement_separator() {
+        // The suppression is specifically for newlines *inside* an open
+        // `(`/`[` — once `)` closes it, a following newline is back to the
+        // ordinary `can_end_statement`-based rule (`RParen` is in that
+        // list), so `if (x)\nprintln()`'s gap is unaffected by this lexer
+        // change alone (the parser separately skips it — see `parser.rs`'s
+        // `skip_newlines`).
+        assert_eq!(
+            kinds("f(x)\ny"),
+            vec![
+                TokenKind::Ident("f".into()),
+                TokenKind::LParen,
+                TokenKind::Ident("x".into()),
+                TokenKind::RParen,
+                TokenKind::Newline,
+                TokenKind::Ident("y".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_inside_a_brace_block_nested_in_parens_stays_significant() {
+        // Regression guard: a multi-statement lambda/block passed as a
+        // call argument (`f({ ... })`) must keep separating its own
+        // statements by newline even though the whole `{...}` sits inside
+        // the call's `(...)` — `{` resets the innermost-bracket check back
+        // to "newlines matter" for its own direct content.
+        // The trailing newline right before the block's own closing `}` is
+        // also still significant (top of the bracket stack is `{` right up
+        // until `}` itself is lexed) — matches how an ordinary block body
+        // (`{ a\n b\n }`) already behaves today, with or without this fix.
+        assert_eq!(
+            kinds("f({\n  a\n  b\n})"),
+            vec![
+                TokenKind::Ident("f".into()),
+                TokenKind::LParen,
+                TokenKind::LBrace,
+                TokenKind::Ident("a".into()),
+                TokenKind::Newline,
+                TokenKind::Ident("b".into()),
+                TokenKind::Newline,
+                TokenKind::RBrace,
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_inside_parens_nested_in_a_brace_block_is_suppressed_again() {
+        // One level deeper: `(...)` nested inside a `{...}` (itself inside
+        // the outer call's `(...)`) suppresses newlines again for its own
+        // content — the innermost open bracket always wins.
+        // As above, the newline between `g(...)`'s closing `)` and the
+        // block's own closing `}` is significant again (top of the stack
+        // is back to `{` once `g(...)`'s `(` is closed).
+        assert_eq!(
+            kinds("f({\n  g(\n    a\n  )\n})"),
+            vec![
+                TokenKind::Ident("f".into()),
+                TokenKind::LParen,
+                TokenKind::LBrace,
+                TokenKind::Ident("g".into()),
+                TokenKind::LParen,
+                TokenKind::Ident("a".into()),
+                TokenKind::RParen,
+                TokenKind::Newline,
+                TokenKind::RBrace,
+                TokenKind::RParen,
+                TokenKind::Eof,
             ]
         );
     }

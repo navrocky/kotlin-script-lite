@@ -100,6 +100,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Like `skip_separators`, but `Newline` only — used where the grammar
+    /// unconditionally requires a specific continuation next (an `if`/
+    /// `while`/`for`/`when` header's body, or a `fun`'s `=`/`{`), so a
+    /// newline right there is always just formatting, never a real
+    /// statement separator. Deliberately doesn't also skip `Semicolon`,
+    /// unlike `skip_separators` — none of this method's call sites are
+    /// statement-list positions where a bare `;` would mean anything.
+    fn skip_newlines(&mut self) {
+        while matches!(self.peek_kind(), TokenKind::Newline) {
+            self.advance();
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<String, ParseError> {
         Ok(self.expect_ident_spanned()?.0)
     }
@@ -429,8 +442,10 @@ impl<'a> Parser<'a> {
         self.advance(); // fun
         let (name, name_span) = self.expect_ident_spanned()?;
         let params = self.parse_params()?;
+        self.skip_newlines();
         let return_type =
             if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
+        self.skip_newlines();
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         let body = if self.matches(&TokenKind::Assign) {
             self.parse_expr().map(|e| FunBody::Expr(Box::new(e)))
@@ -450,6 +465,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen, "'('")?;
         let cond = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
+        self.skip_newlines();
         self.loop_depth += 1;
         let body = self.parse_block_stmts();
         self.loop_depth -= 1;
@@ -464,6 +480,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::In, "'in'")?;
         let iterable = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
+        self.skip_newlines();
         self.loop_depth += 1;
         let body = self.parse_block_stmts();
         self.loop_depth -= 1;
@@ -905,6 +922,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen, "'('")?;
         let cond = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
+        self.skip_newlines();
         let then_branch = self.parse_branch()?;
         self.skip_separators_if_else_follows();
         let else_branch = if self.matches(&TokenKind::Else) {
@@ -946,6 +964,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        self.skip_newlines();
         self.expect(TokenKind::LBrace, "'{'")?;
         self.skip_separators();
         let mut arms = Vec::new();
@@ -1222,6 +1241,45 @@ mod tests {
         parse_src("when (x) { 1 -> \"one\" else -> \"other\" }");
         parse_src("for (i in 1..10) { println(i) }");
         parse_src("while (x < 10) { x = x + 1 }");
+    }
+
+    #[test]
+    fn header_followed_by_a_newline_before_the_body_parses() {
+        // A newline right after a header's closing `)` (or, for `fun`,
+        // its params/return type) is always just formatting, never a
+        // statement separator, since the grammar unconditionally requires
+        // a body/`=`/`{` to follow — see `skip_newlines`.
+        parse_src("if (true)\n1");
+        parse_src("if (true)\n{ 1 }");
+        parse_src("while (false)\n{ 1 }");
+        parse_src("for (i in 1..1)\n{ println(i) }");
+        parse_src("when (1)\n{ 1 -> \"one\" else -> \"other\" }");
+        parse_src("fun f(): Int\n= 1");
+        parse_src("fun f()\n{ }");
+    }
+
+    #[test]
+    fn if_condition_may_span_multiple_lines() {
+        // Newline *inside* the condition's parens (before the closing
+        // `)`, after an `Ident`) — suppressed at the lexer level, see
+        // `lexer.rs`'s `bracket_stack`.
+        let stmts = parse_src("if (\n  x\n) { 1 }");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => assert!(matches!(e.kind, ExprKind::If { .. })),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_with_a_newline_before_the_closing_paren_parses() {
+        let stmts = parse_src("f(\n  1,\n  2\n)");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Call { args, .. } => assert_eq!(args.len(), 2),
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
