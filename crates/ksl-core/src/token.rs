@@ -67,6 +67,8 @@ pub enum TokenKind {
     StarAssign,
     SlashAssign,
     PercentAssign,
+    PlusPlus,
+    MinusMinus,
     Arrow,
     Range,
     Question,
@@ -99,6 +101,8 @@ impl TokenKind {
                 | TokenKind::Continue
                 | TokenKind::Null
                 | TokenKind::BangBang
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus
         )
     }
 }

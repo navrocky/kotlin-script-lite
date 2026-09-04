@@ -295,8 +295,9 @@ pub fn resolve(program: &Program) -> ResolveResult {
         },
         diagnostics: Vec::new(),
         type_errors: Vec::new(),
-        imported_names: program.imports_use.iter().map(|u| u.path.last().unwrap().clone()).collect(),
+        imported_names: program.imports_use.iter().filter(|u| !u.wildcard).map(|u| u.path.last().unwrap().clone()).collect(),
         has_file_imports: !program.imports.is_empty(),
+        has_wildcard_import: program.imports_use.iter().any(|u| u.wildcard),
         generic_params: Vec::new(),
         known_classes: HashSet::new(),
         return_type_stack: Vec::new(),
@@ -327,6 +328,14 @@ struct Resolver {
     /// unflagged), but a undefined-name check that's wrong on ordinary,
     /// correct multi-file code is worse than one that's merely incomplete.
     has_file_imports: bool,
+    /// True if this file has any wildcard `import a.b.*`. Same reasoning
+    /// and same blanket leniency as `has_file_imports` — a wildcard import
+    /// brings in an unknown-to-this-resolver set of names (it has no
+    /// access to the interpreter's runtime package envs), so this
+    /// suppresses the undefined-name diagnostic file-wide rather than risk
+    /// false positives on every name that wildcard import legitimately
+    /// provides.
+    has_wildcard_import: bool,
     /// Names of generic type parameters in scope (from an enclosing
     /// declaration's own `<T, ...>` list) — always empty today, since no
     /// declaration has a `type_params` list yet; see
@@ -625,7 +634,7 @@ impl Resolver {
             }
             return ty;
         }
-        if crate::stdlib::is_known(name) || self.imported_names.contains(name) || self.has_file_imports {
+        if crate::stdlib::is_known(name) || self.imported_names.contains(name) || self.has_file_imports || self.has_wildcard_import {
             return Type::Unknown;
         }
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
@@ -1333,6 +1342,19 @@ impl Resolver {
                 self.table.name_refs.push((expr.span, name.clone()));
                 self.resolve_name(scope, name, expr.span)
             }
+            // `++x`/`x--` etc. — same name resolution as a bare `Name`
+            // (goto-def/hover on the identifier), returning the target's
+            // own type since the value's type never changes across
+            // increment/decrement (`Int` stays `Int`, `Double` stays
+            // `Double`). No dedicated arithmetic-compatibility check here,
+            // same as `StmtKind::Assign`'s `+=`/`-=` (see its own comment) —
+            // this is sugar over exactly that, and inherits the same
+            // "out of scope for v1" reasoning; a non-numeric target still
+            // surfaces a runtime error via `apply_binary`.
+            ExprKind::IncDec { name, name_span, .. } => {
+                self.table.name_refs.push((*name_span, name.clone()));
+                self.resolve_name(scope, name, *name_span)
+            }
             // `receiver.field` — this resolver has no notion of packages or
             // (pre-Phase-5) object fields, so it can't tell a local field
             // access apart from a package-qualified reference any more
@@ -1767,9 +1789,7 @@ impl Resolver {
                     // logic below so it applies unconditionally, even when
                     // the other branch is itself a primitive.
                     else_ty
-                } else if else_ty == Type::Nothing {
-                    then_ty
-                } else if then_ty == else_ty {
+                } else if else_ty == Type::Nothing || then_ty == else_ty {
                     then_ty
                 } else {
                     // Two different primitives have no common supertype to
@@ -1840,7 +1860,7 @@ impl Resolver {
                         // above: a never-returning arm carries no real type
                         // of its own, so the accumulated join just becomes
                         // whichever side isn't `Nothing`.
-                        Some(prev) if prev == Type::Nothing => arm_ty,
+                        Some(Type::Nothing) => arm_ty,
                         Some(prev) if arm_ty == Type::Nothing => prev,
                         Some(prev) if prev == arm_ty => prev,
                         Some(prev) => {

@@ -182,17 +182,42 @@ impl<'a> Parser<'a> {
     /// file's own unqualified scope. At least 2 segments are required (a
     /// package name plus a member); `import c` alone has no package to
     /// qualify it and is rejected.
+    /// `import a.b.c` (single symbol) or `import a.b.*` (wildcard — every
+    /// top-level name package `a.b` declares). Can't reuse
+    /// `parse_dotted_path` as-is: a trailing `.*` needs its own lookahead,
+    /// since `*` is never a legal path segment otherwise (`Star` isn't an
+    /// identifier token).
     fn parse_import_use(&mut self) -> Result<ImportUse, ParseError> {
         let span = self.span();
         self.advance(); // 'import'
-        let (path, path_span) = self.parse_dotted_path()?;
-        if path.len() < 2 {
+        let (first, first_span) = self.expect_ident_spanned()?;
+        let mut path = vec![first];
+        let mut full_span = first_span;
+        let mut wildcard = false;
+        while self.matches(&TokenKind::Dot) {
+            if matches!(self.peek_kind(), TokenKind::Star) {
+                let star_span = self.span();
+                self.advance(); // '*'
+                full_span = full_span.merge(&star_span);
+                wildcard = true;
+                break;
+            }
+            let (segment, segment_span) = self.expect_ident_spanned()?;
+            full_span = full_span.merge(&segment_span);
+            path.push(segment);
+        }
+        // A wildcard's `path` is the package name alone (e.g. `["kotlin",
+        // "test"]` for `import kotlin.test.*`) — at least 1 segment, always
+        // true since `first` is always pushed. A single-symbol import's
+        // `path` is package + member — at least 2 segments required, same
+        // rule as before this method grew wildcard support.
+        if !wildcard && path.len() < 2 {
             return Err(ParseError {
                 message: "import path must be package-qualified, e.g. 'import a.b.c'".into(),
-                span: path_span,
+                span: full_span,
             });
         }
-        Ok(ImportUse { path, span: span.merge(&path_span) })
+        Ok(ImportUse { path, wildcard, span: span.merge(&full_span) })
     }
 
     /// `TypeAnnotation ::= Ident | '(' (TypeAnnotation (',' TypeAnnotation)*)? ')' '->' TypeAnnotation`
@@ -333,14 +358,17 @@ impl<'a> Parser<'a> {
         self.parse_stmts_until_rbrace()
     }
 
-    /// Either a `{ ... }` block or a single expression, used for if/when branches.
+    /// Either a `{ ... }` block or a single statement, used for if/when
+    /// branches — real Kotlin's grammar allows any statement here, not just
+    /// an expression (`if (cond) return "x"`, `if (cond) continue`, both
+    /// with no braces, are ordinary Kotlin). Delegates to `parse_stmt`
+    /// rather than `parse_expr` directly so `return`/`break`/`continue`
+    /// work in this position exactly as they do inside a `{ }` block.
     fn parse_branch(&mut self) -> Result<Vec<Stmt>, ParseError> {
         if matches!(self.peek_kind(), TokenKind::LBrace) {
             self.parse_block_stmts()
         } else {
-            let span = self.span();
-            let expr = self.parse_expr()?;
-            Ok(vec![Stmt::new(StmtKind::ExprStmt(expr), span)])
+            Ok(vec![self.parse_stmt()?])
         }
     }
 
@@ -698,6 +726,18 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         let span = self.span();
+        if let Some(op) = match self.peek_kind() {
+            TokenKind::PlusPlus => Some(IncDecOp::Inc),
+            TokenKind::MinusMinus => Some(IncDecOp::Dec),
+            _ => None,
+        } {
+            self.advance();
+            let (name, name_span) = self.expect_ident_spanned()?;
+            return Ok(Expr::new(
+                ExprKind::IncDec { op, name, name_span, prefix: true },
+                span,
+            ));
+        }
         let op = match self.peek_kind() {
             TokenKind::Minus => Some(UnaryOp::Neg),
             TokenKind::Plus => Some(UnaryOp::Pos),
@@ -770,6 +810,24 @@ impl<'a> Parser<'a> {
                     },
                     span,
                 );
+            } else if matches!(self.peek_kind(), TokenKind::PlusPlus | TokenKind::MinusMinus)
+                && matches!(expr.kind, ExprKind::Name(_))
+            {
+                // Postfix `x++`/`x--` — restricted to a bare name target,
+                // same as `StmtKind::Assign`'s target (no settable
+                // `.field`/`[i]` exists yet). A receiver that isn't a plain
+                // name (e.g. `f()++`) leaves the token unconsumed instead of
+                // erroring here — it just isn't a valid postfix-inc/dec
+                // target, same as it isn't a valid assignment target.
+                let op = if matches!(self.peek_kind(), TokenKind::PlusPlus) { IncDecOp::Inc } else { IncDecOp::Dec };
+                let span = self.span();
+                self.advance();
+                let name_span = expr.span;
+                let name = match expr.kind {
+                    ExprKind::Name(name) => name,
+                    _ => unreachable!("matched above"),
+                };
+                expr = Expr::new(ExprKind::IncDec { op, name, name_span, prefix: false }, span);
             } else {
                 break;
             }
@@ -1378,6 +1436,35 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_import_parses() {
+        let tokens = tokenize("import kotlin.test.*\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.imports_use.len(), 1);
+        assert!(program.imports_use[0].wildcard);
+        // Unlike a single-symbol import, `path` holds only the package
+        // segments — the `*` isn't a member name to store.
+        assert_eq!(program.imports_use[0].path, vec!["kotlin", "test"]);
+    }
+
+    #[test]
+    fn single_symbol_import_is_not_wildcard() {
+        let tokens = tokenize("import a.b.greet\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert!(!program.imports_use[0].wildcard);
+    }
+
+    #[test]
+    fn wildcard_import_of_a_single_segment_package_parses() {
+        // `import kotlin.*` — one package segment (`kotlin`) before `*`,
+        // still legal (unlike a single-symbol import, a wildcard has no
+        // 2-segment minimum: the member position is `*`, not a name).
+        let tokens = tokenize("import kotlin.*\nprintln(1)").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert!(program.imports_use[0].wildcard);
+        assert_eq!(program.imports_use[0].path, vec!["kotlin"]);
+    }
+
+    #[test]
     fn package_file_import_and_import_use_can_all_appear_together_in_any_order() {
         let tokens = tokenize(
             "package my.pkg\nimport a.b.greet\n@file:Import(\"utils.ksl\")\nimport c.d.helper\nprintln(1)",
@@ -1543,6 +1630,94 @@ mod tests {
                 assert!(params.is_empty());
                 assert!(matches!(ret.as_ref(), TypeAnnotation::Named(n, _) if n == "Unit"));
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn braceless_if_branch_accepts_a_return_statement() {
+        // `if (cond) return "x"` with no braces — a bare-statement branch,
+        // not just a bare-expression one (real Kotlin grammar: an if/when
+        // branch is a `Statement`, and `return`/`break`/`continue` are
+        // statements, not expressions, in ksl).
+        let stmts = parse_src("fun f(): String {\nif (true) return \"x\"\nreturn \"y\"\n}\n");
+        match &stmts[0].kind {
+            StmtKind::FunDecl { body: FunBody::Block(body), .. } => match &body[0].kind {
+                StmtKind::ExprStmt(e) => match &e.kind {
+                    ExprKind::If { then_branch, else_branch: None, .. } => {
+                        assert!(matches!(&then_branch[0].kind, StmtKind::Return(Some(_))));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn braceless_if_branch_accepts_a_continue_statement() {
+        let stmts = parse_src("while (true) {\nif (true) continue\n}\n");
+        match &stmts[0].kind {
+            StmtKind::While { body, .. } => match &body[0].kind {
+                StmtKind::ExprStmt(e) => match &e.kind {
+                    ExprKind::If { then_branch, .. } => {
+                        assert!(matches!(&then_branch[0].kind, StmtKind::Continue));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postfix_increment_and_decrement_parse() {
+        let stmts = parse_src("x++\ny--");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => assert!(
+                matches!(&e.kind, ExprKind::IncDec { op: IncDecOp::Inc, name, prefix: false, .. } if name == "x")
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        match &stmts[1].kind {
+            StmtKind::ExprStmt(e) => assert!(
+                matches!(&e.kind, ExprKind::IncDec { op: IncDecOp::Dec, name, prefix: false, .. } if name == "y")
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_increment_and_decrement_parse() {
+        let stmts = parse_src("++x\n--y");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => assert!(
+                matches!(&e.kind, ExprKind::IncDec { op: IncDecOp::Inc, name, prefix: true, .. } if name == "x")
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        match &stmts[1].kind {
+            StmtKind::ExprStmt(e) => assert!(
+                matches!(&e.kind, ExprKind::IncDec { op: IncDecOp::Dec, name, prefix: true, .. } if name == "y")
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn postfix_increment_inside_a_condition_parses() {
+        // `x++ < 5` — postfix binds tighter than `<`, so this is
+        // `(x++) < 5`, not a parse error.
+        let stmts = parse_src("val ok = x++ < 5");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { init, .. } => match &init.kind {
+                ExprKind::Binary { op: BinaryOp::Lt, lhs, .. } => {
+                    assert!(matches!(&lhs.kind, ExprKind::IncDec { prefix: false, .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
             other => panic!("unexpected {other:?}"),
         }
     }

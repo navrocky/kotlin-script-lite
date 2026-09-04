@@ -51,15 +51,22 @@ pub struct ImportDecl {
 }
 
 /// `import a.b.c` — brings the package-qualified name `a.b.c` (package
-/// `a.b`, member `c`) into this file's own unqualified scope. `path` always
-/// has at least 2 segments; the last is the member name, everything before
-/// it is the package name. Orthogonal to `ImportDecl`/`@file:Import`, which
-/// loads a *file* by path — `import` only aliases a name that some already-
-/// loaded file's `package` declaration put there; it never loads anything
-/// by itself. See `Interpreter::resolve_qualified`.
+/// `a.b`, member `c`) into this file's own unqualified scope — or, when
+/// `wildcard` is set, `import a.b.*` brings in *every* top-level name
+/// package `a.b` declares. When `wildcard` is `false`, `path` always has at
+/// least 2 segments and its last is the member name, everything before it
+/// the package name; when `true`, every segment of `path` is part of the
+/// package name (the member position held `*` instead, consumed by the
+/// parser rather than stored). Orthogonal to `ImportDecl`/`@file:Import`,
+/// which loads a *file* by path — `import` only aliases a name (or names)
+/// some already-loaded file's `package` declaration put there, or one of
+/// the handful of synthetic packages (`kotlin.test`) that alias ksl's own
+/// stdlib without needing a loaded file at all — never loads anything by
+/// itself. See `Interpreter::resolve_qualified`/`resolve_package_members`.
 #[derive(Debug, Clone)]
 pub struct ImportUse {
     pub path: Vec<String>,
+    pub wildcard: bool,
     pub span: Span,
 }
 
@@ -163,6 +170,25 @@ pub enum ExprKind {
     },
     Block(Vec<Stmt>),
     NullLit,
+    /// `++x`/`--x` (`prefix: true`) or `x++`/`x--` (`prefix: false`) —
+    /// restricted to a bare variable target, same as `StmtKind::Assign`'s
+    /// `name` (no `.field`/`[i]` target exists to increment yet). Mutates
+    /// `name` in place (sugar over `name = name + 1`/`name = name - 1`,
+    /// reusing the same `apply_binary` arithmetic the interpreter already
+    /// uses for `+=`/`-=`) and evaluates to the *new* value when `prefix`,
+    /// the *old* value otherwise — matching Kotlin's own semantics.
+    IncDec {
+        op: IncDecOp,
+        name: String,
+        name_span: Span,
+        prefix: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncDecOp {
+    Inc,
+    Dec,
 }
 
 #[derive(Debug, Clone)]

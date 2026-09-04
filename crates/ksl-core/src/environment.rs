@@ -60,6 +60,16 @@ impl Env {
             .insert(name.to_string(), Binding { value, mutable, declared_type });
     }
 
+    /// Every name defined directly on this scope — not inherited from a
+    /// parent — as `(name, value)` pairs. Used for wildcard `import a.b.*`
+    /// (`importer.rs`): a package's own `Env` is always a direct child of
+    /// `globals` (see `Interpreter::package_env`), so this returns exactly
+    /// that package's own top-level declarations, nothing from `globals`
+    /// itself or any sibling package.
+    pub fn own_bindings(&self) -> Vec<(String, Value)> {
+        self.0.borrow().vars.iter().map(|(k, b)| (k.clone(), b.value.clone())).collect()
+    }
+
     pub fn get(&self, name: &str) -> Option<Value> {
         let data = self.0.borrow();
         match data.vars.get(name) {

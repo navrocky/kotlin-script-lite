@@ -61,7 +61,14 @@ val x = 10          // immutable
 var y: Int = 20      // mutable, with an optional type annotation
 y = y + 1
 y += 5               // += -= *= /= %= are also supported
+y++                  // postfix increment/decrement — evaluates to the old value
+++y                  // prefix — evaluates to the new value
 ```
+
+`++`/`--` are sugar over `y = y + 1`/`y = y - 1` (so they work on `Int`
+and `Double` locals the same way `+=`/`-=` do) and, like `=`/`+=`, only
+apply to a bare variable name — not yet a `.field` or `[i]` target, since
+neither exists as a settable place yet.
 
 Reassigning a `val` is a runtime error. A type annotation (`Int`, `Double`,
 `Boolean`, `String`, `Unit`, or `List`) is checked against the
@@ -214,8 +221,8 @@ Listed loosest-to-tightest binding (i.e. `a || b && c` parses as
 | 6 | `..` | inclusive `Int` range, e.g. `1..5` |
 | 7 | `+` `-` | `+` also concatenates `String` (`"x" + 1`) and `List` |
 | 8 | `*` `/` `%` | integer division/remainder by zero is a runtime error |
-| — | unary `-` `+` `!` | tightest, right-associative |
-| — | `f(...)`, `.field`, `.method(...)`, `?.field`, `?.method(...)`, `!!` | postfix call/member-access/null-safety, tightest of all, left-associative (`a.b.c()` is `(a.b).c(...)`) |
+| — | unary `-` `+` `!` `++` `--` | prefix, tightest, right-associative — `++x`/`--x` mutate `x` in place and evaluate to the *new* value |
+| — | `f(...)`, `.field`, `.method(...)`, `?.field`, `?.method(...)`, `!!`, `++` `--` | postfix call/member-access/null-safety/increment/decrement, tightest of all, left-associative (`a.b.c()` is `(a.b).c(...)`) — `x++`/`x--` mutate `x` in place but evaluate to the *old* value |
 
 `Int`/`Double` operands mix freely (`1 + 2.5`); the result is `Double`
 whenever either operand is. `Int` arithmetic wraps on overflow, matching
@@ -232,8 +239,17 @@ assigned directly:
 val label = if (score > 50) "pass" else "fail"
 ```
 
-An `if`/`when` branch may be either a `{ ... }` block or, without braces,
-a single expression.
+An `if`/`when` branch may be either a `{ ... }` block or, without braces, a
+single **statement** — not just an expression, so `return`/`break`/
+`continue` work in this position with no braces needed, same as real
+Kotlin:
+
+```kotlin
+if (cond) { ... } else { ... }
+if (cond) "yes" else "no"
+if (x < 0) return "negative"       // a bare `return`, no braces
+if (x <= 2) continue               // likewise `break`/`continue`, inside a loop
+```
 
 ### `if`
 
@@ -270,6 +286,9 @@ while (cond) {
     ...
 }
 ```
+
+There is no `do { ... } while (cond)` form — only the condition-first
+`while` above. See "Not supported" below.
 
 ### `for`
 
@@ -482,8 +501,26 @@ println(square(5))
   some already-`@file:Import`ed file's `package` declaration put there.
   Using it, or a bare `a.b.c` reference, before that file has actually been
   imported is a runtime error (`unknown package 'a.b'`).
+- `import a.b.*` (wildcard) brings in *every* top-level name package `a.b`
+  declares, instead of just one — otherwise the same rules as above
+  (must appear before any other statement, the package must already be
+  loaded/known, `import a.b.*` before that is `unknown package 'a.b'`).
 - `a.b.c` qualified-name syntax (package `a.b`, member `c`) works in any
   expression position without needing `import` first.
+
+**`kotlin.test`** is a special case: it's a real, resolvable package
+(both forms above work, and so does a fully-qualified
+`kotlin.test.assertEquals(...)` call with no import at all) even though no
+file ever declares `package kotlin.test` — it's a synthetic alias for
+[the assertion functions](stdlib.md#assertions) ksl's stdlib already
+provides globally (`assertEquals`, `assertTrue`, `assertFalse`,
+`assertNull`, `assertNotNull`), added so real Kotlin code that writes
+`import kotlin.test.*` (a common convention, including in JetBrains's own
+compiler test suite — see `docs/roadmap.md`'s Phase 0.5) doesn't need to
+be rewritten to run under ksl. Importing a `kotlin.test` member ksl
+doesn't actually implement (e.g. `assertFailsWith`, which needs `throw` —
+see "Not supported") is a plain `undefined name` error, same as importing
+any other nonexistent member.
 
 `a.b.c` in expression position is genuinely ambiguous between a
 package-qualified name and `.` member access on a value (see "Methods"
@@ -512,4 +549,7 @@ map literal doesn't exist in real Kotlin at all), collection indexing
 a real `List<T>` rather than a special case — `try`/`catch`, coroutines,
 extension functions, and network imports. `.` method syntax only covers
 the small builtin set in [`stdlib.md`](stdlib.md#methods) — arbitrary
-field/method access on a value needs classes/objects first.
+field/method access on a value needs classes/objects first. There's also
+no `do { ... } while (cond)` loop — only condition-first `while` (see
+above); found missing during `docs/roadmap.md`'s Phase 0.5 audit, not yet
+on any roadmap phase.

@@ -113,6 +113,34 @@ max(3, 7)       // 7
 min(3.5, 2)     // 2.0 (printed as "2")
 ```
 
+## Assertions
+
+`kotlin.test`-shaped, but plain global functions — no `import` needed (see
+[`syntax.md`](syntax.md#imports); `import kotlin.test.*` itself doesn't
+resolve, since ksl has no such package). Each aborts the script with a
+runtime error on failure, exactly like any other stdlib error.
+
+### `assertEquals(expected, actual, message: String? = null)`
+
+```kotlin
+assertEquals(4, 2 + 2)
+assertEquals(4, 2 + 3, "arithmetic is broken")   // fails: "... : arithmetic is broken"
+```
+
+### `assertTrue(actual: Boolean, message: String? = null)` / `assertFalse(actual: Boolean, message: String? = null)`
+
+```kotlin
+assertTrue(1 < 2)
+assertFalse(1 > 2)
+```
+
+### `assertNull(actual, message: String? = null)` / `assertNotNull(actual, message: String? = null)`
+
+```kotlin
+assertNull(null)
+assertNotNull(5)
+```
+
 ## Value formatting
 
 `println`/`print` and string templates format values as follows:

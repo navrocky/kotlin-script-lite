@@ -25,7 +25,18 @@ impl<'a> Interpreter<'a> {
     pub fn new(out: &'a mut dyn std::io::Write) -> Self {
         let globals = Env::new();
         crate::stdlib::populate_globals(&globals);
-        Interpreter { globals, out, packages: HashMap::new() }
+        let mut packages = HashMap::new();
+        // Synthetic package, not backed by any loaded file — see
+        // `stdlib::KOTLIN_TEST_MEMBERS`'s doc comment for why this exists
+        // and why it's this narrow.
+        let kotlin_test = globals.child();
+        for name in crate::stdlib::KOTLIN_TEST_MEMBERS {
+            if let Some(v) = globals.get(name) {
+                kotlin_test.define(name, v, false, crate::types::Type::Unknown);
+            }
+        }
+        packages.insert("kotlin.test".to_string(), kotlin_test);
+        Interpreter { globals, out, packages }
     }
 
     pub fn run(&mut self, stmts: &[Stmt]) -> Result<(), Flow> {
@@ -69,6 +80,17 @@ impl<'a> Interpreter<'a> {
         package_env
             .get(&member[0])
             .ok_or_else(|| RuntimeError::new(format!("undefined name '{}'", path.join(".")), span))
+    }
+
+    /// Resolves every top-level member of package `path` (e.g. `["kotlin",
+    /// "test"]` for `kotlin.test`) — the wildcard-`import` counterpart of
+    /// `resolve_qualified`, which resolves exactly one named member.
+    pub fn resolve_package_members(&self, path: &[String], span: Span) -> Result<Vec<(String, Value)>, RuntimeError> {
+        let package_name = path.join(".");
+        let package_env = self.packages.get(&package_name).ok_or_else(|| {
+            RuntimeError::new(format!("unknown package '{package_name}'"), span)
+        })?;
+        Ok(package_env.own_bindings())
     }
 
     /// If `receiver` is a chain of bare-identifier `.` access (`a`, `a.b`,
@@ -333,6 +355,31 @@ impl<'a> Interpreter<'a> {
                     )
                     .into()),
                 }
+            }
+            ExprKind::IncDec { op, name, prefix, .. } => {
+                // Sugar over `name = name + 1`/`name = name - 1` — reuses
+                // the exact `apply_binary`/`Env::assign` path
+                // `StmtKind::Assign`'s `+=`/`-=` already goes through, so
+                // `Int`/`Double` widening and mutability/type-mismatch
+                // errors behave identically to the equivalent compound
+                // assignment.
+                let cur = env
+                    .get(name)
+                    .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span))?;
+                let bop = match op {
+                    IncDecOp::Inc => BinaryOp::Add,
+                    IncDecOp::Dec => BinaryOp::Sub,
+                };
+                let new_val = apply_binary(bop, cur.clone(), Value::Int(1), expr.span)?;
+                env.assign(name, new_val.clone()).map_err(|e| match e {
+                    AssignError::Undefined => RuntimeError::new(format!("undefined name '{name}'"), expr.span),
+                    AssignError::NotMutable => RuntimeError::new(format!("cannot reassign val '{name}'"), expr.span),
+                    AssignError::TypeMismatch(actual, expected) => RuntimeError::new(
+                        format!("type mismatch: expected {}, got {}", expected.name(), actual.name()),
+                        expr.span,
+                    ),
+                })?;
+                Ok(if *prefix { new_val } else { cur })
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 if *op == BinaryOp::And {
@@ -1068,5 +1115,58 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
     fn function_typed_val_rejects_a_non_callable_value() {
         let err = run_err("val f: (Int) -> Int = 5\n");
         assert!(err.contains("type mismatch: expected (Int) -> Int, got Int"), "{err}");
+    }
+
+    #[test]
+    fn postfix_increment_returns_old_value_and_mutates() {
+        assert_eq!(run("var x = 5\nprintln(x++)\nprintln(x)"), "5\n6\n");
+    }
+
+    #[test]
+    fn postfix_decrement_returns_old_value_and_mutates() {
+        assert_eq!(run("var x = 5\nprintln(x--)\nprintln(x)"), "5\n4\n");
+    }
+
+    #[test]
+    fn prefix_increment_and_decrement_return_the_new_value() {
+        assert_eq!(run("var x = 5\nprintln(++x)\nprintln(x)"), "6\n6\n");
+        assert_eq!(run("var x = 5\nprintln(--x)\nprintln(x)"), "4\n4\n");
+    }
+
+    #[test]
+    fn increment_works_on_double_locals() {
+        assert_eq!(run("var d = 1.5\nd++\nprintln(d)"), "2.5\n");
+    }
+
+    #[test]
+    fn increment_in_a_while_condition_matches_kotlin_semantics() {
+        // `x++ < 5` compares the *old* value, then increments — a do-while-
+        // shaped loop body relies on exactly this ordering.
+        let src = "var x = 0\nvar count = 0\nwhile (x++ < 5) {\n    count = count + 1\n}\nprintln(count)\nprintln(x)";
+        assert_eq!(run(src), "5\n6\n");
+    }
+
+    #[test]
+    fn decrement_a_val_is_a_runtime_error() {
+        let err = run_err("val x = 5\nx++\n");
+        assert!(err.contains("cannot reassign val"), "{err}");
+    }
+
+    #[test]
+    fn braceless_if_branch_with_return_runs_correctly() {
+        let src = "fun f(b: Boolean): String {\n    if (b) return \"yes\"\n    return \"no\"\n}\nprintln(f(true))\nprintln(f(false))";
+        assert_eq!(run(src), "yes\nno\n");
+    }
+
+    #[test]
+    fn braceless_if_branch_with_continue_runs_correctly() {
+        let src = "var count = 0\nvar i = 0\nwhile (i < 5) {\n    i = i + 1\n    if (i <= 2) continue\n    count = count + 1\n}\nprintln(count)";
+        assert_eq!(run(src), "3\n");
+    }
+
+    #[test]
+    fn increment_an_undefined_name_is_a_runtime_error() {
+        let err = run_err("x++\n");
+        assert!(err.contains("undefined name 'x'"), "{err}");
     }
 }

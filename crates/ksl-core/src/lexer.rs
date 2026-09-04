@@ -473,6 +473,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some('=') {
                     self.advance();
                     TokenKind::PlusAssign
+                } else if self.peek() == Some('+') {
+                    self.advance();
+                    TokenKind::PlusPlus
                 } else {
                     TokenKind::Plus
                 }
@@ -484,6 +487,9 @@ impl<'a> Lexer<'a> {
                 } else if self.peek() == Some('>') {
                     self.advance();
                     TokenKind::Arrow
+                } else if self.peek() == Some('-') {
+                    self.advance();
+                    TokenKind::MinusMinus
                 } else {
                     TokenKind::Minus
                 }

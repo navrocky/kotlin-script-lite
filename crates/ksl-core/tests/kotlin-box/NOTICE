@@ -1,0 +1,15 @@
+The .ksl files under this directory and ../kotlin-box-pending/ are vendored,
+content-unmodified (renamed from upstream's own .kt to .ksl only — see
+README.md), from:
+
+    JetBrains/kotlin
+    https://github.com/JetBrains/kotlin
+    compiler/testData/codegen/box/
+    commit 8fc606186b9d2be2bce6b390f7bf12f7cdb41adc
+
+Licensed under the Apache License, Version 2.0. A copy of the license can
+be obtained at:
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+See README.md in this directory for how these files are used and updated.

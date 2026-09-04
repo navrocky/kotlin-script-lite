@@ -29,11 +29,33 @@ pub const STDLIB_SIGNATURES: &[(&str, &str, &str)] = &[
     ("sqrt", "sqrt(x: Int | Double): Double", "Square root."),
     ("max", "max(a, b): Int | Double", "Returns the larger of a and b."),
     ("min", "min(a, b): Int | Double", "Returns the smaller of a and b."),
+    ("assertEquals", "assertEquals(expected, actual, message: String? = null)", "Aborts with a runtime error if expected and actual aren't equal."),
+    ("assertTrue", "assertTrue(actual: Boolean, message: String? = null)", "Aborts with a runtime error if actual is false."),
+    ("assertFalse", "assertFalse(actual: Boolean, message: String? = null)", "Aborts with a runtime error if actual is true."),
+    ("assertNull", "assertNull(actual, message: String? = null)", "Aborts with a runtime error if actual isn't null."),
+    ("assertNotNull", "assertNotNull(actual, message: String? = null)", "Aborts with a runtime error if actual is null."),
 ];
 
 pub fn is_known(name: &str) -> bool {
     STDLIB_SIGNATURES.iter().any(|(n, _, _)| *n == name)
 }
+
+/// Real Kotlin's `kotlin.test` package, as far as ksl goes — every one of
+/// these names is already a plain global stdlib function (see
+/// `populate_globals`), but real Kotlin box tests write `import
+/// kotlin.test.*`/`import kotlin.test.assertEquals` expecting a real
+/// package to resolve against, not a flat global scope. `Interpreter::new`
+/// seeds a synthetic `"kotlin.test"` package env from exactly this list
+/// (aliasing the same values already in `globals`, not copies), so both
+/// import forms — and a fully-qualified `kotlin.test.assertEquals(...)`
+/// call, via the existing package-qualified `FieldAccess`/`MethodCall`
+/// path — resolve for real, with no harness-level text rewriting needed.
+/// Deliberately narrow (just the assertions this crate actually
+/// implements) rather than aliasing all of `globals` under `kotlin.test`,
+/// which would make nonsensical calls like `kotlin.test.println(...)`
+/// resolve too.
+pub const KOTLIN_TEST_MEMBERS: &[&str] =
+    &["assertEquals", "assertTrue", "assertFalse", "assertNull", "assertNotNull"];
 
 /// Real, machine-readable `(param types, return type)` for a stdlib
 /// function's call-site checking (`STDLIB_SIGNATURES`'s own `signature`
@@ -56,6 +78,9 @@ pub fn stdlib_call_types(name: &str) -> Option<(Vec<Type>, Type)> {
         "length" => Some((vec![Type::String], Type::Int)),
         "uppercase" | "lowercase" | "trim" => Some((vec![Type::String], Type::String)),
         "sqrt" => Some((vec![Type::Unknown], Type::Double)),
+        "assertEquals" => Some((vec![Type::Unknown, Type::Unknown], Type::Unit)),
+        "assertTrue" | "assertFalse" => Some((vec![Type::Bool], Type::Unit)),
+        "assertNull" | "assertNotNull" => Some((vec![Type::Unknown], Type::Unit)),
         _ => None,
     }
 }
@@ -123,6 +148,101 @@ pub fn populate_globals(env: &Env) {
         let a = args.get(0).ok_or_else(|| arity_error("min", "2", args.len(), span))?;
         let b = args.get(1).ok_or_else(|| arity_error("min", "2", args.len(), span))?;
         numeric_binary(a, b, span, f64::min)
+    });
+
+    // `kotlin.test`-shaped assertions — thin wrappers over `values_equal`/
+    // `is_truthy` that raise the existing `RuntimeError` path on failure
+    // (the same mechanism `arity_error`/`type_error` already use above),
+    // not `Flow::Throw` (that doesn't exist until the `try`/`catch` phase).
+    // Added so `docs/roadmap.md`'s Phase 0.5 (JetBrains box-test conformance
+    // harness) has something to run vendored `kotlin.test.*`-using tests
+    // against — see that phase's own "stdlib additions" note.
+    register(env, "assertEquals", |_interp, args, span| {
+        let (expected, actual, message) = match args.len() {
+            2 => (&args[0], &args[1], None),
+            3 => (&args[0], &args[1], Some(&args[2])),
+            n => return Err(arity_error("assertEquals", "2 or 3", n, span)),
+        };
+        if !Value::values_equal(expected, actual) {
+            return Err(RuntimeError::new(
+                format!(
+                    "assertEquals failed: expected <{expected}>, actual <{actual}>{}",
+                    message.map(|m| format!(": {m}")).unwrap_or_default()
+                ),
+                span,
+            )
+            .into());
+        }
+        Ok(Value::Unit)
+    });
+
+    register(env, "assertTrue", |_interp, args, span| {
+        let (cond, message) = match args.len() {
+            1 => (&args[0], None),
+            2 => (&args[0], Some(&args[1])),
+            n => return Err(arity_error("assertTrue", "1 or 2", n, span)),
+        };
+        match cond {
+            Value::Bool(true) => Ok(Value::Unit),
+            Value::Bool(false) => Err(RuntimeError::new(
+                format!("assertTrue failed{}", message.map(|m| format!(": {m}")).unwrap_or_default()),
+                span,
+            )
+            .into()),
+            _ => Err(type_error("assertTrue", "a Boolean argument", span)),
+        }
+    });
+
+    register(env, "assertFalse", |_interp, args, span| {
+        let (cond, message) = match args.len() {
+            1 => (&args[0], None),
+            2 => (&args[0], Some(&args[1])),
+            n => return Err(arity_error("assertFalse", "1 or 2", n, span)),
+        };
+        match cond {
+            Value::Bool(false) => Ok(Value::Unit),
+            Value::Bool(true) => Err(RuntimeError::new(
+                format!("assertFalse failed{}", message.map(|m| format!(": {m}")).unwrap_or_default()),
+                span,
+            )
+            .into()),
+            _ => Err(type_error("assertFalse", "a Boolean argument", span)),
+        }
+    });
+
+    register(env, "assertNull", |_interp, args, span| {
+        let (actual, message) = match args.len() {
+            1 => (&args[0], None),
+            2 => (&args[0], Some(&args[1])),
+            n => return Err(arity_error("assertNull", "1 or 2", n, span)),
+        };
+        if !matches!(actual, Value::Null) {
+            return Err(RuntimeError::new(
+                format!(
+                    "assertNull failed: expected null, actual <{actual}>{}",
+                    message.map(|m| format!(": {m}")).unwrap_or_default()
+                ),
+                span,
+            )
+            .into());
+        }
+        Ok(Value::Unit)
+    });
+
+    register(env, "assertNotNull", |_interp, args, span| {
+        let (actual, message) = match args.len() {
+            1 => (&args[0], None),
+            2 => (&args[0], Some(&args[1])),
+            n => return Err(arity_error("assertNotNull", "1 or 2", n, span)),
+        };
+        if matches!(actual, Value::Null) {
+            return Err(RuntimeError::new(
+                format!("assertNotNull failed: expected non-null{}", message.map(|m| format!(": {m}")).unwrap_or_default()),
+                span,
+            )
+            .into());
+        }
+        Ok(Value::Unit)
     });
 }
 
@@ -369,5 +489,64 @@ mod tests {
             Err(Flow::Error(e)) => assert_eq!(e.span, span),
             other => panic!("expected an error, got {:?}", other.is_ok()),
         }
+    }
+
+    fn call(env: &Env, name: &str, args: Vec<Value>) -> Result<Value, Flow> {
+        let f = match env.get(name) {
+            Some(Value::Native(n)) => n,
+            _ => panic!("'{name}' not registered"),
+        };
+        let mut sink = Vec::new();
+        let mut interp = Interpreter::new(&mut sink);
+        (f.func)(&mut interp, args, Span::default())
+    }
+
+    #[test]
+    fn assert_equals_passes_on_equal_values_fails_otherwise() {
+        let env = Env::new();
+        populate_globals(&env);
+        assert!(call(&env, "assertEquals", vec![Value::Int(4), Value::Int(4)]).is_ok());
+        match call(&env, "assertEquals", vec![Value::Int(4), Value::Int(5)]) {
+            Err(Flow::Error(e)) => assert!(e.message.contains("assertEquals failed"), "{}", e.message),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn assert_equals_appends_the_optional_message() {
+        let env = Env::new();
+        populate_globals(&env);
+        match call(&env, "assertEquals", vec![Value::Int(4), Value::Int(5), Value::str("nope")]) {
+            Err(Flow::Error(e)) => assert!(e.message.ends_with(": nope"), "{}", e.message),
+            other => panic!("expected an error, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn assert_true_and_assert_false() {
+        let env = Env::new();
+        populate_globals(&env);
+        assert!(call(&env, "assertTrue", vec![Value::Bool(true)]).is_ok());
+        assert!(call(&env, "assertTrue", vec![Value::Bool(false)]).is_err());
+        assert!(call(&env, "assertFalse", vec![Value::Bool(false)]).is_ok());
+        assert!(call(&env, "assertFalse", vec![Value::Bool(true)]).is_err());
+    }
+
+    #[test]
+    fn assert_null_and_assert_not_null() {
+        let env = Env::new();
+        populate_globals(&env);
+        assert!(call(&env, "assertNull", vec![Value::Null]).is_ok());
+        assert!(call(&env, "assertNull", vec![Value::Int(1)]).is_err());
+        assert!(call(&env, "assertNotNull", vec![Value::Int(1)]).is_ok());
+        assert!(call(&env, "assertNotNull", vec![Value::Null]).is_err());
+    }
+
+    #[test]
+    fn assert_functions_report_arity_errors() {
+        let env = Env::new();
+        populate_globals(&env);
+        assert!(call(&env, "assertEquals", vec![Value::Int(1)]).is_err());
+        assert!(call(&env, "assertTrue", vec![]).is_err());
     }
 }

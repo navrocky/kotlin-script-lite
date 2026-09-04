@@ -41,8 +41,8 @@ fn token_type_index(kind: &TokenKind) -> Option<u32> {
 
         Assign | Eq | NotEq | Lt | Gt | LtEq | GtEq | AndAnd | OrOr | Not | Plus | Minus | Star
         | Slash | Percent | PlusAssign | MinusAssign | StarAssign | SlashAssign
-        | PercentAssign | Arrow | Range | At | TemplateExprStart | TemplateExprEnd
-        | Question | QuestionDot | QuestionColon | BangBang => OPERATOR,
+        | PercentAssign | PlusPlus | MinusMinus | Arrow | Range | At | TemplateExprStart
+        | TemplateExprEnd | Question | QuestionDot | QuestionColon | BangBang => OPERATOR,
 
         Ident(_) | LParen | RParen | LBrace | RBrace | LBracket | RBracket | Comma | Colon
         | Dot | Semicolon | Newline | Eof => return None,

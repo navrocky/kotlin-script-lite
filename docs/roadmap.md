@@ -75,12 +75,22 @@ Decisions already made that shape this plan:
   cleanup pass.** Every phase below has its own explicit `LSP:` note for
   exactly this reason — treat a phase as unfinished until its `LSP:` note
   is done, the same way it'd be unfinished without tests.
+- **A Kotlin conformance test harness (JetBrains's own compiler `box`
+  tests) is added early, as its own Phase 0.5**, independent of and never
+  gated by any feature phase below — the whole point is to start
+  exercising already-shipped functionality (Phases 0–4.5 today) rather
+  than waiting until the end, and to keep growing opportunistically as
+  each later phase lands real syntax the corpus needs. See Phase 0.5's own
+  section.
 
 ## Dependency order
 
 ```
 Phase 0: tech-debt (NativeFn span, break/continue fix)
    |
+   +--> Phase 0.5: Kotlin box-test conformance harness [initial cut shipped]
+   |    (independent side-track — starts here, grows opportunistically as
+   |    every later phase lands, never gates or is gated by anything below)
    v
 Phase 1: `.` postfix member-access syntax  <-- blocks 6, 7, 8
    |
@@ -172,6 +182,241 @@ changes.
 
 **Tests:** unit tests in `parser.rs`/`stdlib.rs` for both; update AGENTS.md
 to drop these from its "known gap" callouts once fixed.
+
+---
+
+## Phase 0.5 — Kotlin conformance test harness (JetBrains box tests) [initial cut shipped]
+
+Independent of every feature phase in this document — started early,
+specifically so it can already exercise everything shipped so far (Phases
+0–4.5), and grown incrementally as each later phase lands, rather than
+gating on any of them or being gated by them. Marked "initial cut shipped"
+rather than `[DONE]`, unlike other phases — by design this one never
+really finishes; see "Shipped" below for what actually landed and what's
+still open.
+
+**What upstream provides.** `JetBrains/kotlin`'s own compiler test suite
+(`compiler/testData/codegen/box/`, Apache License 2.0 —
+`license/LICENSE.txt` in that repo) has ~179 top-level subdirectories
+covering essentially every Kotlin language feature (`basics`, `functions`,
+`controlStructures`, `arithmetic`, `classes`, `coroutines`, plus
+JVM/JS/klib-backend-specific and IR-dump directories). Each test is a
+single `.kt` file with `fun box(): String`; real Kotlin's own compiler
+considers a test passed iff `box()` returns the literal string `"OK"`
+(most tests just `return "fail ..."` inline on a mismatch; some
+`import kotlin.test.*` for `assertEquals`/`assertTrue`/`assertFailsWith`
+instead). Files also carry compiler-internal directive comments at the top
+(`// WITH_STDLIB`, `// DUMP_IR`, `// IGNORE_BACKEND: ...`, `// FILE:
+other.kt` for multi-file tests) — ordinary `//` comments syntactically
+(harmless to ksl's lexer), but several describe things ksl has no
+equivalent of (backend selection, IR dumps) or change the test's actual
+shape (multi-file).
+
+**Audited a sample** (`basics/local_variable.kt`,
+`controlStructures/doWhile.kt`, `functions/defaultargs.kt`) against ksl's
+current feature set and found three concrete blockers common enough to
+matter even for the *simplest* tests, none previously tracked anywhere in
+this document:
+
+1. **No `++`/`--` operators at all** (`lexer.rs`/`token.rs` have no
+   increment/decrement token) — `do x++ while (...)`
+   (`controlStructures/doWhile.kt`) can't even parse. Real Kotlin,
+   low-risk, parser+interpreter-only (mirrors how `+=`/`-=`/etc. already
+   work) — not part of the original 9-feature backlog this document
+   otherwise sequences, so it had no phase of its own until now. **Ships
+   as part of this phase** rather than getting its own phase number: it's
+   what unlocks a meaningful slice of the corpus to even parse, and this
+   is the phase that needs it.
+2. **No property-style bare-field access on any value, including
+   builtins.** `z.length` (String's real Kotlin property, no parens) is
+   legal syntax (`ExprKind::FieldAccess`, Phase 1) but *always* a runtime
+   error today, matching `docs/syntax.md`'s documented rule (fields need
+   classes/objects, i.e. Phase 6). ksl's own stdlib works around this by
+   exposing `length`/`uppercase`/etc. as `.method()` calls instead
+   (`docs/stdlib.md#methods`) — a **permanent, deliberate divergence from
+   real Kotlin syntax**, not a bug: `s.length()` isn't valid Kotlin (real
+   `String.length` is a `val`, no call parens). No upstream test using a
+   bare builtin property runs unmodified before Phase 6.
+3. **`kotlin.test.*` doesn't exist.** `import kotlin.test.*` is Kotlin
+   package-import syntax; ksl's own import is `@file:Import(...)`
+   (`docs/syntax.md`'s "Imports" — different keyword, different grammar
+   position) and doesn't parse it at all, independent of which assertion
+   functions the test calls.
+
+Tests avoiding all three — plain `return "fail"`/`"OK"`, no bare
+properties, only `fun`/`val`/`var`/`if`/`when`/`while`/`for`/`return` over
+`Int`/`Double`/`Boolean`/`String` — are already runnable today, unmodified.
+
+**Vendoring: a curated, hand-picked subset, not a mirror of the whole
+tree.** The upstream corpus is thousands of files covering coroutine
+internals, JVM/JS-backend-specific codegen, and IR-dump sidecars — none of
+which a tree-walking, no-bytecode-backend interpreter has any use for even
+in principle. Pulling the whole tree would mean thousands of permanently
+irrelevant fixtures with no path to ever passing, pure noise against the
+actual goal of testing shipped functionality. Instead:
+
+- `scripts/fetch-kotlin-box-tests.sh` fetches one **pinned upstream commit
+  SHA**, copying a **curated file list** (grouped by subdirectory, kept in
+  the script or a sibling `manifest.txt`) content-verbatim into
+  `crates/ksl-core/tests/kotlin-box/<category>/<name>.ksl` (upstream's own
+  `.kt` extension, renamed to `.ksl` on the way in — see "Shipped" below)
+  — never hand-edited, so a re-fetch stays a clean diff against upstream.
+  Record the pinned SHA and an Apache-2.0 attribution/`NOTICE` file at the
+  vendor root.
+- Start with hand-picked files (not whole directories) from `basics`,
+  `functions`, `controlStructures`, `loops`, `arithmetic`, `elvis`,
+  `binaryOp` that use only already-implemented syntax (see the "avoiding
+  all three" rule above). Grow the list opportunistically per phase from
+  there — Phase 5 unlocks a slice of `exceptions`/`finally`/`try`, Phase 6
+  unlocks `classes`/`dataClasses`, Phase 9 unlocks a slice of `generics` —
+  rather than pre-selecting the eventual full set now.
+- **Explicitly out of scope**: multi-file (`// FILE:`) tests (ksl's own
+  file-import mechanism is semantically different — worth a separate
+  ksl-native test if ever needed, not a reason to adapt these);
+  `coroutines`, `js`, `jvm8`, `klib`, `invokedynamic`,
+  `devirtualization`, `escapeAnalysis`, and other backend-optimization
+  directories (meaningless with no bytecode backend at all); `.ir.txt`
+  sidecar files (compiler-internal, not test input).
+
+**Harness — mirrors the existing example-fixture runner, doesn't invent a
+new execution path.** New `crates/ksl-core/tests/kotlin_box_tests.rs`,
+structurally parallel to `crates/ksl-core/tests/run_examples.rs` (which
+already walks a directory and runs `ksl_core::run_source`, diffing
+stdout): for each vendored `.ksl` file, run it with an in-memory-only
+trailer (`println(box())`, never written back to the vendored file) and
+assert stdout is exactly `"OK\n"`.
+
+**Two-tier layout**, so the suite stays green and useful long before most
+of the corpus can pass: `tests/kotlin-box/` (asserted-passing, part of
+normal `cargo test`) vs. a parallel `tests/kotlin-box-pending/` (vendored
+but not yet promoted). A second, always-green test walks
+`kotlin-box-pending` and only asserts each file **parses** — a much weaker
+bar, still useful signal — printing a pass/fail-reason summary rather than
+a hard assertion, so `cargo test` output shows real progress as more of
+the pending tree becomes promotable. Promotion (moving a file from
+`kotlin-box-pending` to `kotlin-box`) stays a manual per-file step done as
+part of whichever phase's own "Docs/tests" work unblocks it — e.g. Phase
+6's own tests section is the natural place to promote the first batch of
+`classes`/`dataClasses` files — not a separate cleanup pass.
+
+**stdlib additions, from the same audit.** `assertEquals`/`assertTrue`/
+`assertFalse`/`assertNull`/`assertNotNull` can land now — no language
+feature required first: each is a thin wrapper comparing values with the
+existing `values_equal`/`is_truthy` and raising the existing runtime-error
+path on failure (the same pattern `abs`/`sqrt`/etc. already use for
+`arity_error`/`type_error`, `stdlib.rs:122-128`) — the failure just aborts
+the script the way any other runtime error already does. `assertFailsWith`
+specifically needs `Flow::Throw` and waits for Phase 5. Add these to
+`STDLIB_SIGNATURES` + `docs/stdlib.md` per the existing checklist (see
+"Cross-cutting rules" below) — no exception for being test-only, since an
+embedder of `ksl-core` may reasonably want `assertEquals` too.
+
+**Docs:** a short `crates/ksl-core/tests/kotlin-box/README.md` records the
+pinned upstream SHA, the fetch script, the two-tier layout, and the
+promotion workflow above — living next to the vendored files rather than
+duplicated here, so it doesn't go stale.
+
+**Shipped (this initial cut), corrections found during implementation:**
+
+- `++`/`--` landed as planned — both prefix (`++x`/`--x`, evaluates to the
+  *new* value) and postfix (`x++`/`x--`, evaluates to the *old* value),
+  restricted to a bare-name target (same restriction `=`/`+=` already
+  have), sugar over `x = x + 1`/`x = x - 1` reusing the exact
+  `apply_binary`/`Env::assign` path compound assignment already goes
+  through — so it works on `Int` and `Double` locals identically to
+  `+=`/`-=`, with the same mutability/type-mismatch runtime errors.
+- `assertEquals`/`assertTrue`/`assertFalse`/`assertNull`/`assertNotNull`
+  landed as planned, exactly as scoped above (`assertFailsWith` still
+  waits for Phase 5).
+- **A real, previously-undiscovered parser bug was found and fixed by this
+  audit, independent of the three blockers above**: `parse_branch`
+  (`parser.rs`, used for a brace-less `if`/`when` branch) only ever called
+  `parse_expr`, never `parse_stmt` — so `if (cond) return "x"` and
+  `if (cond) continue`, both with no braces, failed to parse at all
+  (`return`/`break`/`continue` are `StmtKind`, not `ExprKind`, in this
+  AST). This is completely ordinary Kotlin (`controlStructures/
+  bottles.ksl`'s vendored sibling `continueInWhile.ksl` uses exactly this
+  shape) and had nothing to do with `++`/`--`/imports — a real, if narrow,
+  correctness gap the box-test audit surfaced simply by trying real
+  upstream code, which is exactly the kind of bug this phase exists to
+  catch early. Fixed by having `parse_branch` delegate to `parse_stmt`
+  instead of hand-rolling an expression-only wrapper; see `docs/syntax.md`
+  ("Control flow", "if"/"when") and `parser.rs`/`interpreter.rs`'s new
+  regression tests.
+- **A fourth, larger gap surfaced by the same audit, deliberately left
+  unaddressed by this phase**: ksl has **no `do { ... } while (cond)`
+  loop** at all — not a smaller "missing operator" fix like `++`/`--`, but
+  a whole new loop construct (new keyword, new `StmtKind`, new parser/
+  interpreter/resolver support) disproportionate to this phase's own
+  scope. Documented in `docs/syntax.md`'s "Not supported" and tracked via
+  `kotlin-box-pending/controlStructures/{doWhile,factorialTest}.ksl` — not
+  yet its own roadmap phase; whoever picks it up next should give it one
+  (dependency-graph position: independent, like `++`/`--` was, no
+  prerequisites beyond Phase 0).
+- **Vendored so far**: 7 active
+  (`controlStructures/{bottles,continueInWhile,ifConst1,kt1899,kt870}.ksl`,
+  `elvis/nullNullOk.ksl`, `basics/concatenation.ksl`) + 4 pending
+  (`controlStructures/{doWhile,factorialTest,kt2147}.ksl`,
+  `basics/local_variable.ksl`), all at pinned SHA
+  `8fc606186b9d2be2bce6b390f7bf12f7cdb41adc` — see
+  `crates/ksl-core/tests/kotlin-box/README.md`'s own table for exactly
+  which gap blocks each pending file.
+- **Vendored files carry a `.ksl` extension on disk, not upstream's own
+  `.kt`** — the fetch script strips `.kt` and appends `.ksl` on the
+  destination path only (the fetch URL still uses real upstream's `.kt`
+  path; content is unchanged). Added after `.kt` files sitting inside this
+  Rust project caused an editor's Kotlin plugin (VS Code, specifically) to
+  pick them up as real Kotlin source and flag every ksl-unsupported
+  construct as an error — `.ksl` routes them to ksl's own tooling instead.
+  See `crates/ksl-core/tests/kotlin-box/README.md`'s "Layout" section.
+- **Superseded**: this bullet originally described stripping a leading
+  `import kotlin.test.*`/`import kotlin.test.<name>` line at the harness
+  level (text-rewriting the vendored file's *effective* content in
+  memory, never the file on disk). Reconsidered almost immediately after
+  shipping — a text-rewrite is a workaround, not real import support, and
+  the vendored corpus needs it too often to leave as a permanent hack. It
+  was replaced outright by real language support:
+  - **`import a.b.*` (wildcard import) is now real syntax**, a general
+    language feature independent of `kotlin.test` — `parser.rs`'s
+    `parse_import_use` grew a `.`-then-`*` lookahead (`Star` is never a
+    legal path segment otherwise), and `ast::ImportUse` gained a
+    `wildcard: bool` (when set, every segment of `path` is the package
+    name — no member position to store, since `*` isn't one). Resolves
+    via a new `Interpreter::resolve_package_members` (the
+    all-members counterpart of the existing single-member
+    `resolve_qualified`) and a new `Env::own_bindings()` (every name
+    defined directly on a scope, not inherited — exactly a package env's
+    own top-level declarations, since a package env is always a direct
+    child of `globals`); `importer.rs`'s `run_program` defines each
+    returned `(name, value)` pair into the importing file's scope.
+    `resolver.rs` can't know a wildcard's actual member set statically
+    (no access to the interpreter's runtime package envs), so — same
+    reasoning as the pre-existing `has_file_imports` leniency — a new
+    `has_wildcard_import` flag suppresses the undefined-name diagnostic
+    file-wide when any wildcard import is present, rather than false-flag
+    every name it legitimately provides.
+  - **`kotlin.test` is now a real, resolvable package** — `Interpreter::new`
+    seeds a synthetic `"kotlin.test"` package env (a child of `globals`,
+    populated from a new `stdlib::KOTLIN_TEST_MEMBERS` list — currently
+    exactly the five `assert*` functions this crate implements) *without*
+    any file ever declaring `package kotlin.test`. This makes all three
+    forms real: `import kotlin.test.*`, `import kotlin.test.assertEquals`
+    (single-symbol import already worked once the package env existed —
+    no parser change needed for that form), and a fully-qualified
+    `kotlin.test.assertEquals(...)` call with no import at all (via the
+    pre-existing `FieldAccess`/`MethodCall` → `resolve_qualified`
+    fallback, unchanged). Importing a `kotlin.test` member not in
+    `KOTLIN_TEST_MEMBERS` (e.g. `assertFailsWith`, which needs
+    `Flow::Throw`/Phase 5) is a plain `undefined name` error — the
+    package is deliberately narrow, not an alias for all of `globals`.
+  - **The harness (`kotlin_box_tests.rs`) went back to doing nothing but
+    append the `println(box())` driver** — `adapt`/its import-stripping
+    logic was deleted outright (renamed to `append_box_driver`), and
+    `basics/concatenation.ksl`'s vendored `import kotlin.test.*` line now
+    runs as genuinely unmodified Kotlin, real import and all.
+  - See `docs/syntax.md`'s "Imports" section for the user-facing
+    documentation of both wildcard import and the `kotlin.test` special
+    case.
 
 ---
 

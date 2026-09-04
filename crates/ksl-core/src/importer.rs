@@ -154,12 +154,21 @@ fn run_program(interp: &mut Interpreter, program: &Program) -> Result<(), Interp
     };
 
     for use_ in &program.imports_use {
-        let value = interp
-            .resolve_qualified(&use_.path, use_.span)
-            .map_err(InterpError::Runtime)?;
-        // Checked by the parser (`parse_import_use`): at least 2 segments.
-        let member_name = use_.path.last().expect("import path has a member segment");
-        target_env.define(member_name, value, false, crate::types::Type::Unknown);
+        if use_.wildcard {
+            let members = interp
+                .resolve_package_members(&use_.path, use_.span)
+                .map_err(InterpError::Runtime)?;
+            for (name, value) in members {
+                target_env.define(&name, value, false, crate::types::Type::Unknown);
+            }
+        } else {
+            let value = interp
+                .resolve_qualified(&use_.path, use_.span)
+                .map_err(InterpError::Runtime)?;
+            // Checked by the parser (`parse_import_use`): at least 2 segments.
+            let member_name = use_.path.last().expect("import path has a member segment");
+            target_env.define(member_name, value, false, crate::types::Type::Unknown);
+        }
     }
 
     run_stmts_in(interp, &program.stmts, &target_env)
@@ -334,6 +343,70 @@ mod tests {
         );
 
         assert_eq!(run_in(&dir, "main.ksl").unwrap(), "Hi, World\n");
+    }
+
+    #[test]
+    fn wildcard_import_brings_every_top_level_name_into_bare_scope() {
+        let dir = TempDir::new("wildcard_import");
+        dir.write(
+            "pkg.ksl",
+            "package a.b\nfun greet(name: String): String = \"Hi, $name\"\nval farewell = \"Bye\"\n",
+        );
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport a.b.*\nprintln(greet(\"World\"))\nprintln(farewell)\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "Hi, World\nBye\n");
+    }
+
+    #[test]
+    fn wildcard_import_of_an_unresolved_package_errors_cleanly() {
+        let dir = TempDir::new("wildcard_import_unresolved");
+        dir.write("main.ksl", "import a.b.*\nprintln(1)\n");
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("unknown package 'a.b'"), "{err}");
+    }
+
+    #[test]
+    fn wildcard_import_of_kotlin_test_resolves_to_ksls_own_assertions() {
+        // `kotlin.test` isn't backed by any loaded file — it's a synthetic
+        // package `Interpreter::new` seeds from `stdlib::KOTLIN_TEST_MEMBERS`
+        // — see that constant's doc comment for why this exists.
+        let dir = TempDir::new("wildcard_kotlin_test");
+        dir.write("main.ksl", "import kotlin.test.*\nassertEquals(4, 2 + 2)\nprintln(\"OK\")\n");
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "OK\n");
+    }
+
+    #[test]
+    fn single_symbol_import_of_kotlin_test_resolves() {
+        let dir = TempDir::new("single_kotlin_test");
+        dir.write("main.ksl", "import kotlin.test.assertTrue\nassertTrue(1 < 2)\nprintln(\"OK\")\n");
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "OK\n");
+    }
+
+    #[test]
+    fn kotlin_test_qualified_call_works_without_any_import() {
+        let dir = TempDir::new("qualified_kotlin_test");
+        dir.write("main.ksl", "kotlin.test.assertEquals(4, 2 + 2)\nprintln(\"OK\")\n");
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "OK\n");
+    }
+
+    #[test]
+    fn importing_an_unknown_kotlin_test_member_is_an_undefined_name_error() {
+        // `assertFailsWith` isn't in `stdlib::KOTLIN_TEST_MEMBERS` (needs
+        // `Flow::Throw`, not implemented until the try/catch phase) — the
+        // synthetic package must reject it like any other unknown member,
+        // not silently accept every name under `kotlin.test`.
+        let dir = TempDir::new("unknown_kotlin_test_member");
+        dir.write("main.ksl", "import kotlin.test.assertFailsWith\nprintln(1)\n");
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("undefined name"), "{err}");
     }
 
     #[test]
