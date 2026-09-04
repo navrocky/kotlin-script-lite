@@ -1,5 +1,5 @@
 use ksl_core::resolver::SymbolKind;
-use ksl_core::stdlib::{BUILTIN_METHOD_SIGNATURES, STDLIB_SIGNATURES};
+use ksl_core::stdlib::BUILTIN_METHOD_SIGNATURES;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
 use crate::analysis::Analysis;
@@ -16,23 +16,31 @@ const KEYWORDS: &[&str] = &[
 /// `text` (needed, alongside `analysis`, to detect a package-qualified
 /// prefix already typed before the cursor — see `dotted_prefix_before_cursor`).
 ///
-/// If the cursor sits right after `a.b.`: when `a.b` is a single bare
-/// identifier that resolves to a local with a statically known type (e.g.
-/// `s` in `s.`, where `s: String`), only that type's builtin methods are
-/// offered — the concrete fix for the bug this filtering exists for
-/// (offering `.length()`/`.uppercase()` after a receiver that obviously
-/// isn't a `String`, e.g. a number). Otherwise (the type is `Unknown`, the
-/// name doesn't resolve, or the prefix has multiple segments and so looks
-/// package-shaped) there's no way to statically tell a local receiver from
-/// a package apart (the same ambiguity `ExprKind::FieldAccess`/`MethodCall`
-/// defer to evaluation time, see `docs/syntax.md`'s "Packages" section), so
-/// both possibilities are offered together: `a.b`'s members if it's a known
-/// package, and every builtin method in case `a.b` is actually a real
-/// receiver value — this over-suggests until classes give real per-type
-/// member info, but never under-suggests. Otherwise (no `.` prefix at all):
-/// locals and outer-scope symbols visible there, every stdlib function,
-/// every known package's full name, and language keywords — merged in that
-/// order (most relevant first).
+/// Inside an in-progress bare `import a.b.c`/`import a.b.*` (see
+/// `import_use_context`): delegates to `package_path_completions` with the
+/// builtin-method fallback disabled — an import path is never a value
+/// expression, so real package members and next-segment names (see that
+/// function's own doc comment) are the only things that can legally follow.
+///
+/// Otherwise, if the cursor sits right after `a.b.`: also
+/// `package_path_completions`, this time with the builtin-method fallback
+/// enabled — when `a.b` is a single bare identifier resolving to a local
+/// with a statically known type (e.g. `s` in `s.`, where `s: String`), only
+/// that type's builtin methods are offered on top of any package match (the
+/// concrete fix for the bug this filtering exists for: offering
+/// `.length()`/`.uppercase()` after a receiver that obviously isn't a
+/// `String`, e.g. a number); otherwise builtin methods are only shown when
+/// `a.b` doesn't match or prefix any known package at all (see
+/// `package_path_completions`'s own doc comment for why — this is what
+/// stops an unrelated `length`/`uppercase`/... from polluting completion
+/// after a real package-qualified prefix like `kotlin.test.` or a real
+/// user package).
+///
+/// Otherwise (no `.` prefix at all): locals and outer-scope symbols visible
+/// there, every stdlib function, every known package's full name (real and
+/// built-in alike — see `package_index`'s module doc comment), package-less
+/// flat cross-file members, and language keywords — merged in that order
+/// (most relevant first).
 pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
@@ -52,6 +60,11 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             FileImportContext::AfterFileColon => import_keyword_completion(),
             FileImportContext::InsidePath(partial) => file_path_completions(&analysis.own_file, &partial),
         };
+    }
+
+    if import_use_context(&up_to_cursor) {
+        let (prefix_path, _partial) = dotted_prefix_before_cursor(&up_to_cursor);
+        return package_path_completions(analysis, &prefix_path, None, false);
     }
 
     if type_position_before_cursor(&up_to_cursor) {
@@ -96,45 +109,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             _ => None,
         };
 
-        let package_name = prefix_path.join(".");
-        let mut items: Vec<CompletionItem> = analysis
-            .packages
-            .members_of(&package_name)
-            .iter()
-            .map(|m| CompletionItem {
-                label: m.symbol.name.clone(),
-                kind: Some(symbol_completion_kind(m.symbol.kind)),
-                detail: Some(m.symbol.signature.clone()),
-                documentation: m.symbol.doc.clone().map(Documentation::String),
-                ..Default::default()
-            })
-            .collect();
-        items.extend(
-            BUILTIN_METHOD_SIGNATURES
-                .iter()
-                .filter(|(recv_ty, ..)| match &receiver_type {
-                    // A `T?` receiver dispatches against `T`'s own builtin
-                    // methods (`String?`'s methods are exactly `String`'s —
-                    // matches Kotlin's safe-call semantics), so unwrap one
-                    // `Nullable` layer before comparing names — otherwise
-                    // `ty.name()` would be e.g. `"String?"`, which never
-                    // matches any table entry (all bare `"String"`), and
-                    // completion on a nullable-typed receiver would wrongly
-                    // suggest nothing instead of falling back to "show
-                    // everything" (that fallback only triggers on `Unknown`).
-                    Some(ksl_core::types::Type::Nullable(inner)) => inner.name() == *recv_ty,
-                    Some(ty) => ty.name() == *recv_ty,
-                    None => true,
-                })
-                .map(|(_, name, signature, doc)| CompletionItem {
-                    label: name.to_string(),
-                    kind: Some(CompletionItemKind::METHOD),
-                    detail: Some(signature.to_string()),
-                    documentation: Some(Documentation::String(doc.to_string())),
-                    ..Default::default()
-                }),
-        );
-        return items;
+        return package_path_completions(analysis, &prefix_path, receiver_type.as_ref(), true);
     }
 
     let line = position.line + 1;
@@ -151,12 +126,12 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         });
     }
 
-    for (name, signature, doc) in STDLIB_SIGNATURES {
+    for sym in ksl_core::stdlib::default_imported_symbols() {
         items.push(CompletionItem {
-            label: name.to_string(),
-            kind: Some(CompletionItemKind::FUNCTION),
-            detail: Some(signature.to_string()),
-            documentation: Some(Documentation::String(doc.to_string())),
+            label: sym.name.to_string(),
+            kind: Some(symbol_completion_kind(sym.kind)),
+            detail: Some(ksl_core::stdlib::format_signature(sym)),
+            documentation: Some(Documentation::String(sym.doc.to_string())),
             ..Default::default()
         });
     }
@@ -234,6 +209,130 @@ fn dotted_prefix_before_cursor(text_before_cursor: &str) -> (Vec<String>, String
     let mut parts: Vec<String> = chunk.split('.').map(String::from).collect();
     let partial = parts.pop().unwrap_or_default();
     (parts, partial)
+}
+
+/// Whether the cursor sits inside an in-progress bare `import a.b.c` /
+/// `import a.b.*` path — never `@file:Import(...)`, which is
+/// `file_import_context`'s job. `import` only ever starts a whole
+/// statement/line (`parser.rs`'s grammar: `parse_import_use` is the entire
+/// statement, nothing else can share its line), so checking the line's own
+/// start is enough — unlike `file_import_context`, no longest-suffix-first
+/// care is needed since there's only one shape to recognize.
+fn import_use_context(up_to_cursor: &str) -> bool {
+    up_to_cursor.trim_start().starts_with("import ")
+}
+
+/// Completions for a dotted-prefix position (`prefix_path` from
+/// `dotted_prefix_before_cursor`) — shared by both `import_use_context` and
+/// the general expression-position dotted-prefix branch in `completion()`.
+/// Entirely generic over *which* package `prefix_path` might name: real
+/// user-declared ones and any built-in one (`kotlin.test`, ...) are both
+/// just entries in `analysis.packages` (see `package_index`'s module doc
+/// comment) — nothing here matches a package name by string.
+///
+/// Always includes:
+/// - every member of `prefix_path`'s package, if it's a fully known one;
+/// - the *next* dotted segment of any known package `prefix_path` is a
+///   strict prefix of (`next_segment_completions` — e.g. prefix `kotlin`
+///   finds package `kotlin.test` and offers `test`; an empty prefix offers
+///   every package's *first* segment, which is exactly what "nothing typed
+///   yet" needs, so no separate empty-prefix case exists here).
+///
+/// `receiver_type`/`allow_builtin_fallback` govern the *only* other
+/// possible source, `BUILTIN_METHOD_SIGNATURES` — real Kotlin's `.`-method
+/// completion, relevant only because `ExprKind::FieldAccess`/`MethodCall`'s
+/// grammar can't tell a package-qualified name from a real value receiver
+/// apart (see that node's own doc comment) — added *only* when
+/// `allow_builtin_fallback` and either `receiver_type` is concretely known
+/// (a resolved local, e.g. `s.` for `s: String` — always single-segment,
+/// so this never conflicts with the package checks above) or nothing
+/// package-shaped was found at all. A known/prefix-matched package name is
+/// a strong enough signal on its own to stop hedging "this might actually
+/// be a value receiver" — this is the general fix for a real, previously
+/// unnoticed bug (confirmed independently by the user across unrelated
+/// package names, not just `kotlin.test`): the old code appended
+/// `BUILTIN_METHOD_SIGNATURES` unconditionally after *any* multi-segment
+/// prefix, even an exact, fully-known package name. `import_use_context`
+/// passes `allow_builtin_fallback: false` unconditionally — an import path
+/// is never a value expression, so that hedge never applies there at all,
+/// regardless of whether the prefix is package-shaped.
+fn package_path_completions(
+    analysis: &Analysis,
+    prefix_path: &[String],
+    receiver_type: Option<&ksl_core::types::Type>,
+    allow_builtin_fallback: bool,
+) -> Vec<CompletionItem> {
+    let package_name = prefix_path.join(".");
+    let mut items: Vec<CompletionItem> =
+        analysis.packages.members_of(&package_name).iter().map(package_member_completion).collect();
+    items.extend(next_segment_completions(analysis, prefix_path));
+
+    let package_shaped = !items.is_empty() || analysis.packages.package_names().any(|n| n == &package_name);
+
+    if allow_builtin_fallback && (receiver_type.is_some() || !package_shaped) {
+        items.extend(builtin_method_completions(receiver_type));
+    }
+    items
+}
+
+/// The next dotted segment of every known package (`analysis.packages`,
+/// real or built-in — see `package_path_completions`) whose own segments
+/// start with `prefix_path` — e.g. `["kotlin"]` finds `kotlin.test` and
+/// yields `test`; `[]` (nothing typed yet) yields every package's first
+/// segment. Lets a multi-segment package name be discovered one segment at
+/// a time, the same way for a real user package and a built-in one.
+fn next_segment_completions(analysis: &Analysis, prefix_path: &[String]) -> Vec<CompletionItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for full in analysis.packages.package_names() {
+        let segments: Vec<&str> = full.split('.').collect();
+        if segments.len() > prefix_path.len()
+            && segments.iter().zip(prefix_path.iter()).all(|(s, p)| s == p)
+        {
+            let next = segments[prefix_path.len()];
+            if seen.insert(next) {
+                items.push(CompletionItem {
+                    label: next.to_string(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    items
+}
+
+fn package_member_completion(m: &crate::package_index::PackageMember) -> CompletionItem {
+    CompletionItem {
+        label: m.symbol.name.clone(),
+        kind: Some(symbol_completion_kind(m.symbol.kind)),
+        detail: Some(m.symbol.signature.clone()),
+        documentation: m.symbol.doc.clone().map(Documentation::String),
+        ..Default::default()
+    }
+}
+
+/// `BUILTIN_METHOD_SIGNATURES`, filtered to `receiver_type` when it's
+/// concretely known (same `Nullable`-unwrapping rule as `hover.rs`'s
+/// identical filter) or offered unfiltered when it's `None` — the
+/// "over-suggest, never under-suggest" hedge described on
+/// `package_path_completions`.
+fn builtin_method_completions(receiver_type: Option<&ksl_core::types::Type>) -> Vec<CompletionItem> {
+    BUILTIN_METHOD_SIGNATURES
+        .iter()
+        .filter(|(recv_ty, ..)| match receiver_type {
+            Some(ksl_core::types::Type::Nullable(inner)) => inner.name() == *recv_ty,
+            Some(ty) => ty.name() == *recv_ty,
+            None => true,
+        })
+        .map(|(_, name, signature, doc)| CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::METHOD),
+            detail: Some(signature.to_string()),
+            documentation: Some(Documentation::String(doc.to_string())),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Whether the cursor sits in type-annotation position: right after a `:`
@@ -884,5 +983,113 @@ mod tests {
             dotted_prefix_before_cursor("println(util.math.sq"),
             (vec!["util".to_string(), "math".to_string()], "sq".to_string())
         );
+    }
+
+    // --- package-qualified completion (built-in and real packages) ---
+    // Regression coverage for the bug reported against `kotlin.test`
+    // completion: every case here is driven purely by `analysis.packages`
+    // (see `package_path_completions`), so a real user package exercises
+    // the exact same code path as the built-in one — nothing here is
+    // `kotlin.test`-specific.
+    //
+    // Each test writes a *complete, valid* line (an in-progress `a.b.`
+    // fails to parse at all — there's no identifier after the last `.` —
+    // same reason `dotted_prefix_before_cursor`'s own doc comment gives)
+    // and places the cursor mid-line, exactly like `completion_after_a_dot_*`
+    // above already does for ordinary `.`-method completion.
+
+    #[test]
+    fn import_kotlin_test_dot_offers_exactly_the_real_members() {
+        let text = "import kotlin.test.assertEquals\n";
+        let names = labels(text, Position::new(0, 19)); // right after "import kotlin.test."
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["assertEquals", "assertFalse", "assertNotNull", "assertNull", "assertTrue"]);
+        assert!(!names.contains(&"length".to_string()), "{names:?}");
+        assert!(!names.contains(&"uppercase".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn import_kotlin_dot_offers_only_the_next_segment() {
+        // `kotlin.*` now names several real built-in packages
+        // (`kotlin.io`, `kotlin.collections`, `kotlin.text`, `kotlin.math`,
+        // `kotlin.test`) — every one of them offers its own next segment,
+        // never a full member name (`println`, `assertEquals`, ...) this
+        // early.
+        let text = "import kotlin.test.assertEquals\n";
+        let mut names = labels(text, Position::new(0, 14)); // right after "import kotlin."
+        names.sort();
+        assert_eq!(names, vec!["collections", "io", "math", "test", "text"]);
+    }
+
+    #[test]
+    fn import_kotlin_test_assert_partial_still_only_offers_real_members() {
+        // The editor does its own client-side filtering by the partial
+        // text (`"assert"` here) — the server always returns the full
+        // candidate list for the resolved context, same as every other
+        // completion source in this file (see the module doc comment).
+        let text = "import kotlin.test.assertEquals\n";
+        let names = labels(text, Position::new(0, 25)); // right after "import kotlin.test.assert"
+        assert!(names.contains(&"assertEquals".to_string()), "{names:?}");
+        assert!(!names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn bare_kotlin_prefix_with_no_dot_finds_kotlin_test_via_package_names() {
+        // The `"kotl"` case: no dot typed yet at all, so this hits the
+        // ordinary no-prefix branch, which already lists every known
+        // package's full name (`analysis.packages.package_names()`) — the
+        // editor's own client-side prefix filter finds `kotlin.test` in
+        // that list. No dedicated code path needed for this case.
+        let text = "kotl\n";
+        let names = labels(text, Position::new(0, 4));
+        assert!(names.contains(&"kotlin.test".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn general_expression_position_kotlin_test_dot_is_also_fixed() {
+        // Same fix, outside of an `import` statement entirely — a bare
+        // `kotlin.test.` in ordinary expression position (e.g. building up
+        // a fully-qualified call) must not show builtin methods either.
+        let text = "fun f() {\n    kotlin.test.assertEquals\n}\n";
+        let names = labels(text, Position::new(1, 16)); // right after "    kotlin.test."
+        assert!(names.contains(&"assertEquals".to_string()), "{names:?}");
+        assert!(!names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_real_multi_segment_user_package_gets_the_same_next_segment_and_filtering() {
+        // Proves the fix is general, not `kotlin.test`-specific: a real
+        // `package a.b` declaration gets identical next-segment discovery
+        // and identical builtin-method suppression.
+        let dir = std::env::temp_dir().join(format!(
+            "ksl_completion_test_real_pkg_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pkg.ksl"), "package a.b\nfun helper(): Int = 1\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let main_text = "@file:Import(\"pkg.ksl\")\nimport a.b.helper\n";
+        std::fs::write(&main_path, main_text).unwrap();
+
+        let analysis = analysis::analyze(main_text, None, &main_path).expect("should parse");
+
+        // `import a.` -> next segment `b`, no builtin-method noise.
+        let names: Vec<String> = completion(&analysis, main_text, Position::new(1, 9))
+            .into_iter()
+            .map(|i| i.label)
+            .collect(); // right after "import a."
+        assert_eq!(names, vec!["b".to_string()], "{names:?}");
+
+        // `import a.b.` -> the package's real member, still no builtin noise.
+        let names2: Vec<String> = completion(&analysis, main_text, Position::new(1, 11))
+            .into_iter()
+            .map(|i| i.label)
+            .collect(); // right after "import a.b."
+        assert!(names2.contains(&"helper".to_string()), "{names2:?}");
+        assert!(!names2.contains(&"length".to_string()), "{names2:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

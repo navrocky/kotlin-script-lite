@@ -1,6 +1,6 @@
 use ksl_core::error::Span;
 use ksl_core::resolver::{Symbol, SymbolKind};
-use ksl_core::stdlib::{BUILTIN_METHOD_SIGNATURES, STDLIB_SIGNATURES};
+use ksl_core::stdlib::BUILTIN_METHOD_SIGNATURES;
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::analysis::Analysis;
@@ -14,7 +14,7 @@ use crate::diagnostics::span_to_range;
 /// `s` is a real local) falls back further to `BUILTIN_METHOD_SIGNATURES`;
 /// finally, a bare name that never resolved to a local symbol at all (this
 /// resolver is single-file, see its module doc comment) falls back to
-/// `STDLIB_SIGNATURES` (`println`, etc.) and then to a package-less
+/// `stdlib::default_imported_symbols()` (`println`, etc.) and then to a package-less
 /// `@file:Import`ed file's flat member (`greet`, brought in unqualified —
 /// see `package_index::PackageIndex::flat_member`).
 pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
@@ -61,8 +61,8 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
     // local symbol, so this is what's left for a stdlib function or a
     // flat cross-file import.
     let name = analysis.resolved.table.name_ref_at(line, col)?;
-    if let Some((_, signature, doc)) = STDLIB_SIGNATURES.iter().find(|(n, ..)| *n == name) {
-        return Some(build_stdlib_function_hover(signature, doc));
+    if let Some(sym) = ksl_core::stdlib::default_imported_symbols().find(|s| s.name == name) {
+        return Some(build_stdlib_function_hover(&ksl_core::stdlib::format_signature(sym), sym.doc));
     }
     let found = analysis.packages.flat_member(name)?;
     Some(build_hover(&found.symbol, None, analysis.is_current))
@@ -340,6 +340,18 @@ mod tests {
         // hover for it.
         let h = hover_at("println(a.b.greet(\"x\"))\n", 1, 14);
         assert!(h.is_none());
+    }
+
+    #[test]
+    fn hover_on_a_fully_qualified_kotlin_test_call_shows_real_signature() {
+        // `kotlin.test` is a synthetic package (`package_index`'s built-in
+        // seeding, from `stdlib::BUILTIN_PACKAGES`) — before that, this hit
+        // exactly the "unknown package" case above (`analysis.packages`
+        // had no idea `kotlin.test` existed) and returned `None` too, even
+        // though `kotlin.test.assertEquals(...)` is real, valid ksl.
+        let h = hover_at("println(kotlin.test.assertEquals(1, 1))\n", 1, 25).expect("should have hover info");
+        let text = markdown_value(&h);
+        assert!(text.contains("assertEquals"), "{text}");
     }
 }
 

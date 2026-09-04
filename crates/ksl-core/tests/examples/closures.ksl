@@ -1,4 +1,6 @@
 // Lambdas as values, closures capturing an outer var, implicit `it`.
+import kotlin.math.*
+
 fun makeCounter(): Int {
     var count = 0
     fun increment(): Int {

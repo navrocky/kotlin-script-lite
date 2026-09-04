@@ -24,18 +24,28 @@ pub struct Interpreter<'a> {
 impl<'a> Interpreter<'a> {
     pub fn new(out: &'a mut dyn std::io::Write) -> Self {
         let globals = Env::new();
-        crate::stdlib::populate_globals(&globals);
         let mut packages = HashMap::new();
-        // Synthetic package, not backed by any loaded file — see
-        // `stdlib::KOTLIN_TEST_MEMBERS`'s doc comment for why this exists
-        // and why it's this narrow.
-        let kotlin_test = globals.child();
-        for name in crate::stdlib::KOTLIN_TEST_MEMBERS {
-            if let Some(v) = globals.get(name) {
-                kotlin_test.define(name, v, false, crate::types::Type::Unknown);
+        // One synthetic package env per `stdlib::STDLIB_PACKAGES` entry —
+        // real Kotlin packages (`kotlin.io`, `kotlin.test`, ...), not
+        // backed by any loaded file. A `default_imported` package's
+        // members are additionally mirrored onto `globals` (same `Value`s,
+        // not copies — `Value::Native`'s `Rc<NativeValue>` is cheap to
+        // clone) so they're visible with no `import` at all, exactly like
+        // real Kotlin auto-importing `kotlin.io`/`kotlin.text`/
+        // `kotlin.collections`/etc. into every file; a non-default-imported
+        // one (`kotlin.math`, `kotlin.test`) stays reachable only via
+        // `import`/full qualification — see `STDLIB_PACKAGES`'s own doc
+        // comment for exactly which is which and why.
+        for pkg in crate::stdlib::STDLIB_PACKAGES {
+            let env = globals.child();
+            (pkg.populate)(&env);
+            if pkg.default_imported {
+                for (name, value) in env.own_bindings() {
+                    globals.define(&name, value, false, crate::types::Type::Unknown);
+                }
             }
+            packages.insert(pkg.name.to_string(), env);
         }
-        packages.insert("kotlin.test".to_string(), kotlin_test);
         Interpreter { globals, out, packages }
     }
 

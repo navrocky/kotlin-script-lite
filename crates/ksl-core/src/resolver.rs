@@ -13,7 +13,7 @@
 //! - Stdlib functions like `println` are never declared in the AST at all
 //!   (they're registered directly into the runtime `Env` by
 //!   `stdlib::populate_globals`), so they're checked against
-//!   `stdlib::STDLIB_SIGNATURES` instead.
+//!   `stdlib::root_symbols()` instead.
 //! - A name brought in by this file's own `import a.b.c` is known
 //!   precisely — `resolve` reads `Program::imports_use` up front — so it's
 //!   never flagged.
@@ -159,7 +159,7 @@ pub struct SymbolTable {
     /// `occurrences` only covers names that *do* resolve locally, so this
     /// is what a caller (`ksl-lsp`'s `hover`/`goto_definition`) falls back
     /// to for everything else — checking the name against
-    /// `stdlib::STDLIB_SIGNATURES` or a cross-file flat index, neither of
+    /// `stdlib::root_symbols()` or a cross-file flat index, neither of
     /// which this single-file resolver knows about itself.
     name_refs: Vec<(Span, String)>,
 }
@@ -1312,6 +1312,98 @@ impl Resolver {
         self.walk_expr_expected(expr, scope, following, None)
     }
 
+    /// Walks every argument of a call (`Call` or a qualified `MethodCall`
+    /// — both share the same `Vec<Arg>` shape), propagating each one's
+    /// expected type (its matching declared parameter, by name if named
+    /// else by position) into `walk_expr_expected` so a lambda argument can
+    /// infer its own parameter types from it (`apply({ x -> x * 2 }, 5)`).
+    /// `signature` is `None` for a callee with no checkable signature at
+    /// all — every argument is still walked (occurrences/diagnostics still
+    /// recorded), just with no expected type propagated. Returns each
+    /// argument's own name (if any) and inferred type, for
+    /// `check_call_signature` below to check against `signature`.
+    fn walk_call_args(
+        &mut self,
+        args: &[Arg],
+        signature: Option<&(Type, Vec<Type>, Vec<String>)>,
+        scope: usize,
+        following: Span,
+    ) -> Vec<(Option<String>, Type)> {
+        let mut arg_infos: Vec<(Option<String>, Type)> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let expected_param_ty = signature.and_then(|(_, param_types, param_names)| {
+                match &a.name {
+                    Some(n) => param_names.iter().position(|p| p == n).and_then(|i| param_types.get(i)),
+                    None => param_types.get(i),
+                }
+            });
+            let t = self.walk_expr_expected(&a.value, scope, following, expected_param_ty);
+            arg_infos.push((a.name.clone(), t));
+        }
+        arg_infos
+    }
+
+    /// Checks already-walked call arguments (`arg_infos`, from
+    /// `walk_call_args`) against `signature`'s declared parameter types —
+    /// shared by `Call` (a bare-name callee) and `MethodCall` (a fully
+    /// package-qualified callee, e.g. `kotlin.test.assertFalse(...)`) so a
+    /// stdlib function gets identical argument checking whichever way it's
+    /// called, matching real Kotlin where both are the same function. Two
+    /// passes, mirroring `call_function`'s own argument-binding algorithm
+    /// exactly: named arguments claim their declared slot first; only then
+    /// are the remaining positional arguments matched, in order, against
+    /// whichever param slots are still unclaimed. `span` is where a
+    /// mismatch diagnostic points — the whole call for `Call`, just the
+    /// method name for `MethodCall` (matching that arm's own existing
+    /// diagnostics). Returns `signature`'s return type, or `Type::Unknown`
+    /// when there's no signature to check against at all.
+    fn check_call_signature(
+        &mut self,
+        arg_infos: &[(Option<String>, Type)],
+        signature: Option<(Type, Vec<Type>, Vec<String>)>,
+        span: Span,
+    ) -> Type {
+        let Some((ret_ty, param_types, param_names)) = signature else {
+            return Type::Unknown;
+        };
+        let mut claimed = vec![false; param_types.len()];
+        for (arg_name, arg_ty) in arg_infos {
+            let Some(pname) = arg_name else { continue };
+            match param_names.iter().position(|n| n == pname) {
+                Some(i) => {
+                    claimed[i] = true;
+                    if let Some(param_ty) = param_types.get(i) {
+                        if *arg_ty != Type::Unknown && *param_ty != Type::Unknown && !types::is_assignable(arg_ty, param_ty) {
+                            self.type_errors.push(RuntimeError::new(
+                                format!("argument '{pname}' has type {}, expected {}", arg_ty.name(), param_ty.name()),
+                                span,
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    self.type_errors.push(RuntimeError::new(format!("unknown parameter '{pname}'"), span));
+                }
+            }
+        }
+        let mut remaining = (0..param_types.len()).filter(|&i| !claimed[i]);
+        for (arg_name, arg_ty) in arg_infos {
+            if arg_name.is_some() {
+                continue;
+            }
+            let Some(i) = remaining.next() else { continue };
+            if let Some(param_ty) = param_types.get(i) {
+                if *arg_ty != Type::Unknown && *param_ty != Type::Unknown && !types::is_assignable(arg_ty, param_ty) {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("argument {} has type {}, expected {}", i + 1, arg_ty.name(), param_ty.name()),
+                        span,
+                    ));
+                }
+            }
+        }
+        ret_ty
+    }
+
     /// Like `walk_expr`, but with an optional "expected type" for `expr`
     /// itself — used only by a `Lambda` at this exact position to infer its
     /// parameter types when it has no explicit annotation of its own (see
@@ -1407,10 +1499,12 @@ impl Resolver {
             }
             ExprKind::MethodCall { receiver, method, method_span, args, safe } => {
                 self.table.method_refs.push((*method_span, method.clone()));
+                let mut qualified_path: Option<Vec<String>> = None;
                 let recv_ty = match self.dotted_path_if_not_local(receiver, scope) {
                     Some(mut path) => {
                         path.push(method.clone());
-                        self.table.qualified_refs.push((expr.span, path));
+                        self.table.qualified_refs.push((expr.span, path.clone()));
+                        qualified_path = Some(path);
                         None
                     }
                     None => Some(self.walk_expr(receiver, scope, following)),
@@ -1418,9 +1512,24 @@ impl Resolver {
                 if let Some(t) = &recv_ty {
                     self.table.method_receiver_types.push((*method_span, t.clone()));
                 }
-                for a in args {
-                    self.walk_expr(&a.value, scope, following);
-                }
+                // A fully package-qualified call to a real stdlib function
+                // (`kotlin.test.assertFalse(...)`) gets the exact same
+                // argument-vs-parameter checking a bare, imported call to
+                // the same function already gets via `ExprKind::Call`'s
+                // `stdlib::stdlib_call_types` — matching real Kotlin, where
+                // both call forms are the same function. `None` here (an
+                // unrecognized qualified path — a typo, or a real cross-
+                // file user package this single-file resolver has no
+                // static visibility into either way) falls through to
+                // `check_call_signature`'s own `None` case below, exactly
+                // preserving today's lenient `Type::Unknown` behavior.
+                let signature = qualified_path.as_ref().and_then(|path| {
+                    crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
+                        let names = vec![String::new(); param_types.len()];
+                        (ret_ty, param_types, names)
+                    })
+                });
+                let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
                 // An unsafe (`.`) call on a still-nullable receiver is
                 // rejected outright, matching Kotlin's own compile error —
                 // see the identical check in `FieldAccess` above. Never
@@ -1470,7 +1579,14 @@ impl Resolver {
                                 Type::Unknown
                             }
                         }
-                        None => Type::Unknown,
+                        // The qualified-path case (`kotlin.test.assertFalse(...)`):
+                        // `signature` is `Some` exactly when the path
+                        // resolved to a real stdlib member above, in which
+                        // case this both checks `arg_infos` against it and
+                        // returns its real return type — `None` (unknown
+                        // qualified path) falls back to `Type::Unknown`,
+                        // unchanged from before this check existed.
+                        None => self.check_call_signature(&arg_infos, signature, *method_span),
                     }
                 };
                 // A safe (`?.`) call's own result is nullable whenever it
@@ -1598,7 +1714,7 @@ impl Resolver {
 
                 // A checkable signature comes from either a local `fun`
                 // symbol or a stdlib function with a known machine-
-                // readable signature (`STDLIB_SIGNATURES`'s own signature
+                // readable signature (a `BuiltinSymbol`'s own signature
                 // field is a free-text display string, not this). Stdlib
                 // params have no real names to match a named argument
                 // against (`String::new()` placeholders — any named-arg
@@ -1645,23 +1761,7 @@ impl Resolver {
                     _ => None,
                 };
 
-                let mut arg_infos: Vec<(Option<String>, Type)> = Vec::with_capacity(args.len());
-                for (i, a) in args.iter().enumerate() {
-                    // Matched by name if the argument is named, else by
-                    // position — a best-effort lookup only for the purpose
-                    // of expected-type propagation into a lambda argument;
-                    // the real named-vs-positional argument *checking*
-                    // below (once `arg_infos` is filled in) does its own,
-                    // more careful two-pass matching.
-                    let expected_param_ty = signature.as_ref().and_then(|(_, param_types, param_names)| {
-                        match &a.name {
-                            Some(n) => param_names.iter().position(|p| p == n).and_then(|i| param_types.get(i)),
-                            None => param_types.get(i),
-                        }
-                    });
-                    let t = self.walk_expr_expected(&a.value, scope, following, expected_param_ty);
-                    arg_infos.push((a.name.clone(), t));
-                }
+                let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
 
                 // `abs`/`max`/`min` are numeric-polymorphic (their return
                 // type mirrors whichever numeric type the caller actually
@@ -1680,71 +1780,7 @@ impl Resolver {
                     }
                 }
 
-                match signature {
-                    Some((ret_ty, param_types, param_names)) => {
-                        // Two passes, mirroring `call_function`'s own
-                        // argument-binding algorithm exactly: named
-                        // arguments claim their declared slot first: only
-                        // then are the remaining positional arguments
-                        // matched, in order, against whichever param slots
-                        // are still unclaimed.
-                        let mut claimed = vec![false; param_types.len()];
-                        for (arg_name, arg_ty) in &arg_infos {
-                            let Some(pname) = arg_name else { continue };
-                            match param_names.iter().position(|n| n == pname) {
-                                Some(i) => {
-                                    claimed[i] = true;
-                                    if let Some(param_ty) = param_types.get(i) {
-                                        if *arg_ty != Type::Unknown
-                                            && *param_ty != Type::Unknown
-                                            && !types::is_assignable(arg_ty, param_ty)
-                                        {
-                                            self.type_errors.push(RuntimeError::new(
-                                                format!(
-                                                    "argument '{pname}' has type {}, expected {}",
-                                                    arg_ty.name(),
-                                                    param_ty.name()
-                                                ),
-                                                expr.span,
-                                            ));
-                                        }
-                                    }
-                                }
-                                None => {
-                                    self.type_errors.push(RuntimeError::new(
-                                        format!("unknown parameter '{pname}'"),
-                                        expr.span,
-                                    ));
-                                }
-                            }
-                        }
-                        let mut remaining = (0..param_types.len()).filter(|&i| !claimed[i]);
-                        for (arg_name, arg_ty) in &arg_infos {
-                            if arg_name.is_some() {
-                                continue;
-                            }
-                            let Some(i) = remaining.next() else { continue };
-                            if let Some(param_ty) = param_types.get(i) {
-                                if *arg_ty != Type::Unknown
-                                    && *param_ty != Type::Unknown
-                                    && !types::is_assignable(arg_ty, param_ty)
-                                {
-                                    self.type_errors.push(RuntimeError::new(
-                                        format!(
-                                            "argument {} has type {}, expected {}",
-                                            i + 1,
-                                            arg_ty.name(),
-                                            param_ty.name()
-                                        ),
-                                        expr.span,
-                                    ));
-                                }
-                            }
-                        }
-                        ret_ty
-                    }
-                    None => Type::Unknown,
-                }
+                self.check_call_signature(&arg_infos, signature, expr.span)
             }
             ExprKind::Lambda { params, body } => self.walk_lambda(expr, params, body, scope, following, expected),
             ExprKind::If { cond, then_branch, else_branch } => {
@@ -2324,6 +2360,38 @@ mod tests {
         let result = resolve_src(src);
         assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
         assert!(result.type_errors[0].message.contains("argument 'b' has type String, expected Int"));
+    }
+
+    /// Regression test: a fully package-qualified stdlib call
+    /// (`kotlin.test.assertFalse(...)`, parsed as `ExprKind::MethodCall`,
+    /// not `ExprKind::Call`) used to skip argument type-checking entirely —
+    /// only the bare, imported form (`assertFalse(...)`) was checked. Both
+    /// forms must now be flagged identically.
+    #[test]
+    fn qualified_stdlib_call_argument_type_mismatch_is_flagged() {
+        let src = "kotlin.test.assertFalse(true == false, 123)\n";
+        let result = resolve_src(src);
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected String"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn qualified_stdlib_call_with_correct_argument_types_is_not_flagged() {
+        let src = "kotlin.test.assertFalse(true == false, \"msg\")\nkotlin.io.println(5)\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn qualified_call_under_the_wrong_stdlib_package_is_not_falsely_checked() {
+        // `assertFalse` is a real member of `kotlin.test`, not `kotlin.math`
+        // — this must resolve to `Type::Unknown` (today's existing lenient
+        // behavior for an unrecognized qualified path), not incorrectly
+        // reuse `kotlin.test.assertFalse`'s signature just because the
+        // trailing name matches.
+        let src = "kotlin.math.assertFalse(true, 123)\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 
     #[test]

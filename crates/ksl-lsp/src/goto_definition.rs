@@ -31,11 +31,20 @@ pub fn goto_definition(analysis: &Analysis, uri: &Url, position: Position) -> Op
 
     if let Some((_, path)) = analysis.resolved.table.qualified_ref_at(line, col) {
         let (package, member) = path.split_at(path.len() - 1);
+        // A built-in package member (e.g. `kotlin.test.assertEquals`) has
+        // no source file to jump to — `found.file` is `None`, same as a
+        // plain (non-package) stdlib function already is for this
+        // function's "last resort" branch below (see that branch's own
+        // comment). Falls through rather than returning `None` outright,
+        // matching this whole `if let` already not returning on a `find`
+        // miss either.
         if let Some(found) = analysis.packages.find(&package.join("."), &member[0]) {
-            return Some(GotoDefinitionResponse::Scalar(Location {
-                uri: found.file.clone(),
-                range: span_to_range(found.symbol.def_span),
-            }));
+            if let Some(uri) = &found.file {
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range: span_to_range(found.symbol.def_span),
+                }));
+            }
         }
     }
 
@@ -44,8 +53,9 @@ pub fn goto_definition(analysis: &Analysis, uri: &Url, position: Position) -> Op
     // the stdlib case (a stdlib function has no source location to jump to).
     let name = analysis.resolved.table.name_ref_at(line, col)?;
     let found = analysis.packages.flat_member(name)?;
+    let uri = found.file.clone()?;
     Some(GotoDefinitionResponse::Scalar(Location {
-        uri: found.file.clone(),
+        uri,
         range: span_to_range(found.symbol.def_span),
     }))
 }
@@ -152,6 +162,27 @@ mod tests {
         let a = analysis::analyze(text, None, &main_path).expect("should parse");
         let uri = uri_for(&main_path);
         assert!(goto_definition(&a, &uri, Position::new(0, 16)).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goto_definition_on_a_built_in_package_member_stays_none() {
+        // `kotlin.test.assertEquals` is a real, resolvable qualified
+        // reference (`package_index`'s built-in seeding), but has no
+        // source file to jump to — must return `None`, not a broken URI
+        // (`PackageMember::file` is `None` for it; see that field's own
+        // doc comment), and must not panic.
+        let dir = temp_dir("builtin_no_location");
+        let main_path = dir.join("main.ksl");
+        let text = "println(kotlin.test.assertEquals(1, 1))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        let uri = uri_for(&main_path);
+        // "println(kotlin.test." is 21 chars, so "assertEquals" starts at
+        // column 22 (0-based 21).
+        assert!(goto_definition(&a, &uri, Position::new(0, 25)).is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

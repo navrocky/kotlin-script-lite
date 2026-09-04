@@ -11,20 +11,36 @@
 //! silently skipped rather than surfaced as an error — an editor still
 //! wants hover/completion to work for everything that *does* resolve, even
 //! if one import is currently broken.
+//!
+//! Also seeds every package `ksl_core::stdlib::STDLIB_PACKAGES` describes
+//! (`kotlin.io`, `kotlin.text`, `kotlin.math`, `kotlin.test`, ...) —
+//! generically, by iterating that table, never by matching a package name
+//! here (every stdlib symbol belongs to a real, named package there, no
+//! flat/root special case). This is what makes a built-in package
+//! indistinguishable, to every consumer of this index
+//! (`completion`/`hover`/`goto_definition`), from a real user-declared
+//! one: neither this module nor any of them special-cases any package name
+//! anywhere.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use ksl_core::ast::Program;
+use ksl_core::error::Span;
 use ksl_core::resolver::{self, Symbol};
+use ksl_core::types::Type;
 use tower_lsp::lsp_types::Url;
 
 /// One package member: a top-level `fun`/`val`/`var` declared in some
-/// `package`-declaring file, plus which file it came from (for goto-def).
+/// `package`-declaring file, plus which file it came from (for goto-def) —
+/// or a built-in package's member (see the module doc comment), which has
+/// no source file at all, hence `Option`: `None` here means the same thing
+/// `goto_definition.rs` already means by "a stdlib function has no source
+/// location to jump to" for a plain (non-package) stdlib function.
 pub struct PackageMember {
     pub symbol: Symbol,
-    pub file: Url,
+    pub file: Option<Url>,
 }
 
 #[derive(Default)]
@@ -80,6 +96,23 @@ impl PackageIndex {
 /// literal (uncanonicalized) parent directory.
 pub fn build_package_index(program: &Program, own_file: &Path) -> PackageIndex {
     let mut index = PackageIndex::default();
+
+    // Built-ins first, unconditionally, independent of `program`/`own_file`
+    // entirely — see the module doc comment. Every package is indexed the
+    // same way, `default_imported` or not — a bare (default-imported)
+    // stdlib function is *also* handled separately, by
+    // `ksl-lsp::completion`/`hover`'s own
+    // `stdlib::default_imported_symbols()` calls, so it's reachable both
+    // unqualified and fully qualified, matching real Kotlin.
+    for pkg in ksl_core::stdlib::STDLIB_PACKAGES {
+        for sym in pkg.symbols {
+            index.members.entry(pkg.name.to_string()).or_default().push(PackageMember {
+                symbol: builtin_symbol(sym),
+                file: None,
+            });
+        }
+    }
+
     let mut visited = HashSet::new();
     let base_dir = own_file.parent().unwrap_or_else(|| Path::new("."));
     let own_canonical = fs::canonicalize(own_file).ok();
@@ -88,6 +121,29 @@ pub fn build_package_index(program: &Program, own_file: &Path) -> PackageIndex {
     }
     index_program(program, base_dir, &mut index, &mut visited, own_canonical.as_deref(), true);
     index
+}
+
+/// A `Symbol` for a built-in package member, with no real declaration site
+/// to speak of — `def_span`/`ty`/`return_type`/`param_types`/`param_names`
+/// all take the same "nothing more precise to say" defaults `ksl-core`
+/// itself uses for a `Value::Native`'s own unknowable signature (see
+/// `types::Type::from_value`'s `Value::Native` arm). `kind` is carried
+/// through from `stdlib::BuiltinSymbol` rather than hardcoded — every entry
+/// today is `SymbolKind::Fun`, but this needs no change if that ever stops
+/// being true.
+fn builtin_symbol(sym: &ksl_core::stdlib::BuiltinSymbol) -> Symbol {
+    Symbol {
+        name: sym.name.to_string(),
+        kind: sym.kind,
+        def_span: Span::default(),
+        mutable: false,
+        signature: ksl_core::stdlib::format_signature(sym),
+        ty: Type::Function(Vec::new(), Box::new(Type::Unknown)),
+        return_type: Type::Unknown,
+        param_types: Vec::new(),
+        param_names: Vec::new(),
+        doc: Some(sym.doc.to_string()),
+    }
 }
 
 fn index_program(
@@ -110,7 +166,7 @@ fn index_program(
                 for symbol in resolved.table.top_level_symbols() {
                     index.members.entry(package_name.clone()).or_default().push(PackageMember {
                         symbol: symbol.clone(),
-                        file: file.clone(),
+                        file: Some(file.clone()),
                     });
                 }
             }
@@ -128,7 +184,7 @@ fn index_program(
                 for symbol in resolved.table.top_level_symbols() {
                     index.flat.entry(symbol.name.clone()).or_default().push(PackageMember {
                         symbol: symbol.clone(),
-                        file: file.clone(),
+                        file: Some(file.clone()),
                     });
                 }
             }
@@ -201,6 +257,45 @@ mod tests {
     }
 
     #[test]
+    fn build_package_index_always_seeds_built_in_packages() {
+        // Independent of any real file at all — even a script with no
+        // `package`/`@file:Import` whatsoever still has `kotlin.test`
+        // indexed, generically, from `stdlib::STDLIB_PACKAGES`.
+        let dir = TempDir::new("builtin_only");
+        dir.write("main.ksl", "println(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.package_names().any(|n| n == "kotlin.test"));
+        let names: Vec<&str> = index.members_of("kotlin.test").iter().map(|m| m.symbol.name.as_str()).collect();
+        assert!(names.contains(&"assertEquals"));
+        assert!(names.contains(&"assertTrue"));
+        assert!(names.contains(&"assertFalse"));
+        assert!(names.contains(&"assertNull"));
+        assert!(names.contains(&"assertNotNull"));
+    }
+
+    #[test]
+    fn built_in_package_members_have_no_file() {
+        let dir = TempDir::new("builtin_no_file");
+        dir.write("main.ksl", "println(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        let found = index.find("kotlin.test", "assertEquals").expect("assertEquals should be indexed");
+        assert!(found.file.is_none());
+    }
+
+    #[test]
+    fn a_real_packages_members_are_unaffected_by_built_in_seeding() {
+        let dir = TempDir::new("real_package_unaffected");
+        dir.write("pkg.ksl", "package a.b\nfun helper(): Int = 1\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert_eq!(index.members_of("a.b").len(), 1);
+        assert!(index.members_of("a.b")[0].file.is_some());
+    }
+
+    #[test]
     fn indexes_a_directly_imported_package() {
         let dir = TempDir::new("direct");
         dir.write("pkg.ksl", "package util.math\nfun square(x: Int): Int = x * x\n");
@@ -237,7 +332,10 @@ mod tests {
         dir.write("main.ksl", "@file:Import(\"nope.ksl\")\nprintln(1)\n");
 
         let index = build(&dir, "main.ksl"); // must not panic
-        assert!(index.package_names().next().is_none());
+        // No *real* user package — only the built-ins every index carries
+        // regardless of the program indexed (see `missing_or_broken_import`'s
+        // sibling test `build_package_index_always_seeds_built_in_packages`).
+        assert!(index.members_of("a.b").is_empty());
     }
 
     #[test]

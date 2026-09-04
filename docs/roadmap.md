@@ -82,6 +82,13 @@ Decisions already made that shape this plan:
   than waiting until the end, and to keep growing opportunistically as
   each later phase lands real syntax the corpus needs. See Phase 0.5's own
   section.
+- **ksl's numeric types don't yet match real Kotlin's widths/set** — its
+  `Int` is actually 64-bit (documented as `i64` in `docs/syntax.md`, but
+  that's what real Kotlin calls `Long`), and `Long`/`Float`/`Byte`/`Short`/
+  `Char` don't exist at all. Recorded as its own **Phase 2.3, audit only —
+  no implementation** (found via the same session that fixed `kotlin.math`'s
+  overload signatures; see that phase's own section for the full findings
+  and open questions).
 
 ## Dependency order
 
@@ -97,6 +104,9 @@ Phase 1: `.` postfix member-access syntax  <-- blocks 6, 7, 8
    v
 Phase 2: static & runtime type system  <-- needs Phase 1 (type-aware completion hooks into MethodCall)
    |
+   +--> Phase 2.3: numeric type width fix + missing primitives
+   |    (Byte/Short/Long/Float/Char) [audit only, not implemented —
+   |    independent side-track, like Phase 0.5, never gates anything below)
    v
 Phase 4: null-safety (Value::Null, ?, ?., ?:, !!)   [DONE]
    |
@@ -397,16 +407,17 @@ duplicated here, so it doesn't go stale.
     every name it legitimately provides.
   - **`kotlin.test` is now a real, resolvable package** — `Interpreter::new`
     seeds a synthetic `"kotlin.test"` package env (a child of `globals`,
-    populated from a new `stdlib::KOTLIN_TEST_MEMBERS` list — currently
-    exactly the five `assert*` functions this crate implements) *without*
-    any file ever declaring `package kotlin.test`. This makes all three
-    forms real: `import kotlin.test.*`, `import kotlin.test.assertEquals`
+    populated by a new `stdlib::populate_kotlin_test` from a new
+    `stdlib::KOTLIN_TEST_SIGNATURES` table — currently exactly the five
+    `assert*` functions this crate implements) *without* any file ever
+    declaring `package kotlin.test`. This makes all three forms real:
+    `import kotlin.test.*`, `import kotlin.test.assertEquals`
     (single-symbol import already worked once the package env existed —
     no parser change needed for that form), and a fully-qualified
     `kotlin.test.assertEquals(...)` call with no import at all (via the
     pre-existing `FieldAccess`/`MethodCall` → `resolve_qualified`
     fallback, unchanged). Importing a `kotlin.test` member not in
-    `KOTLIN_TEST_MEMBERS` (e.g. `assertFailsWith`, which needs
+    `KOTLIN_TEST_SIGNATURES` (e.g. `assertFailsWith`, which needs
     `Flow::Throw`/Phase 5) is a plain `undefined name` error — the
     package is deliberately narrow, not an alias for all of `globals`.
   - **The harness (`kotlin_box_tests.rs`) went back to doing nothing but
@@ -417,6 +428,263 @@ duplicated here, so it doesn't go stale.
   - See `docs/syntax.md`'s "Imports" section for the user-facing
     documentation of both wildcard import and the `kotlin.test` special
     case.
+- **Corrected after a user report, right after the above shipped**: the
+  first cut of the `kotlin.test` package env aliased values already
+  registered on `globals` (`populate_globals` itself called
+  `register(env, "assertEquals", ...)` etc.) — meaning the five assertions
+  were *also* plain unqualified globals, callable as bare
+  `assertEquals(...)` with **no** `import kotlin.test.*`/qualification at
+  all. Flagged as wrong: real Kotlin's `kotlin.test` needs an explicit
+  import (it isn't one of the packages Kotlin auto-imports), so ksl
+  silently accepting the unqualified form both polluted the root scope
+  with test-only names and didn't actually exercise the new import
+  machinery the way a real vendored box test does. Fixed by moving the
+  five `register(...)` calls out of `populate_globals` into a new
+  `stdlib::populate_kotlin_test(env: &Env)`, called only on the synthetic
+  `"kotlin.test"` package env, never on `globals` — and moving their
+  entries out of `STDLIB_SIGNATURES` (which feeds `is_known`, the "is this
+  bare name legitimately global" check `resolver.rs`'s `resolve_name`
+  uses) into the new, separate `KOTLIN_TEST_SIGNATURES`. A bare
+  `assertEquals(...)` with nothing importing it now correctly surfaces
+  `undefined name 'assertEquals'`, both at runtime (`Env::get` finds
+  nothing on `globals`) and statically (`is_known` no longer matches it,
+  so `resolve_name` falls through to the same diagnostic any other typo
+  gets, unless `imported_names`/`has_wildcard_import` says otherwise).
+  `stdlib_call_types` (argument/return-type checking) still recognizes
+  these five names unconditionally — safe to leave as-is, since it only
+  ever runs *after* `walk_expr(callee)` has already resolved-or-rejected
+  the bare name itself, so it can't make an unimported call resolve, only
+  give a *properly imported* one real argument-type checking instead of
+  falling back to `Unknown`. `docs/stdlib.md`'s "Assertions" section and
+  `docs/syntax.md`'s `kotlin.test` paragraph corrected to match.
+- **A second, separate user-reported bug, this time in `ksl-lsp` (not
+  `ksl-core`) — also found and fixed the same session**: `ksl-lsp`'s
+  cross-file `PackageIndex` (`crates/ksl-lsp/src/package_index.rs`) only
+  ever indexed real `package`-declaring `.ksl` files, with no concept of
+  `kotlin.test` at all — so completion/hover/goto-definition on
+  `kotlin.test.*` all silently failed in an editor, independent of
+  `ksl-core`'s own (correct) runtime resolution. A first attempt patched
+  this by special-casing the literal strings `"kotlin"`/`"kotlin.test"`
+  directly inside `completion.rs` — rejected by the user as non-systemic,
+  and for good reason: it also surfaced a **real, general, pre-existing**
+  bug unrelated to `kotlin.test` — `completion.rs`'s dotted-prefix branch
+  unconditionally appended every `BUILTIN_METHOD_SIGNATURES` entry
+  (`length`/`uppercase`/...) after *any* multi-segment prefix, even one
+  that exactly matched a fully-known real package (confirmed by the user
+  against arbitrary package names, not just `kotlin.test`). Fixed
+  generically instead:
+  - New `stdlib::BUILTIN_PACKAGES: &[(&str, stdlib::Signatures)]` — the
+    single, data-only source of truth for "which packages ksl's stdlib
+    itself provides" (currently one entry, `("kotlin.test",
+    KOTLIN_TEST_SIGNATURES)"`); a future built-in package needs only a new
+    entry here, nothing in `ksl-lsp`.
+  - `package_index::build_package_index` now generically seeds every
+    `BUILTIN_PACKAGES` entry into the same `PackageIndex` real files
+    populate — iterating the table, never matching a name — via a new
+    `builtin_symbol` helper synthesizing a `resolver::Symbol` with no real
+    declaration site. `PackageMember::file` became `Option<Url>` (`None`
+    for a built-in member — "no source location", the same thing a plain
+    stdlib function already means for `goto_definition.rs`'s pre-existing
+    fallback); `goto_definition.rs` updated to treat that as "nothing to
+    jump to" rather than a broken URI.
+  - `completion.rs`'s ad-hoc `import_use_completions` was deleted and
+    replaced by one generic `package_path_completions`, shared by both
+    `import_use_context` and the general expression-position dotted-prefix
+    branch: real package members (`analysis.packages.members_of`, real or
+    built-in, no distinction) plus a new `next_segment_completions`
+    (generic hierarchical prefix matching — `kotlin` finds `kotlin.test`
+    and offers `test`; an empty prefix offers every package's first
+    segment, so "nothing typed after `import `" needs no special case
+    either) plus `BUILTIN_METHOD_SIGNATURES` *only* when nothing
+    package-shaped matched at all (or a concretely resolved local's own
+    type — preserves the original single-segment-local behavior exactly).
+    This is the general fix for the pre-existing bug above, for *every*
+    package, not just `kotlin.test`.
+  - Regression coverage deliberately includes a real, declared
+    multi-segment user package (`a.b`) exercising the identical code path,
+    proving the fix isn't `kotlin.test`-specific.
+- **A third round of user feedback, same session, on `ksl-core::stdlib`'s
+  own internal shape rather than `ksl-lsp`**: after the fix above, the
+  user asked why new stdlib functions don't automatically show up
+  wherever `kotlin.test` does, and why `is_known` only consulted one of
+  several separately hand-maintained lists (`STDLIB_SIGNATURES` for the
+  flat root scope, `KOTLIN_TEST_SIGNATURES` for `kotlin.test`,
+  `BUILTIN_PACKAGES` wrapping only the latter — the root scope wasn't in
+  it at all). Their proposed shape: one list of `Package { packageName,
+  [Symbol { name, type, ... }] }`. Adopted, with the flat root scope
+  itself modeled as `""`-named package inside the same list rather than a
+  separate parallel const:
+  - `stdlib.rs` gained `BuiltinSymbol { name, kind: SymbolKind, signature,
+    doc }` (reusing `resolver::SymbolKind` rather than inventing a
+    parallel one — every entry is `SymbolKind::Fun` today, since ksl has
+    no stdlib `val`/`var` constants and no classes/interfaces yet, but
+    needs no shape change whenever that stops being true) and
+    `BuiltinPackage { name, symbols }`, and one `STDLIB_PACKAGES: &[BuiltinPackage]`
+    replacing all three old consts and the `Signatures` type alias
+    outright. `resolver::Symbol` itself isn't `const`-constructible
+    (owned `String`/`Vec`/`Box` fields), which is why `BuiltinSymbol`
+    stays plain `&'static str` fields rather than literally being a
+    `Symbol` — converted to one on demand where a real `Symbol` is
+    actually needed (`package_index::builtin_symbol`, which now takes the
+    `kind` from the table instead of hardcoding `SymbolKind::Fun`).
+  - `is_known` and a new `stdlib::root_symbols()` (for `ksl-lsp`'s two
+    former direct `STDLIB_SIGNATURES` consumers) both read *only* the
+    `""`-named package — preserves the previous round's namespace-
+    pollution fix exactly (a bare `assertEquals(...)` must still be
+    `undefined name`, not suddenly "known" just because the tables merged).
+  - `package_index.rs`'s built-in seeding now iterates
+    `STDLIB_PACKAGES.iter().filter(|p| !p.name.is_empty())` — the `""`
+    entry is deliberately excluded there (it isn't a real navigable
+    package to `import`), one filter instead of a second hand-maintained
+    list.
+  - `BUILTIN_METHOD_SIGNATURES` (the `.`-method table, `"x".uppercase()`
+    etc.) was deliberately **not** folded in — it dispatches by the
+    *receiver's type*, not by package/namespace, a genuinely different
+    lookup axis from everything else here (already documented as a
+    deliberate duplication in `docs/stdlib.md#methods`).
+  - At the time, described as a pure internal refactor with no behavior
+    change — **superseded almost immediately by a fourth round of
+    feedback, same session**, which corrected that framing itself: see
+    below.
+- **A fourth round, on the `""` root-package sentinel the previous round
+  introduced**: the user rejected it outright — real Kotlin has no such
+  thing as an unqualified "root scope" distinct from packages; `println`
+  is genuinely `kotlin.io.println`, and it's callable bare only because
+  `kotlin.io` is one of several packages the compiler **auto-imports**
+  into every file (`kotlin.io`, `kotlin.collections`, `kotlin.text`, and
+  others ksl has no stdlib symbols in yet — `kotlin`, `kotlin.annotation`,
+  `kotlin.comparisons`, `kotlin.sequences`); `kotlin.math` and
+  `kotlin.test` are real packages too, just **not** on that auto-import
+  list, so `kotlin.math.abs(...)`/`kotlin.io.println(...)` should both be
+  valid fully-qualified calls either way. Adopted in full — this is *not*
+  a pure internal refactor, it's a deliberate behavior change:
+  - `BuiltinPackage` gained `default_imported: bool` and a `populate: fn(&Env)`
+    field (a function *pointer* right on the table entry, so
+    `Interpreter::new` can build every package's env and default-import
+    the right ones with one generic loop, instead of a hardcoded call per
+    package); the `""` sentinel is gone — `STDLIB_PACKAGES` now has five
+    entries, all real names: `kotlin.io`/`kotlin.collections`/`kotlin.text`
+    (`default_imported: true`) and `kotlin.math`/`kotlin.test`
+    (`default_imported: false`). `populate_globals` (one function for
+    everything) was split into `populate_kotlin_io`/`_collections`/`_text`/
+    `_math` (plus the already-existing `populate_kotlin_test`) — same
+    `register(...)` calls, just grouped by package, moved verbatim.
+  - `Interpreter::new` now loops over `STDLIB_PACKAGES`: builds each
+    package's own child `Env` via its `populate` fn (so
+    `kotlin.math.abs(...)`/`kotlin.io.println(...)`-style full
+    qualification works for *every* package, not just `kotlin.test` as
+    before), and for `default_imported` ones only, additionally mirrors
+    the same `Value`s onto `globals` (`Env::own_bindings()`, already added
+    earlier this session) — one `Rc`-cheap clone per name, not a second
+    copy of any closure.
+  - `is_known`/former `root_symbols()` (renamed `default_imported_symbols()`)
+    now union every `default_imported` package instead of reading one
+    special-cased entry.
+  - `package_index.rs`'s built-in seeding **lost** its `.filter(|p|
+    !p.name.is_empty())` entirely — every package is real now, so every
+    one is indexed identically, no exclusion needed. Net simplification,
+    not added complexity.
+  - **Real, deliberate behavior change, confirmed with the user in
+    Plan Mode before implementing**: `kotlin.math` not being
+    auto-imported means `abs`/`sqrt`/`max`/`min` stop working unqualified
+    — exactly like real Kotlin. `crates/ksl-core/tests/examples/closures.ksl`
+    (the one place in this repo actually calling them bare) got an `import
+    kotlin.math.*` added; `docs/stdlib.md`'s Math section documents the
+    same requirement.
+  - Regression tests added generically over the whole table (loop over
+    `STDLIB_PACKAGES`, not one hand-written test per package): every
+    declared symbol is actually registered by its own package's
+    `populate`; `default_imported_symbols()`/`is_known` matches
+    `default_imported` exactly; a real `Interpreter`'s `globals` mirrors
+    exactly the default-imported packages, nothing else.
+- **A fifth round, on `kotlin.math`'s own signatures specifically**: the
+  user (having started hand-editing `stdlib.rs`'s signature strings
+  directly, adding `fun`/explicit return types elsewhere) pointed out
+  `"fun abs(x: Int | Double): Int | Double"` uses a union-type syntax that
+  doesn't exist in real Kotlin — real Kotlin solves exactly this with
+  **overloading** (several same-named functions, each with one concrete
+  signature). Fixed by splitting each of `abs`/`sqrt`/`max`/`min` into two
+  separate `BuiltinSymbol` entries (one `Int`, one `Double`) sharing one
+  `name` — needed no shape change to `BuiltinSymbol`/`BuiltinPackage`
+  at all: `symbols: &'static [BuiltinSymbol]` never assumed unique names
+  to begin with, and `populate_kotlin_math`'s actual runtime closures
+  already dispatch on the real `Value` variant they're given (that dynamic
+  dispatch *is* the overload resolution, at the one layer that actually
+  executes code) — only the display metadata was ever collapsed into one
+  fake union-typed entry. Confirmed every consumer tolerates a repeated
+  `name` within one package's `symbols` (audited, not just assumed):
+  `is_known`/`default_imported_symbols` (`.any()`/iteration, unaffected by
+  duplicates), `package_index.rs`'s built-in seeding (both overloads get
+  indexed as separate `PackageMember`s — correct for completion, which
+  should show both; `find()`'s first-match-only behavior means
+  hover/goto-def on a `kotlin.math` qualified call shows only the first
+  overload — an accepted, pre-existing-style imprecision, not a new
+  regression), `resolver.rs`/`stdlib_call_types` (doesn't read signature
+  strings at all — already has separate, non-string-based numeric-
+  polymorphic handling for these four names, untouched). Two of the eight
+  resulting overloads intentionally go beyond what real Kotlin itself
+  overloads — `sqrt(x: Int): Double` (real `kotlin.math.sqrt` has no `Int`
+  overload; needs `.toDouble()` first) and the still-accepted *mixed*
+  `max(anInt, aDouble)`/`min(...)` call (widens to `Double` at runtime; no
+  such overload exists in real Kotlin either) — both pre-existing ksl
+  conveniences, not new behavior, now just honestly documented instead of
+  hidden behind `|` — see `docs/stdlib.md`'s Math section.
+  - **Immediately followed by a related roadmap-only request** (no
+    implementation asked for): audit and record what's still missing for
+    real Kotlin numeric-type fidelity — see Phase 2.3 below, added for
+    exactly this.
+- **A sixth round, on the remaining duplication between `BuiltinSymbol`'s
+  own free-text `signature: &'static str` (hover/completion display) and
+  `stdlib_call_types`'s separate, hand-written `match name { ... }` (call-
+  site argument/return-type checking)**: the user pointed out these were
+  two independently hand-maintained descriptions of the same fact — a
+  signature string could drift from its own type-checking entry with
+  nothing to catch it. First proposal (keep both, framed as "different
+  axes") was rejected in favor of full unification: derive *both* the
+  display text and the checked types from one canonical structure.
+  Landed as `BuiltinParam { name, ty: Type, nullable: bool, default:
+  Option<&'static str> }` plus `BuiltinSymbol { params: &'static
+  [BuiltinParam], variadic_param: Option<&'static str>, return_type: Type,
+  ... }` — `signature` is gone entirely; `format_signature(sym)` now
+  generates the exact same display text on demand (verified byte-for-byte
+  against every one of the 20 previously hand-written strings, across all
+  15 distinct names including the `abs`/`sqrt`/`max`/`min` overload pairs,
+  in a dedicated test), and `stdlib_call_types` derives from the same
+  `params`/`return_type` instead of its own separate match. One real,
+  empirically-confirmed constraint shaped the design: `Box::new(...)` is
+  **not** a `const fn` in stable Rust (`rustc 1.98.0` — confirmed by
+  compiling a minimal repro: `cannot call non-const associated function
+  'Box::<T>::new' in constants`), so a `Type::Nullable(Box<Type>)` can't
+  appear directly inside `pub const STDLIB_PACKAGES`; `BuiltinParam` works
+  around this by storing the bare, non-nullable `ty` plus a `nullable:
+  bool` flag, with `real_type()` building the true `Type::Nullable(Box::
+  new(ty))` on demand in ordinary (non-`const`) function calls, both in
+  `format_signature` and in `stdlib_call_types`. `stdlib_call_types`'s own
+  overload-collapsing heuristic (several `BuiltinSymbol`s sharing a name —
+  safe to represent as one permissive signature only when every overload
+  agrees on arity *and* return type, e.g. `sqrt`'s two `Double`-returning
+  overloads; otherwise, e.g. `abs`/`max`/`min` with diverging `Int`/
+  `Double` return types, `None`) reproduces today's exact name-by-name
+  behavior with no hardcoded names anywhere — `resolver.rs`'s own,
+  separate `abs`/`max`/`min` special case (which picks a type from the
+  actual call-site argument, real overload resolution rather than a static
+  table lookup) is untouched, a deliberately different and more capable
+  mechanism for exactly those three names. `ksl-lsp`'s three direct
+  `sym.signature` readers (`package_index::builtin_symbol`, `completion.rs`,
+  `hover.rs`) all switched to `stdlib::format_signature(sym)` — no other
+  changes needed there, since none of them ever matched on stdlib names
+  specifically. One accepted, small behavior expansion falls out of giving
+  `assertEquals`/`assertTrue`/`assertFalse`/`assertNull`/`assertNotNull`'s
+  `message` parameter a real, checkable `params` entry (needed so
+  `format_signature` can print it at all) instead of it being invisible to
+  `stdlib_call_types` as before: `assertEquals(1, 2, 3)` is now a genuine
+  static type error (`argument 3 has type Int, expected String?`) — it
+  previously type-checked fine and only failed, if at all, when the
+  message was later formatted at runtime. Confirmed via `cargo test
+  --workspace` (all green) and manual `ksl-cli` runs that: `abs`/`max`/
+  `min`/`sqrt` still execute correctly at runtime; `length(5)` and
+  `assertTrue("x")` are still rejected exactly as before; `assertEquals(1,
+  2, 3)` is the one newly-caught case, as expected.
 
 ---
 
@@ -452,7 +720,11 @@ this phase with real value: convert a handful of existing stdlib functions
 into a builtin-method dispatch table (`call_builtin_method(receiver,
 method, args, span)` matching on `(type_name(), method)`), e.g.
 `"x".length()`, `"x".uppercase()`. `FieldAccess` on primitives (no fields
-yet) is a clear runtime error until Phase 6.
+yet) is a clear runtime error until Phase 6. This table is a deliberate,
+temporary stopgap, not a permanent design — Phase 6 retires it entirely
+once real class-method dispatch exists (see that phase's "Built-in
+primitive types as classes" subsection), replacing it with primitives
+dispatching through the same mechanism a real `class`'s methods use.
 
 **LSP (do in the same phase, not a follow-up — matches existing repo
 pattern):** `resolver.rs` needs `FieldAccess`/`MethodCall` arms (recurse
@@ -680,6 +952,84 @@ LSP wiring) still holds.
   inference through `@file:Import`/`package` — a package-qualified call
   (`util.math.square(5)`) still resolves to `Unknown` rather than a real
   checked signature, same as originally shipped Phase 2.
+
+---
+
+## Phase 2.3 — Numeric type width fix + missing primitive types (audit only, not implemented)
+
+Extends Phase 2 directly (the type system this touches), independent of
+everything after it — no later phase currently depends on ksl's numeric
+types being exactly `Int`/`Double`, so this can land any time once picked
+up. Added as a roadmap entry only, at the user's explicit request, right
+after that same session's `kotlin.math` overload-signature fix (see Phase
+0.5's own "fifth round" note) surfaced the underlying gap — **no
+implementation work done here**, this section is the audit/scoping pass
+alone, the same way Phase 10 (coroutines) is deliberately left as "needs a
+design spike before implementation" rather than a concrete plan.
+
+**Finding, confirmed by grep across `value.rs`/`types.rs`/`lexer.rs`/
+`token.rs`**: ksl's `Value::Int`/`types::Type::Int` is backed by `i64` —
+**64-bit**, already documented as such in `docs/syntax.md`'s Literals
+table (`Int (i64)`) — a known, existing, *documented* divergence, not a
+hidden bug. But real Kotlin's `Int` is 32-bit; what ksl calls `Int` today
+actually behaves like real Kotlin's `Long`, and there's no real `Long` at
+all. Real Kotlin's full primitive set, for reference: `Byte` (8-bit),
+`Short` (16-bit), `Int` (32-bit), `Long` (64-bit), `Float` (32-bit),
+`Double` (64-bit), `Boolean`, `Char` (16-bit, a UTF-16 code unit — a real
+distinct type in Kotlin, not just a length-1 `String`). Cross-checked
+against ksl's actual `Value`/`Type` enums and `lexer.rs`'s `lex_number` /
+identifier-lexing:
+
+| Kotlin primitive | ksl today |
+|---|---|
+| `Boolean` | ✅ `Value::Bool` — correct, no width concept applies |
+| `Double` (64-bit) | ✅ `Value::Double(f64)` — correct width |
+| `Int` (32-bit) | ⚠️ exists as `Value::Int(i64)` — **wrong width**, behaves like `Long` |
+| `Long` (64-bit) | ❌ missing entirely — no variant, no `10L` literal suffix in `lex_number` |
+| `Float` (32-bit) | ❌ missing entirely — no variant, no `3.14f`/`3.14F` literal suffix |
+| `Byte` (8-bit) | ❌ missing entirely |
+| `Short` (16-bit) | ❌ missing entirely |
+| `Char` | ❌ missing entirely — no `'x'` single-quoted literal token anywhere in `lexer.rs`/`token.rs` |
+
+**Open questions for whoever picks this up** (deliberately not decided
+here — this is scoping, not design):
+- Whether to actually **resize** `Int` to `i32` — a real, breaking
+  behavior change: `docs/syntax.md`'s Operators section already promises
+  "`Int` arithmetic wraps on overflow, matching Kotlin's `Int` semantics"
+  — that wrap is currently `i64` wraparound; becoming `i32` wraparound
+  changes the result of any script relying on today's wider range, not
+  just an additive fix.
+- Whether `Byte`/`Short`/`Char` belong in this phase at all, or are a
+  distinct, lower-priority follow-up — recommend scoping an initial pass
+  to the `Int`-width fix plus real `Long`/`Float` first (the three the
+  user actually asked about), since a scripting language's programs
+  reach for `Byte`/`Short`/`Char` far less often than `Int`/`Long`/
+  `Double`/`Float`.
+- Literal suffix grammar (`10L`, `3.14f`/`3.14F`) — new to `lexer.rs`'s
+  `lex_number`, matching real Kotlin's own suffix rules; real Kotlin also
+  has `0x`/`0b` hex/binary integer literals and `_` digit separators,
+  worth deciding whether those ride along or are their own separate item.
+- **Arithmetic promotion stops being a 2×2 table.** Today `apply_binary`
+  only ever widens `Int`↔`Double` (one rule, `docs/syntax.md`: "`Int`/
+  `Double` operands mix freely... result is `Double` whenever either
+  operand is"). With `Byte`/`Short`/`Int`/`Long`/`Float`/`Double` all
+  real, this becomes a real promotion lattice matching Kotlin's own rules
+  (`Byte < Short < Int < Long`, `Float < Double`, an integral type mixed
+  with `Float`/`Double` promotes to that floating type) — needs its own
+  careful design, not a mechanical extension of today's single rule.
+  `types::is_assignable`'s current "no numeric widening" assignment rule,
+  `resolver.rs`'s `is_numeric`, and value formatting/`Display` all need
+  re-deriving for N numeric types instead of 2 as well.
+- **stdlib impact, concretely, following directly from this same
+  session's `kotlin.math` overload work**: real Kotlin's own
+  `kotlin.math.abs`/`max`/`min` each have `Int`/`Long`/`Float`/`Double`
+  overloads (`sqrt` has `Float`/`Double` only, no integral overload at
+  all — see Phase 0.5's note on ksl's `Int` overload already being a
+  deliberate ksl-only convenience beyond real Kotlin there). Growing
+  `STDLIB_PACKAGES`'s `kotlin.math` entries from today's 2-overloads-per-
+  name to the real 3–4 is a natural, incremental follow-up once the types
+  themselves exist — no redesign of the overload-representation mechanism
+  just built (`symbols: &[BuiltinSymbol]` already supports it).
 
 ---
 
@@ -1034,8 +1384,11 @@ further, matching the existing one-concern-per-file layout).
   method *overloading* for a type system to disambiguate between, not
   because there's no type system at all (Phase 2 added one). `MethodCall`
   (Phase 1) gains a branch: if receiver is `Value::Object`, look up on its
-  class; if not found, fall through to Phase 1's builtin-method table, then
-  (Phase 8) extension functions.
+  class; a receiver of a built-in primitive type looks up on *its* class the
+  same way — see "Built-in primitive types as classes" below, which is what
+  retires Phase 1's separate builtin-method table rather than keeping it as
+  a permanent second path; if still not found, (Phase 8) extension
+  functions.
 - **Equality**: `values_equal` needs a `Value::Object` arm — reference
   equality (`Rc::ptr_eq`) by default, matching Kotlin's default `==`
   without an `equals()` override.
@@ -1049,6 +1402,78 @@ further, matching the existing one-concern-per-file layout).
   `(Class, Class)` arm still only does exact-name equality — real
   inheritance-aware subtyping (`Dog` assignable to `val x: Animal`) is
   Phase 7's job, not this one's.
+
+**Built-in primitive types as classes.** Real Kotlin has no split between
+"real classes" and "primitives with special-cased methods" — `String`,
+`Int`, `List`, etc. genuinely *are* classes in Kotlin's own standard
+library, with real member functions dispatched the same way any other
+class's methods are. ksl's `stdlib.rs` currently implements `.`-method
+calls (`"x".uppercase()`) via three free-standing items —
+`BUILTIN_METHOD_SIGNATURES` (a flat `&[(receiver_type, method, signature,
+doc)]` table), `call_builtin_method` (a direct `match (&receiver, method)`
+over runtime `Value`s), and `builtin_method_return_type` (a separate
+hand-written `match` for the resolver's static return-type inference) —
+which is exactly the "dangling functions, not real class methods" shape
+this phase should retire, not preserve as a permanent parallel mechanism
+alongside real class dispatch:
+
+- A fixed, small set of types get a builtin `Rc<ClassValue>` at interpreter
+  startup: `Int`, `Double`, `Boolean`, `String`, `List`. `Unit`/`Nothing`/
+  `Any` are eligible receivers too but start with empty method tables — the
+  same externally-visible "no methods yet" outcome as today, just expressed
+  structurally (a lookup miss) instead of via a separate hand-written
+  catch-all error case.
+- `ClassValue.methods` needs to hold either an interpreted or a native
+  implementation, not just `Rc<FunctionValue>` as sketched above — e.g.
+  `HashMap<String, MethodImpl>` with `enum MethodImpl {
+  UserDefined(Rc<FunctionValue>), Native(NativeMethodFn) }`, mirroring how
+  `Value::Function` vs `Value::Native` already coexist for plain functions.
+  Each native method's metadata should follow the same "one canonical
+  signature feeds both runtime dispatch and static type-checking"
+  principle the stdlib signature-unification work already established for
+  package-level functions (`BuiltinParam`/`BuiltinSymbol`/
+  `format_signature`/`stdlib_call_types` in `stdlib.rs`) — not a repeat of
+  today's split between `call_builtin_method`'s hand-written `match` and
+  `builtin_method_return_type`'s separate hand-written `match`.
+- `interpreter.rs`'s `MethodCall` dispatch unifies on one lookup path:
+  receiver evaluates, then its class is looked up — `Value::Object`'s real
+  class, or a builtin class keyed by `Value::type_name()` — then `method`
+  is looked up in that class's `methods`. The direct value-pattern match
+  used today (`(Value::Str(s), "length") => ...`) goes away.
+- `resolver.rs`'s `MethodCall` arm mirrors this: it already derives a
+  `dispatch_name` from `Type::name()` for its static check — instead of
+  consulting `stdlib::BUILTIN_METHOD_SIGNATURES`/`builtin_method_return_type`,
+  it consults the same builtin-class method registry, mirrored resolver-side
+  the same way `Resolver::known_classes` mirrors `class.rs`'s user-class
+  registry above.
+- **Explicitly NOT changed by this**: `resolve_type_hint`'s primitive arms
+  stay exactly as they are — `"String"` still resolves straight to
+  `Type::String`, never `Type::Class("String")`. `known_classes` also stays
+  exactly what this phase already plans for it above (populated only from
+  user `class` declarations). The builtin-class method registry is a
+  separate, code-only table keyed by type name for *method lookup only* —
+  it does not feed into `Type::Class`/`known_classes`/`is_assignable`.
+  Conflating "this receiver's methods are looked up via the class
+  mechanism" (true for every primitive under this design) with "this
+  receiver's static type is nominal `Type::Class`" (only ever true for
+  user-declared classes) would be a real, unintended type-system behavior
+  change, not just an implementation refactor — worth watching for during
+  implementation, not doing by accident.
+- Precedence with Phase 8 (extension functions) simplifies from three tiers
+  to two once this lands — see Phase 8's own "Dispatch precedence" bullet.
+
+Open questions, deliberately left unresolved here (same convention as Phase
+2.3's "audit only" list and Phase 3's "unscoped extension... to design when
+this phase is actually picked up"): whether `List`'s eventual real methods
+(Phase 3's deferred `operator fun get`/`set`, or Kotlin's real `size`/
+`get`/`contains`/etc.) go through this same mechanism once Phase 9
+(generics) exists, or need generic-aware handling of their own — revisit
+once Phase 9 is picked up. Exact Rust-level shape of `MethodImpl`/native-
+method metadata — left to implementation time, matching how Phase 9
+already defers its own open design point the same way. Whether `Any`/
+`Unit`/`Nothing` need real method entries at all in this first cut (real
+Kotlin's `Any` has `toString()`/`equals()`/`hashCode()`) — out of scope
+for the initial cut.
 
 **LSP — substantial, not mechanical**: `resolver.rs` needs a new
 class/member side-table (`HashMap<String, ClassInfo>`) so `this.field`/
@@ -1190,9 +1615,16 @@ reused as-is here.
 - Storage: a side-table (or, better for LSP reuse, lexically scoped
   alongside normal `Env` bindings) keyed by `(receiver_type_name,
   function_name)`.
-- **Dispatch precedence** (document explicitly): real object methods
-  (Phase 6) > builtin methods (Phase 1) > extension functions — matches
-  Kotlin's rule that members always beat extensions with the same name.
+- **Dispatch precedence** (document explicitly): class methods > extension
+  functions — matches Kotlin's rule that members always beat extensions
+  with the same name. This collapses what used to look like a three-tier
+  split ("real object methods > builtin methods > extension functions")
+  into two: once Phase 6's "Built-in primitive types as classes"
+  subsection lands, a built-in primitive's methods (`String`/`Int`/`List`/
+  etc.) are looked up through the exact same class-method mechanism a
+  user-declared `class`'s methods are — there is no separate "builtin
+  methods" tier left to rank against extension functions by the time this
+  phase is implemented.
 - `this` inside the extension body refers to the receiver, via the same
   binding mechanism Phase 6 built for methods.
 

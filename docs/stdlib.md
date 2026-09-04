@@ -1,14 +1,26 @@
 # Standard library reference
 
-Built-ins are plain global functions, e.g. `length(s)`. A handful also
-have a `.` method-call form (`s.length()`) — see [Methods](#methods)
-below. See [`syntax.md`](syntax.md) for the language itself.
+Every built-in lives in a real, named package, exactly matching real
+Kotlin — `println` is really `kotlin.io.println`, `listOf` is really
+`kotlin.collections.listOf`, and so on. A handful of packages
+(`kotlin.io`, `kotlin.collections`, `kotlin.text`) are **auto-imported**
+into every script, so their members work unqualified with no `import` at
+all, e.g. `length(s)` — a handful of those also have a `.` method-call
+form (`s.length()`) — see [Methods](#methods) below. `kotlin.math` and
+`kotlin.test` are **not** auto-imported (matching real Kotlin exactly),
+so their members need an explicit `import` or a fully-qualified call —
+see [Math](#math) and [Assertions](#assertions) below. A fully-qualified
+call (`kotlin.io.println(...)`) always works too, imported or not. See
+[`syntax.md`](syntax.md) for the language itself.
 
 Errors thrown by these functions are runtime errors like any other — they
 stop the script and print `runtime error: <message> at <line:col>` to
 stderr, `<line:col>` being the actual call site.
 
 ## Output
+
+Lives in `kotlin.io`, auto-imported (see the intro above) — also callable
+as `kotlin.io.println(...)`/`kotlin.io.print(...)`.
 
 ### `println(value?)`
 
@@ -29,6 +41,9 @@ argument.
 
 ## Lists
 
+Lives in `kotlin.collections`, auto-imported — also callable as
+`kotlin.collections.listOf(...)`.
+
 ### `listOf(vararg values)`
 
 Builds a `List` from any number of arguments (including zero).
@@ -42,6 +57,9 @@ Lists are also produced by an inclusive `Int` range, e.g. `1..5` — see
 [`syntax.md`](syntax.md#for). `+` concatenates two lists.
 
 ## Strings
+
+Live in `kotlin.text`, auto-imported — also callable as
+`kotlin.text.length(...)`/`kotlin.text.uppercase(...)`/etc.
 
 ### `length(s: String): Int`
 
@@ -88,7 +106,24 @@ one — so a local variable always wins over a same-named package.
 
 ## Math
 
-### `abs(x: Int | Double): Int | Double`
+Lives in `kotlin.math`, which — matching real Kotlin exactly — is **not**
+auto-imported: needs `import kotlin.math.*` (or a per-name import, or a
+fully-qualified `kotlin.math.abs(...)` call) before any of the functions
+below work:
+
+```kotlin
+abs(-5)              // undefined name 'abs'
+
+import kotlin.math.*
+abs(-5)               // OK
+kotlin.math.abs(-5)   // also OK, with or without the import
+```
+
+Kotlin has no `Int | Double`-style union-type syntax — each function below
+is really **overloaded** (two separate signatures sharing one name, same
+as real Kotlin), not one signature with a union type:
+
+### `abs(x: Int): Int` / `abs(x: Double): Double`
 
 Absolute value; the result type matches the argument's type.
 
@@ -97,16 +132,27 @@ abs(-5)      // 5
 abs(-3.5)    // 3.5
 ```
 
-### `sqrt(x: Int | Double): Double`
+### `sqrt(x: Int): Double` / `sqrt(x: Double): Double`
 
 ```kotlin
 sqrt(16)     // 4.0 (printed as "4", see below)
 ```
 
-### `max(a, b)` / `min(a, b)`
+The `Int` overload is a ksl-only convenience — real Kotlin's
+`kotlin.math.sqrt` has no `Int` overload at all (`sqrt(16)` there needs
+`sqrt(16.toDouble())`).
 
-Both arguments must be `Int` or `Double`. Returns `Int` only if both
-arguments are `Int`; otherwise returns `Double`.
+### `max(a: Int, b: Int): Int` / `max(a: Double, b: Double): Double` (and `min`, same shape)
+
+```kotlin
+max(3, 7)       // 7
+min(3.5, 2)     // 2.0 (printed as "2")
+```
+
+Also a ksl-only convenience beyond these two overloads: mixed
+`max(anInt, aDouble)`/`min(...)` calls are still accepted at runtime,
+widening to `Double` — real Kotlin has no such overload (`Int` and
+`Double` never mix in one call without an explicit conversion).
 
 ```kotlin
 max(3, 7)       // 7
@@ -115,14 +161,32 @@ min(3.5, 2)     // 2.0 (printed as "2")
 
 ## Assertions
 
-`kotlin.test`-shaped, but plain global functions — no `import` needed (see
-[`syntax.md`](syntax.md#imports); `import kotlin.test.*` itself doesn't
-resolve, since ksl has no such package). Each aborts the script with a
-runtime error on failure, exactly like any other stdlib error.
+Live in `kotlin.test`, same story as `kotlin.math` above — **not**
+auto-imported (exactly matching real Kotlin). Calling one bare, with no
+`import kotlin.test.*`/`import kotlin.test.<name>` in scope and no
+`kotlin.test.` qualification, is `undefined name`, same as referencing any
+other name that needs an import:
+
+```kotlin
+assertEquals(4, 2 + 2)              // undefined name 'assertEquals'
+
+import kotlin.test.*
+assertEquals(4, 2 + 2)              // OK
+
+import kotlin.test.assertEquals
+assertEquals(4, 2 + 2)              // OK, single-symbol import
+
+kotlin.test.assertEquals(4, 2 + 2)  // OK, no import needed — fully qualified
+```
+
+Each aborts the script with a runtime error on failure, exactly like any
+other stdlib error.
 
 ### `assertEquals(expected, actual, message: String? = null)`
 
 ```kotlin
+import kotlin.test.*
+
 assertEquals(4, 2 + 2)
 assertEquals(4, 2 + 3, "arithmetic is broken")   // fails: "... : arithmetic is broken"
 ```

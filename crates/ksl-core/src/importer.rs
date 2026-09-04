@@ -372,8 +372,9 @@ mod tests {
     #[test]
     fn wildcard_import_of_kotlin_test_resolves_to_ksls_own_assertions() {
         // `kotlin.test` isn't backed by any loaded file — it's a synthetic
-        // package `Interpreter::new` seeds from `stdlib::KOTLIN_TEST_MEMBERS`
-        // — see that constant's doc comment for why this exists.
+        // package `Interpreter::new` seeds from `stdlib::STDLIB_PACKAGES`'s
+        // `"kotlin.test"` entry — see that constant's doc comment for why
+        // this exists.
         let dir = TempDir::new("wildcard_kotlin_test");
         dir.write("main.ksl", "import kotlin.test.*\nassertEquals(4, 2 + 2)\nprintln(\"OK\")\n");
 
@@ -398,8 +399,9 @@ mod tests {
 
     #[test]
     fn importing_an_unknown_kotlin_test_member_is_an_undefined_name_error() {
-        // `assertFailsWith` isn't in `stdlib::KOTLIN_TEST_MEMBERS` (needs
-        // `Flow::Throw`, not implemented until the try/catch phase) — the
+        // `assertFailsWith` isn't in `stdlib::STDLIB_PACKAGES`'s
+        // `"kotlin.test"` entry (needs `Flow::Throw`, not implemented until
+        // the try/catch phase) — the
         // synthetic package must reject it like any other unknown member,
         // not silently accept every name under `kotlin.test`.
         let dir = TempDir::new("unknown_kotlin_test_member");

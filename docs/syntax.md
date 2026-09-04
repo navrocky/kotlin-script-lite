@@ -508,19 +508,31 @@ println(square(5))
 - `a.b.c` qualified-name syntax (package `a.b`, member `c`) works in any
   expression position without needing `import` first.
 
-**`kotlin.test`** is a special case: it's a real, resolvable package
-(both forms above work, and so does a fully-qualified
-`kotlin.test.assertEquals(...)` call with no import at all) even though no
-file ever declares `package kotlin.test` — it's a synthetic alias for
-[the assertion functions](stdlib.md#assertions) ksl's stdlib already
-provides globally (`assertEquals`, `assertTrue`, `assertFalse`,
-`assertNull`, `assertNotNull`), added so real Kotlin code that writes
+**Every stdlib name lives in a real, named package** — `println` is really
+`kotlin.io.println`, `assertEquals` is really `kotlin.test.assertEquals`,
+and so on (see [`stdlib.md`](stdlib.md) for the full list) — even though
+no file ever declares any of these `package`s; they're synthetic, seeded
+directly rather than parsed from a `.ksl` file, but otherwise behave
+exactly like a real user-declared package: both `import` forms above work
+on them, and so does a fully-qualified call
+(`kotlin.io.println(...)`/`kotlin.test.assertEquals(...)`) with no import
+at all.
+
+The only thing that varies per package is whether it's **auto-imported**:
+`kotlin.io`, `kotlin.collections`, and `kotlin.text` are (matching real
+Kotlin's own default-import list), so their members also work completely
+unqualified, no `import` needed. `kotlin.math` and `kotlin.test` are
+**not** auto-imported (matching real Kotlin exactly, where neither is on
+that list either) — calling one of their members bare, with no
+`import kotlin.math.*`/`import kotlin.test.*` (or a per-name import) in
+scope and no `kotlin.math.`/`kotlin.test.` qualification, is `undefined
+name`, the same as referencing any other name that needs an import first.
+`kotlin.test` in particular is what lets real Kotlin code that writes
 `import kotlin.test.*` (a common convention, including in JetBrains's own
-compiler test suite — see `docs/roadmap.md`'s Phase 0.5) doesn't need to
-be rewritten to run under ksl. Importing a `kotlin.test` member ksl
-doesn't actually implement (e.g. `assertFailsWith`, which needs `throw` —
-see "Not supported") is a plain `undefined name` error, same as importing
-any other nonexistent member.
+compiler test suite — see `docs/roadmap.md`'s Phase 0.5) run under ksl
+unmodified. Importing a member ksl doesn't actually implement (e.g.
+`kotlin.test.assertFailsWith`, which needs `throw` — see "Not supported")
+is likewise a plain `undefined name` error.
 
 `a.b.c` in expression position is genuinely ambiguous between a
 package-qualified name and `.` member access on a value (see "Methods"

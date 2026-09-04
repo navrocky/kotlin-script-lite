@@ -1,251 +1,281 @@
-use std::cell::RefCell;
+//! ksl's standard library — see `STDLIB_PACKAGES` below for the single
+//! source of truth on what it provides. Implementations live one file per
+//! real Kotlin package (`io.rs` = `kotlin.io`, `collections.rs` =
+//! `kotlin.collections`, `text.rs` = `kotlin.text`, `math.rs` =
+//! `kotlin.math`, `assertions.rs` = `kotlin.test`) so the stdlib can keep
+//! growing — a new package/function is a new file (or a new entry in an
+//! existing one) plus one line in `STDLIB_PACKAGES` below, not a bigger and
+//! bigger single file. This module itself holds only what's genuinely
+//! cross-package: the shared metadata types, the combined package table,
+//! the metadata queries every consumer (`is_known`, `stdlib_call_types`,
+//! `Interpreter::new`, `ksl-lsp`) derives from it, the handful of
+//! registration helpers every `populate_*` fn reuses, and the `.`-method
+//! dispatch table (keyed by receiver *type*, not by package — a genuinely
+//! different axis from `STDLIB_PACKAGES`, see `BUILTIN_METHOD_SIGNATURES`'s
+//! own doc comment).
+
 use std::rc::Rc;
 
 use crate::environment::Env;
 use crate::error::{Flow, RuntimeError, Span};
 use crate::interpreter::Interpreter;
+use crate::resolver::SymbolKind;
 use crate::types::Type;
 use crate::value::{NativeValue, Value};
 
-/// `(name, signature, one-line doc)` for every built-in registered by
-/// `populate_globals`, mirroring `docs/stdlib.md`. Hand-maintained since
-/// `populate_globals` registers functions imperatively (no static,
-/// queryable table otherwise) — used for hover/completion in `ksl-lsp` and
-/// to tell the resolver a name is a real built-in rather than a typo.
-/// Keep in sync with `populate_globals` and `docs/stdlib.md` when adding a
-/// stdlib function (see AGENTS.md's feature checklist) — the
-/// `stdlib_signatures_match_populate_globals` test below catches this
-/// table listing a function that `populate_globals` doesn't (renamed or
-/// removed), though not the reverse.
-pub const STDLIB_SIGNATURES: &[(&str, &str, &str)] = &[
-    ("println", "println(value?)", "Prints value followed by a newline, or just a newline if called with no argument."),
-    ("print", "print(value)", "Like println, but without the trailing newline."),
-    ("listOf", "listOf(vararg values)", "Builds a List from any number of arguments."),
-    ("length", "length(s: String): Int", "Number of characters in s."),
-    ("uppercase", "uppercase(s: String): String", "Uppercases s."),
-    ("lowercase", "lowercase(s: String): String", "Lowercases s."),
-    ("trim", "trim(s: String): String", "Removes leading and trailing whitespace."),
-    ("abs", "abs(x: Int | Double): Int | Double", "Absolute value; result type matches the argument's type."),
-    ("sqrt", "sqrt(x: Int | Double): Double", "Square root."),
-    ("max", "max(a, b): Int | Double", "Returns the larger of a and b."),
-    ("min", "min(a, b): Int | Double", "Returns the smaller of a and b."),
-    ("assertEquals", "assertEquals(expected, actual, message: String? = null)", "Aborts with a runtime error if expected and actual aren't equal."),
-    ("assertTrue", "assertTrue(actual: Boolean, message: String? = null)", "Aborts with a runtime error if actual is false."),
-    ("assertFalse", "assertFalse(actual: Boolean, message: String? = null)", "Aborts with a runtime error if actual is true."),
-    ("assertNull", "assertNull(actual, message: String? = null)", "Aborts with a runtime error if actual isn't null."),
-    ("assertNotNull", "assertNotNull(actual, message: String? = null)", "Aborts with a runtime error if actual is null."),
-];
+mod assertions;
+mod collections;
+mod io;
+mod math;
+mod text;
 
-pub fn is_known(name: &str) -> bool {
-    STDLIB_SIGNATURES.iter().any(|(n, _, _)| *n == name)
+/// One parameter of a `BuiltinSymbol` with a real, checkable type — the
+/// single source both `format_signature` (display text) and
+/// `stdlib_call_types` (static argument checking) read from, so the two
+/// can never drift apart the way a hand-written signature *string* and a
+/// hand-written `Type` list once could (see `git log` on this file for
+/// the pre-unification shape, if curious).
+///
+/// `ty` is deliberately the *bare*, non-nullable type, with nullability
+/// carried in its own `nullable: bool` instead of `Type::Nullable(Box::new(ty))`
+/// directly: `Box::new` isn't a `const fn` in stable Rust (confirmed by
+/// compiling a minimal repro — `cannot call non-const associated function
+/// 'Box::<T>::new' in constants`), so a `Type::Nullable` value can't
+/// appear in a `pub const` array at all. `real_type()` builds the true,
+/// possibly-`Nullable`-wrapped `Type` on demand instead — ordinary
+/// function calls (not `const` contexts) can call `Box::new` freely.
+pub struct BuiltinParam {
+    pub name: &'static str,
+    pub ty: Type,
+    pub nullable: bool,
+    /// Display text for a trailing `= default`, e.g. `Some("null")` for
+    /// `message: String? = null` — shown verbatim, never evaluated (each
+    /// `populate_*` closure's own `match args.len()` is what actually
+    /// implements the default).
+    pub default: Option<&'static str>,
 }
 
-/// Real Kotlin's `kotlin.test` package, as far as ksl goes — every one of
-/// these names is already a plain global stdlib function (see
-/// `populate_globals`), but real Kotlin box tests write `import
-/// kotlin.test.*`/`import kotlin.test.assertEquals` expecting a real
-/// package to resolve against, not a flat global scope. `Interpreter::new`
-/// seeds a synthetic `"kotlin.test"` package env from exactly this list
-/// (aliasing the same values already in `globals`, not copies), so both
-/// import forms — and a fully-qualified `kotlin.test.assertEquals(...)`
-/// call, via the existing package-qualified `FieldAccess`/`MethodCall`
-/// path — resolve for real, with no harness-level text rewriting needed.
-/// Deliberately narrow (just the assertions this crate actually
-/// implements) rather than aliasing all of `globals` under `kotlin.test`,
-/// which would make nonsensical calls like `kotlin.test.println(...)`
-/// resolve too.
-pub const KOTLIN_TEST_MEMBERS: &[&str] =
-    &["assertEquals", "assertTrue", "assertFalse", "assertNull", "assertNotNull"];
-
-/// Real, machine-readable `(param types, return type)` for a stdlib
-/// function's call-site checking (`STDLIB_SIGNATURES`'s own `signature`
-/// field is a free-text display string, not this) — used by
-/// `resolver.rs`'s `Call` handling so `println`/`length`/etc. participate
-/// in the same argument/return type checking a user-defined `fun` gets,
-/// instead of staying permanently `Unknown`. `Type::Unknown` as a
-/// parameter's own type means "accepts anything" (never flagged
-/// incompatible), matching `println(value: Any?)` in real Kotlin.
-///
-/// Returns `None` for a name with no checkable signature — `listOf` is
-/// deliberately absent (variadic; every arg would need `Type::List`'s
-/// still-untracked element type to check meaningfully, and its return
-/// type is already just `Type::List` regardless) and so are `abs`/`max`/
-/// `min` (numeric-polymorphic — handled directly in `resolver.rs`'s
-/// `Call` arm instead, since their return type isn't one fixed `Type`).
-pub fn stdlib_call_types(name: &str) -> Option<(Vec<Type>, Type)> {
-    match name {
-        "println" | "print" => Some((vec![Type::Unknown], Type::Unit)),
-        "length" => Some((vec![Type::String], Type::Int)),
-        "uppercase" | "lowercase" | "trim" => Some((vec![Type::String], Type::String)),
-        "sqrt" => Some((vec![Type::Unknown], Type::Double)),
-        "assertEquals" => Some((vec![Type::Unknown, Type::Unknown], Type::Unit)),
-        "assertTrue" | "assertFalse" => Some((vec![Type::Bool], Type::Unit)),
-        "assertNull" | "assertNotNull" => Some((vec![Type::Unknown], Type::Unit)),
-        _ => None,
+impl BuiltinParam {
+    /// The real, checkable `Type` this parameter has — `ty` itself, or
+    /// `Type::Nullable(Box::new(ty))` when `nullable` — see this struct's
+    /// own doc comment for why `ty` can't just already be the `Nullable`
+    /// form in the static table.
+    pub fn real_type(&self) -> Type {
+        if self.nullable {
+            Type::Nullable(Box::new(self.ty.clone()))
+        } else {
+            self.ty.clone()
+        }
     }
 }
 
-pub fn populate_globals(env: &Env) {
-    register(env, "println", |interp, args, span| {
-        match args.len() {
-            0 => write_out(interp, "\n"),
-            1 => write_out(interp, &format!("{}\n", args[0])),
-            n => return Err(arity_error("println", "0 or 1", n, span)),
-        }?;
-        Ok(Value::Unit)
-    });
-
-    register(env, "print", |interp, args, span| {
-        match args.len() {
-            1 => write_out(interp, &format!("{}", args[0]))?,
-            n => return Err(arity_error("print", "1", n, span)),
-        }
-        Ok(Value::Unit)
-    });
-
-    register(env, "listOf", |_interp, args, _span| {
-        Ok(Value::List(Rc::new(RefCell::new(args))))
-    });
-
-    register(env, "length", |_interp, args, span| {
-        let s = expect_str("length", &args, 0, span)?;
-        Ok(str_length(&s))
-    });
-
-    register(env, "uppercase", |_interp, args, span| {
-        let s = expect_str("uppercase", &args, 0, span)?;
-        Ok(str_uppercase(&s))
-    });
-
-    register(env, "lowercase", |_interp, args, span| {
-        let s = expect_str("lowercase", &args, 0, span)?;
-        Ok(str_lowercase(&s))
-    });
-
-    register(env, "trim", |_interp, args, span| {
-        let s = expect_str("trim", &args, 0, span)?;
-        Ok(str_trim(&s))
-    });
-
-    register(env, "abs", |_interp, args, span| match args.get(0) {
-        Some(Value::Int(i)) => Ok(Value::Int(i.wrapping_abs())),
-        Some(Value::Double(d)) => Ok(Value::Double(d.abs())),
-        _ => Err(type_error("abs", "a number", span)),
-    });
-
-    register(env, "sqrt", |_interp, args, span| {
-        let x = expect_num("sqrt", &args, 0, span)?;
-        Ok(Value::Double(x.sqrt()))
-    });
-
-    register(env, "max", |_interp, args, span| {
-        let a = args.get(0).ok_or_else(|| arity_error("max", "2", args.len(), span))?;
-        let b = args.get(1).ok_or_else(|| arity_error("max", "2", args.len(), span))?;
-        numeric_binary(a, b, span, f64::max)
-    });
-
-    register(env, "min", |_interp, args, span| {
-        let a = args.get(0).ok_or_else(|| arity_error("min", "2", args.len(), span))?;
-        let b = args.get(1).ok_or_else(|| arity_error("min", "2", args.len(), span))?;
-        numeric_binary(a, b, span, f64::min)
-    });
-
-    // `kotlin.test`-shaped assertions — thin wrappers over `values_equal`/
-    // `is_truthy` that raise the existing `RuntimeError` path on failure
-    // (the same mechanism `arity_error`/`type_error` already use above),
-    // not `Flow::Throw` (that doesn't exist until the `try`/`catch` phase).
-    // Added so `docs/roadmap.md`'s Phase 0.5 (JetBrains box-test conformance
-    // harness) has something to run vendored `kotlin.test.*`-using tests
-    // against — see that phase's own "stdlib additions" note.
-    register(env, "assertEquals", |_interp, args, span| {
-        let (expected, actual, message) = match args.len() {
-            2 => (&args[0], &args[1], None),
-            3 => (&args[0], &args[1], Some(&args[2])),
-            n => return Err(arity_error("assertEquals", "2 or 3", n, span)),
-        };
-        if !Value::values_equal(expected, actual) {
-            return Err(RuntimeError::new(
-                format!(
-                    "assertEquals failed: expected <{expected}>, actual <{actual}>{}",
-                    message.map(|m| format!(": {m}")).unwrap_or_default()
-                ),
-                span,
-            )
-            .into());
-        }
-        Ok(Value::Unit)
-    });
-
-    register(env, "assertTrue", |_interp, args, span| {
-        let (cond, message) = match args.len() {
-            1 => (&args[0], None),
-            2 => (&args[0], Some(&args[1])),
-            n => return Err(arity_error("assertTrue", "1 or 2", n, span)),
-        };
-        match cond {
-            Value::Bool(true) => Ok(Value::Unit),
-            Value::Bool(false) => Err(RuntimeError::new(
-                format!("assertTrue failed{}", message.map(|m| format!(": {m}")).unwrap_or_default()),
-                span,
-            )
-            .into()),
-            _ => Err(type_error("assertTrue", "a Boolean argument", span)),
-        }
-    });
-
-    register(env, "assertFalse", |_interp, args, span| {
-        let (cond, message) = match args.len() {
-            1 => (&args[0], None),
-            2 => (&args[0], Some(&args[1])),
-            n => return Err(arity_error("assertFalse", "1 or 2", n, span)),
-        };
-        match cond {
-            Value::Bool(false) => Ok(Value::Unit),
-            Value::Bool(true) => Err(RuntimeError::new(
-                format!("assertFalse failed{}", message.map(|m| format!(": {m}")).unwrap_or_default()),
-                span,
-            )
-            .into()),
-            _ => Err(type_error("assertFalse", "a Boolean argument", span)),
-        }
-    });
-
-    register(env, "assertNull", |_interp, args, span| {
-        let (actual, message) = match args.len() {
-            1 => (&args[0], None),
-            2 => (&args[0], Some(&args[1])),
-            n => return Err(arity_error("assertNull", "1 or 2", n, span)),
-        };
-        if !matches!(actual, Value::Null) {
-            return Err(RuntimeError::new(
-                format!(
-                    "assertNull failed: expected null, actual <{actual}>{}",
-                    message.map(|m| format!(": {m}")).unwrap_or_default()
-                ),
-                span,
-            )
-            .into());
-        }
-        Ok(Value::Unit)
-    });
-
-    register(env, "assertNotNull", |_interp, args, span| {
-        let (actual, message) = match args.len() {
-            1 => (&args[0], None),
-            2 => (&args[0], Some(&args[1])),
-            n => return Err(arity_error("assertNotNull", "1 or 2", n, span)),
-        };
-        if matches!(actual, Value::Null) {
-            return Err(RuntimeError::new(
-                format!("assertNotNull failed: expected non-null{}", message.map(|m| format!(": {m}")).unwrap_or_default()),
-                span,
-            )
-            .into());
-        }
-        Ok(Value::Unit)
-    });
+/// One name ksl's standard library provides — a member of some
+/// `BuiltinPackage` (see below), the stdlib's own counterpart of a real
+/// declaration's `resolver::Symbol`. Reuses `SymbolKind` rather than
+/// inventing a parallel enum: every entry today is `SymbolKind::Fun` (the
+/// stdlib has no `val`/`var` constants, and no `Class`/`Interface` variant
+/// exists yet because ksl itself doesn't have classes/interfaces yet —
+/// this field is what lets either show up later with no shape change
+/// here, not a speculative "for future use" addition). Plain
+/// `&'static str`/`Type` fields, not an owned `resolver::Symbol` directly:
+/// that type's `String`/`Vec`/`Box` fields aren't `const`-constructible,
+/// so a `BuiltinSymbol` is converted to a real `Symbol` on demand where
+/// one is actually needed (`ksl-lsp`'s `package_index::builtin_symbol`).
+///
+/// No separate free-text `signature` field — `format_signature` below
+/// generates the exact same display text from `params`/`variadic_param`/
+/// `return_type` instead, so there's only ever one place describing a
+/// given function's shape, not a hand-written string that could silently
+/// drift from the real, checked types.
+pub struct BuiltinSymbol {
+    pub name: &'static str,
+    pub kind: SymbolKind,
+    /// Every parameter with a real, checkable type. Empty (with
+    /// `variadic_param: Some(...)` instead) for a genuinely variadic
+    /// function like `listOf`, where there's no fixed parameter list at
+    /// all.
+    pub params: &'static [BuiltinParam],
+    /// `Some("values")` for `listOf`'s `vararg values` — mutually
+    /// exclusive with a non-empty `params` in practice (nothing enforces
+    /// this at the type level, but every current entry respects it).
+    pub variadic_param: Option<&'static str>,
+    pub return_type: Type,
+    pub doc: &'static str,
 }
 
+/// Builds the exact display signature a hand-written `signature: &'static
+/// str` field used to carry — e.g. `"fun println(value: Any?): Unit"`,
+/// `"fun assertEquals(expected, actual, message: String? = null): Unit"` —
+/// entirely from `sym`'s own structured fields. A `Type::Unknown` param is
+/// printed with **no** type annotation at all (bare name only): that's
+/// what already-shipped signatures like `assertEquals(expected, actual,
+/// ...)` looked like by hand, because `expected`/`actual` are really a
+/// generic `T` in real Kotlin (ksl has no generics yet) — `Unknown` is an
+/// internal type-checker escape hatch, not a real Kotlin type name, so it
+/// has no business appearing in hover text.
+pub fn format_signature(sym: &BuiltinSymbol) -> String {
+    let params = if let Some(vararg_name) = sym.variadic_param {
+        format!("vararg {vararg_name}")
+    } else {
+        sym.params
+            .iter()
+            .map(|p| {
+                let mut piece = if p.ty == Type::Unknown {
+                    p.name.to_string()
+                } else if p.nullable {
+                    format!("{}: {}?", p.name, p.ty.name())
+                } else {
+                    format!("{}: {}", p.name, p.ty.name())
+                };
+                if let Some(default) = p.default {
+                    piece.push_str(" = ");
+                    piece.push_str(default);
+                }
+                piece
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("fun {}({params}): {}", sym.name, sym.return_type.name())
+}
+
+/// One real, namable package ksl's standard library provides — always a
+/// genuine dotted name (no `""`/flat-scope sentinel: every symbol belongs
+/// to a real package, exactly matching real Kotlin, where even `println`
+/// is really `kotlin.io.println`). `default_imported` is what makes a
+/// package's members callable unqualified with no `import` at all — real
+/// Kotlin auto-imports a fixed list of packages (`kotlin.*`,
+/// `kotlin.collections.*`, `kotlin.text.*`, `kotlin.io.*`, ...) into every
+/// file; `kotlin.math` and `kotlin.test` are deliberately **not** on that
+/// list in real Kotlin either, so `abs`/`sqrt`/`max`/`min` and the
+/// assertions both need an explicit `import` or a full
+/// `kotlin.math.abs(...)`/`kotlin.test.assertEquals(...)` qualification —
+/// see `STDLIB_PACKAGES` below for exactly which packages are which.
+/// `populate` registers this package's real `NativeFn` closures onto a
+/// given `Env` — necessarily hand-written code (a closure isn't data), but
+/// keeping a function *pointer* to it right on the table entry is what
+/// lets `Interpreter::new` build every package's env, and default-import
+/// the right ones into `globals`, with one generic loop instead of a
+/// hardcoded call per package (see that function).
+pub struct BuiltinPackage {
+    pub name: &'static str,
+    pub default_imported: bool,
+    pub symbols: &'static [BuiltinSymbol],
+    pub populate: fn(&Env),
+}
+
+/// The single source of truth for "what names does ksl's stdlib provide,
+/// under which package, and which packages are auto-imported" — every
+/// other stdlib-metadata query in this crate and in `ksl-lsp` (`is_known`,
+/// `default_imported_symbols`, `Interpreter::new`'s package/`globals`
+/// setup, `package_index::build_package_index`'s built-in seeding,
+/// `ksl-lsp::completion`/`hover`'s bare-name branches) derives from this
+/// one table rather than keeping its own separately-hand-maintained copy.
+/// Adding a stdlib function to an existing package is exactly one entry in
+/// that package's own module (`io.rs`/`collections.rs`/`text.rs`/
+/// `math.rs`/`assertions.rs`); adding a whole new built-in package is one
+/// new file (own `PACKAGE` const + `populate` fn) plus one line here — see
+/// AGENTS.md's feature checklist; the `_signatures_match_populate_*` tests
+/// below catch a table entry that its `populate` fn doesn't actually
+/// register (renamed or removed), though not the reverse.
+pub const STDLIB_PACKAGES: &[BuiltinPackage] = &[
+    io::PACKAGE,
+    collections::PACKAGE,
+    text::PACKAGE,
+    math::PACKAGE,
+    assertions::PACKAGE,
+];
+
+/// The combined symbols of every `default_imported` package — every stdlib
+/// name visible with no `import`/qualification at all, exactly matching
+/// real Kotlin's own default-import list. Used by `is_known` and by
+/// `ksl-lsp`'s bare-name completion/hover branches.
+pub fn default_imported_symbols() -> impl Iterator<Item = &'static BuiltinSymbol> {
+    STDLIB_PACKAGES.iter().filter(|p| p.default_imported).flat_map(|p| p.symbols)
+}
+
+pub fn is_known(name: &str) -> bool {
+    default_imported_symbols().any(|s| s.name == name)
+}
+
+/// Real, machine-readable `(param types, return type)` for a stdlib
+/// function's call-site checking — used by `resolver.rs`'s `Call` handling
+/// so `println`/`length`/etc. participate in the same argument/return type
+/// checking a user-defined `fun` gets, instead of staying permanently
+/// `Unknown`. `Type::Unknown` as a parameter's own type means "accepts
+/// anything" (never flagged incompatible), matching `println(value: Any?)`
+/// in real Kotlin.
+///
+/// Returns `None` for a name with no single checkable signature — `listOf`
+/// is deliberately absent (variadic; every arg would need `Type::List`'s
+/// still-untracked element type to check meaningfully, and its return type
+/// is already just `Type::List` regardless) and so are `abs`/`max`/`min`
+/// (numeric-polymorphic overloads with *different* return types per
+/// overload — handled directly in `resolver.rs`'s `Call` arm instead,
+/// since there's no one fixed `Type` to report here).
+///
+/// Also covers `kotlin.test`'s names, even though that package isn't
+/// `default_imported` (see `STDLIB_PACKAGES`'s doc comment) — this
+/// function only supplies argument/return types for a name *already*
+/// known to be legitimately in scope (`resolver.rs`'s `Call` arm only
+/// reaches this after `walk_expr(callee)` already resolved or rejected
+/// the bare name itself, via `is_known`/`imported_names`/
+/// `has_wildcard_import`), so listing them here doesn't make an
+/// unimported `assertEquals(...)` resolve — it only makes a *properly
+/// imported* one get real argument-type checking instead of falling back
+/// to `Unknown`.
+pub fn stdlib_call_types(name: &str) -> Option<(Vec<Type>, Type)> {
+    call_types_from_entries(STDLIB_PACKAGES.iter().flat_map(|p| p.symbols).filter(|s| s.name == name && s.variadic_param.is_none()))
+}
+
+/// Same as `stdlib_call_types`, but for a fully package-qualified call
+/// (`kotlin.test.assertFalse(...)`, parsed as an `ExprKind::MethodCall`
+/// whose receiver flattens to a non-local dotted path — see
+/// `resolver.rs`'s `MethodCall` arm) — `path`'s last segment is the
+/// function name, everything before it is the package name. Validating the
+/// package too, not just the trailing name, is what keeps a call qualified
+/// under the *wrong* package (or a genuinely unknown qualified name) from
+/// incorrectly reusing a same-named symbol from a different package —
+/// `stdlib_call_types` alone can't do this since it never sees a package
+/// qualifier at all. Returns `None` for anything not resolving to a real
+/// package + member, exactly like `stdlib_call_types` does for an unknown
+/// bare name.
+pub fn stdlib_qualified_call_types(path: &[String]) -> Option<(Vec<Type>, Type)> {
+    let (name, package_segs) = path.split_last()?;
+    let package_name = package_segs.join(".");
+    let pkg = STDLIB_PACKAGES.iter().find(|p| p.name == package_name)?;
+    call_types_from_entries(pkg.symbols.iter().filter(|s| s.name == name && s.variadic_param.is_none()))
+}
+
+/// Shared derivation both `stdlib_call_types` and `stdlib_qualified_call_types`
+/// build on, given whichever `BuiltinSymbol`s share the name being called
+/// (already filtered to the right package, for the qualified case). Several
+/// overloads sharing one name (abs/sqrt/max/min): without the call site's
+/// real argument types there's no way to pick one, so this only synthesizes
+/// a single permissive signature when every overload agrees on arity and
+/// return type (true for `sqrt`'s two overloads, both returning Double) —
+/// otherwise (abs/max/min, where Int vs Double overloads return different
+/// types) there's no safe single signature, so this returns `None`.
+/// `resolver.rs`'s own `abs`/`max`/`min` special case (picks the type from
+/// the actual first argument, bare-name calls only) is unaffected by this
+/// and still handles those.
+fn call_types_from_entries<'a>(entries: impl Iterator<Item = &'a BuiltinSymbol>) -> Option<(Vec<Type>, Type)> {
+    let entries: Vec<&BuiltinSymbol> = entries.collect();
+    let first = *entries.first()?;
+    if entries.len() == 1 {
+        return Some((first.params.iter().map(BuiltinParam::real_type).collect(), first.return_type.clone()));
+    }
+    let arity = first.params.len();
+    let ret = first.return_type.clone();
+    if entries.iter().all(|s| s.params.len() == arity && s.return_type == ret) {
+        Some((vec![Type::Unknown; arity], ret))
+    } else {
+        None
+    }
+}
+
+/// Defines a native function `name` on `env` — the one primitive every
+/// package's own `populate` fn builds on.
 fn register(
     env: &Env,
     name: &str,
@@ -262,10 +292,6 @@ fn register(
     );
 }
 
-fn write_out(interp: &mut Interpreter, text: &str) -> Result<(), Flow> {
-    write!(interp.out, "{text}").map_err(|e| RuntimeError::new(format!("io error: {e}"), Span::default()).into())
-}
-
 fn arity_error(name: &str, expected: &str, got: usize, span: Span) -> Flow {
     RuntimeError::new(format!("{name} expects {expected} argument(s), got {got}"), span).into()
 }
@@ -274,69 +300,19 @@ fn type_error(name: &str, expected: &str, span: Span) -> Flow {
     RuntimeError::new(format!("{name} expects {expected}"), span).into()
 }
 
-fn expect_str(name: &str, args: &[Value], idx: usize, span: Span) -> Result<Rc<str>, Flow> {
-    match args.get(idx) {
-        Some(Value::Str(s)) => Ok(s.clone()),
-        _ => Err(type_error(name, "a String argument", span)),
-    }
-}
-
-fn expect_num(name: &str, args: &[Value], idx: usize, span: Span) -> Result<f64, Flow> {
-    match args.get(idx) {
-        Some(Value::Int(i)) => Ok(*i as f64),
-        Some(Value::Double(d)) => Ok(*d),
-        _ => Err(type_error(name, "a numeric argument", span)),
-    }
-}
-
-fn numeric_binary(a: &Value, b: &Value, span: Span, f: impl Fn(f64, f64) -> f64) -> Result<Value, Flow> {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => {
-            let xf = *x as f64;
-            let yf = *y as f64;
-            let r = f(xf, yf);
-            Ok(Value::Int(r as i64))
-        }
-        _ => {
-            let xf = match a {
-                Value::Int(x) => *x as f64,
-                Value::Double(x) => *x,
-                _ => return Err(type_error("max/min", "numeric arguments", span)),
-            };
-            let yf = match b {
-                Value::Int(y) => *y as f64,
-                Value::Double(y) => *y,
-                _ => return Err(type_error("max/min", "numeric arguments", span)),
-            };
-            Ok(Value::Double(f(xf, yf)))
-        }
-    }
-}
-
-fn str_length(s: &str) -> Value {
-    Value::Int(s.chars().count() as i64)
-}
-
-fn str_uppercase(s: &str) -> Value {
-    Value::str(s.to_uppercase())
-}
-
-fn str_lowercase(s: &str) -> Value {
-    Value::str(s.to_lowercase())
-}
-
-fn str_trim(s: &str) -> Value {
-    Value::str(s.trim().to_string())
-}
-
 /// `(receiver type, method name, signature, one-line doc)` for every
 /// builtin method `call_builtin_method` dispatches on — the `.`-syntax
-/// counterpart of `STDLIB_SIGNATURES`, used the same way for hover/
-/// completion in `ksl-lsp` (now filtered by receiver type — see
-/// `ksl-lsp`'s `completion.rs`/`hover.rs`). Every entry here is currently
-/// also reachable as a plain stdlib function (`"x".length()` and
+/// counterpart of `STDLIB_PACKAGES`'s `kotlin.text` package, used the same
+/// way for hover/completion in `ksl-lsp` (now filtered by receiver type —
+/// see `ksl-lsp`'s `completion.rs`/`hover.rs`). Deliberately kept as its
+/// own separate table, not folded into `STDLIB_PACKAGES`: it's dispatched
+/// by the *receiver's type*, not by package/namespace — a fundamentally
+/// different lookup axis (every entry below happens to duplicate a
+/// `kotlin.text` function under a `.`-call calling convention, exactly as
+/// `docs/stdlib.md#methods` documents as deliberate). Every entry here is
+/// currently also reachable as a plain stdlib function (`"x".length()` and
 /// `length("x")` both work) — see `call_builtin_method`, which reuses the
-/// same `str_*` helpers as `populate_globals`'s registrations.
+/// same `text::str_*` helpers as `text::populate`'s registrations.
 pub const BUILTIN_METHOD_SIGNATURES: &[(&str, &str, &str, &str)] = &[
     ("String", "length", "String.length(): Int", "Number of characters in the receiver."),
     ("String", "uppercase", "String.uppercase(): String", "Uppercases the receiver."),
@@ -371,19 +347,19 @@ pub fn call_builtin_method(receiver: Value, method: &str, args: Vec<Value>, span
     match (&receiver, method) {
         (Value::Str(s), "length") => {
             expect_no_args(method, &args, span)?;
-            Ok(str_length(s))
+            Ok(text::str_length(s))
         }
         (Value::Str(s), "uppercase") => {
             expect_no_args(method, &args, span)?;
-            Ok(str_uppercase(s))
+            Ok(text::str_uppercase(s))
         }
         (Value::Str(s), "lowercase") => {
             expect_no_args(method, &args, span)?;
-            Ok(str_lowercase(s))
+            Ok(text::str_lowercase(s))
         }
         (Value::Str(s), "trim") => {
             expect_no_args(method, &args, span)?;
-            Ok(str_trim(s))
+            Ok(text::str_trim(s))
         }
         _ => Err(RuntimeError::new(
             format!("'{}' has no method '{method}'", receiver.type_name()),
@@ -405,47 +381,152 @@ fn expect_no_args(method: &str, args: &[Value], span: Span) -> Result<(), Flow> 
 mod tests {
     use super::*;
 
-    /// Every name listed in `STDLIB_SIGNATURES` must actually be
-    /// registered by `populate_globals` — catches the table listing a
-    /// stdlib function that was renamed or removed. (`Env` doesn't expose
-    /// enumeration, so this can't also check the other direction — a new
-    /// `register` call with no matching table entry has to be caught by
-    /// the "adding a feature" checklist in AGENTS.md instead.)
+    /// Every symbol every package in `STDLIB_PACKAGES` claims must
+    /// actually be registered by that same package's own `populate` fn —
+    /// catches a table entry out of sync with the real `register(...)`
+    /// calls (renamed or removed), generically across every package at
+    /// once rather than one hand-written test per package. (`Env` doesn't
+    /// expose enumeration, so this can't also check the reverse direction
+    /// — a new `register` call with no matching table entry has to be
+    /// caught by the "adding a feature" checklist in AGENTS.md instead.)
     #[test]
-    fn stdlib_signatures_match_populate_globals() {
-        let env = Env::new();
-        populate_globals(&env);
-        for (name, _, _) in STDLIB_SIGNATURES {
-            assert!(
-                matches!(env.get(name), Some(Value::Native(_))),
-                "'{name}' is in STDLIB_SIGNATURES but not registered by populate_globals"
-            );
+    fn every_declared_symbol_is_registered_by_its_own_package() {
+        for pkg in STDLIB_PACKAGES {
+            let env = Env::new();
+            (pkg.populate)(&env);
+            for sym in pkg.symbols {
+                assert!(
+                    matches!(env.get(sym.name), Some(Value::Native(_))),
+                    "'{}' is declared in STDLIB_PACKAGES's '{}' package but its populate fn doesn't register it",
+                    sym.name,
+                    pkg.name
+                );
+            }
         }
     }
 
-    /// A stdlib type error must report the call-site span passed to the
-    /// native function, not a default `0:0` — regression test for the
-    /// `NativeFn` span threading fix.
+    /// `format_signature` must reproduce, byte-for-byte, exactly the text
+    /// every `BuiltinSymbol` carried by hand before `signature: &'static
+    /// str` was replaced with `params`/`variadic_param`/`return_type` (see
+    /// this module's own doc comments) — this is what actually catches a
+    /// future edit to `params`/`return_type` silently changing displayed
+    /// hover/completion text, since there's no longer a separate string to
+    /// eyeball against.
     #[test]
-    fn stdlib_error_reports_call_site_span() {
-        let env = Env::new();
-        populate_globals(&env);
+    fn format_signature_matches_every_symbols_original_hand_written_text() {
+        let expected: &[(&str, &str)] = &[
+            ("println", "fun println(value: Any?): Unit"),
+            ("print", "fun print(value: Any?): Unit"),
+            ("listOf", "fun listOf(vararg values): List"),
+            ("length", "fun length(s: String): Int"),
+            ("uppercase", "fun uppercase(s: String): String"),
+            ("lowercase", "fun lowercase(s: String): String"),
+            ("trim", "fun trim(s: String): String"),
+            ("abs", "fun abs(x: Int): Int"),
+            ("abs", "fun abs(x: Double): Double"),
+            ("sqrt", "fun sqrt(x: Int): Double"),
+            ("sqrt", "fun sqrt(x: Double): Double"),
+            ("max", "fun max(a: Int, b: Int): Int"),
+            ("max", "fun max(a: Double, b: Double): Double"),
+            ("min", "fun min(a: Int, b: Int): Int"),
+            ("min", "fun min(a: Double, b: Double): Double"),
+            ("assertEquals", "fun assertEquals(expected, actual, message: String? = null): Unit"),
+            ("assertTrue", "fun assertTrue(actual: Boolean, message: String? = null): Unit"),
+            ("assertFalse", "fun assertFalse(actual: Boolean, message: String? = null): Unit"),
+            ("assertNull", "fun assertNull(actual, message: String? = null): Unit"),
+            ("assertNotNull", "fun assertNotNull(actual, message: String? = null): Unit"),
+        ];
+        let actual: Vec<(&str, String)> = STDLIB_PACKAGES
+            .iter()
+            .flat_map(|p| p.symbols)
+            .map(|s| (s.name, format_signature(s)))
+            .collect();
+        assert_eq!(actual.len(), expected.len(), "STDLIB_PACKAGES entry count changed — update this test's expected table too");
+        for ((actual_name, actual_sig), (expected_name, expected_sig)) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual_name, expected_name);
+            assert_eq!(actual_sig, expected_sig);
+        }
+    }
+
+    /// `stdlib_qualified_call_types` must agree with `stdlib_call_types` for
+    /// a correctly-qualified path, but — unlike `stdlib_call_types`, which
+    /// only ever sees the bare trailing name — must reject a path qualified
+    /// under the *wrong* package, or a genuinely unknown package/member,
+    /// rather than silently reusing a same-named symbol from elsewhere.
+    /// Regression test for the bug where `kotlin.test.assertFalse(true,
+    /// 123)` (a fully-qualified call) skipped argument type-checking
+    /// entirely, while the bare `assertFalse(true, 123)` (after `import
+    /// kotlin.test.*`) was already correctly flagged.
+    #[test]
+    fn stdlib_qualified_call_types_validates_the_package_too() {
+        let path = |segs: &[&str]| segs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            stdlib_qualified_call_types(&path(&["kotlin", "test", "assertFalse"])),
+            stdlib_call_types("assertFalse"),
+        );
+        assert_eq!(
+            stdlib_qualified_call_types(&path(&["kotlin", "io", "println"])),
+            stdlib_call_types("println"),
+        );
+        // Wrong package for a real member name.
+        assert_eq!(stdlib_qualified_call_types(&path(&["kotlin", "math", "assertFalse"])), None);
+        // Unknown package.
+        assert_eq!(stdlib_qualified_call_types(&path(&["kotlin", "nope", "assertFalse"])), None);
+        // Unknown member of a real package.
+        assert_eq!(stdlib_qualified_call_types(&path(&["kotlin", "test", "nope"])), None);
+        // Too short to have both a package and a member.
+        assert_eq!(stdlib_qualified_call_types(&path(&["assertFalse"])), None);
+    }
+
+    /// `is_known`/`default_imported_symbols` must track `default_imported`
+    /// exactly — including that `kotlin.math`/`kotlin.test` are correctly
+    /// *not* on that list, matching real Kotlin (neither is one of the
+    /// packages it auto-imports either).
+    #[test]
+    fn default_imported_symbols_matches_the_table() {
+        let names: Vec<&str> = default_imported_symbols().map(|s| s.name).collect();
+        for pkg in STDLIB_PACKAGES.iter().filter(|p| p.default_imported) {
+            for sym in pkg.symbols {
+                assert!(names.contains(&sym.name), "'{}' ({}) should be in default_imported_symbols()", sym.name, pkg.name);
+                assert!(is_known(sym.name), "'{}' ({}) should be is_known", sym.name, pkg.name);
+            }
+        }
+        for pkg in STDLIB_PACKAGES.iter().filter(|p| !p.default_imported) {
+            for sym in pkg.symbols {
+                assert!(!names.contains(&sym.name), "'{}' ({}) should NOT be in default_imported_symbols()", sym.name, pkg.name);
+                assert!(!is_known(sym.name), "'{}' ({}) should NOT be is_known", sym.name, pkg.name);
+            }
+        }
+    }
+
+    /// The point of the whole `default_imported` split: a real
+    /// `Interpreter` mirrors exactly the default-imported packages' members
+    /// onto `globals` — never a non-default-imported one (`kotlin.math`,
+    /// `kotlin.test`), which must stay reachable only via
+    /// import/qualification. End-to-end (via `Interpreter::new`, not a
+    /// bare `Env`), since this is the whole point of that constructor's
+    /// loop over `STDLIB_PACKAGES`.
+    #[test]
+    fn interpreter_globals_mirror_exactly_the_default_imported_packages() {
         let mut sink = Vec::new();
-        let mut interp = Interpreter::new(&mut sink);
-        let f = match env.get("length") {
-            Some(Value::Native(n)) => n,
-            _ => panic!("length not registered"),
-        };
-        let span = Span::new(7, 3);
-        match (f.func)(&mut interp, vec![Value::Int(1)], span) {
-            Err(Flow::Error(e)) => assert_eq!(e.span, span),
-            _ => panic!("expected Flow::Error"),
+        let interp = Interpreter::new(&mut sink);
+        for pkg in STDLIB_PACKAGES {
+            for sym in pkg.symbols {
+                let visible = interp.globals.get(sym.name).is_some();
+                assert_eq!(
+                    visible, pkg.default_imported,
+                    "'{}' ({}, default_imported={}) visibility on globals doesn't match",
+                    sym.name, pkg.name, pkg.default_imported
+                );
+            }
         }
     }
 
     /// Every name in `BUILTIN_METHOD_SIGNATURES` must actually be
     /// dispatchable by `call_builtin_method` on some receiver — mirrors
-    /// `stdlib_signatures_match_populate_globals` for the `.`-method table.
+    /// `every_declared_symbol_is_registered_by_its_own_package` for the
+    /// `.`-method table.
     #[test]
     fn builtin_method_signatures_are_all_dispatchable_on_a_string() {
         for (receiver_type, name, _, _) in BUILTIN_METHOD_SIGNATURES {
@@ -489,64 +570,5 @@ mod tests {
             Err(Flow::Error(e)) => assert_eq!(e.span, span),
             other => panic!("expected an error, got {:?}", other.is_ok()),
         }
-    }
-
-    fn call(env: &Env, name: &str, args: Vec<Value>) -> Result<Value, Flow> {
-        let f = match env.get(name) {
-            Some(Value::Native(n)) => n,
-            _ => panic!("'{name}' not registered"),
-        };
-        let mut sink = Vec::new();
-        let mut interp = Interpreter::new(&mut sink);
-        (f.func)(&mut interp, args, Span::default())
-    }
-
-    #[test]
-    fn assert_equals_passes_on_equal_values_fails_otherwise() {
-        let env = Env::new();
-        populate_globals(&env);
-        assert!(call(&env, "assertEquals", vec![Value::Int(4), Value::Int(4)]).is_ok());
-        match call(&env, "assertEquals", vec![Value::Int(4), Value::Int(5)]) {
-            Err(Flow::Error(e)) => assert!(e.message.contains("assertEquals failed"), "{}", e.message),
-            other => panic!("expected an error, got {:?}", other.is_ok()),
-        }
-    }
-
-    #[test]
-    fn assert_equals_appends_the_optional_message() {
-        let env = Env::new();
-        populate_globals(&env);
-        match call(&env, "assertEquals", vec![Value::Int(4), Value::Int(5), Value::str("nope")]) {
-            Err(Flow::Error(e)) => assert!(e.message.ends_with(": nope"), "{}", e.message),
-            other => panic!("expected an error, got {:?}", other.is_ok()),
-        }
-    }
-
-    #[test]
-    fn assert_true_and_assert_false() {
-        let env = Env::new();
-        populate_globals(&env);
-        assert!(call(&env, "assertTrue", vec![Value::Bool(true)]).is_ok());
-        assert!(call(&env, "assertTrue", vec![Value::Bool(false)]).is_err());
-        assert!(call(&env, "assertFalse", vec![Value::Bool(false)]).is_ok());
-        assert!(call(&env, "assertFalse", vec![Value::Bool(true)]).is_err());
-    }
-
-    #[test]
-    fn assert_null_and_assert_not_null() {
-        let env = Env::new();
-        populate_globals(&env);
-        assert!(call(&env, "assertNull", vec![Value::Null]).is_ok());
-        assert!(call(&env, "assertNull", vec![Value::Int(1)]).is_err());
-        assert!(call(&env, "assertNotNull", vec![Value::Int(1)]).is_ok());
-        assert!(call(&env, "assertNotNull", vec![Value::Null]).is_err());
-    }
-
-    #[test]
-    fn assert_functions_report_arity_errors() {
-        let env = Env::new();
-        populate_globals(&env);
-        assert!(call(&env, "assertEquals", vec![Value::Int(1)]).is_err());
-        assert!(call(&env, "assertTrue", vec![]).is_err());
     }
 }
