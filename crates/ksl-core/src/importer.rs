@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -8,6 +8,8 @@ use crate::ast::{ImportDecl, Program, Stmt};
 use crate::environment::Env;
 use crate::error::{Flow, InterpError, RuntimeError, Span};
 use crate::interpreter::Interpreter;
+use crate::package_index::PackageIndex;
+use crate::resolver::ResolveResult;
 
 /// Recursively resolves and runs `@file:Import(...)` declarations against a
 /// shared `Interpreter`, before the importing file's own statements run.
@@ -20,6 +22,21 @@ pub struct Importer {
     /// Canonicalized paths currently being loaded, in load order — used to
     /// detect import cycles before they overflow the stack.
     stack: Vec<PathBuf>,
+    /// Every symbol reachable so far in this run — stdlib packages seeded
+    /// unconditionally, plus every already-loaded file's own top-level
+    /// exports (added right after that file is resolved, in
+    /// `add_module_to_index` below). Grows monotonically across the whole
+    /// run and is shared by every file's own `resolver::resolve_with_imports`
+    /// call, so a file's own `import`/`@file:Import` gets exactly the same
+    /// real, precise resolution `ksl-lsp`'s editor tooling gets — matching
+    /// `Interpreter`'s own genuinely-global `globals`/`packages` envs (a
+    /// name a package-less file provides is visible to *every* other file
+    /// in the run, not just its own direct importer — see
+    /// `run_program`'s doc comment), so one shared, ever-growing index is
+    /// the *correct* model here, not a leniency. Since each canonical path
+    /// is only ever parsed+resolved once (`loaded`'s existing dedup), a
+    /// file imported from several places is never redundantly reprocessed.
+    packages: PackageIndex,
 }
 
 impl Importer {
@@ -27,6 +44,7 @@ impl Importer {
         Importer {
             loaded: HashSet::new(),
             stack: Vec::new(),
+            packages: PackageIndex::new(),
         }
     }
 
@@ -43,7 +61,7 @@ impl Importer {
         entry_path: Option<&Path>,
         interp: &mut Interpreter,
     ) -> Result<(), InterpError> {
-        let (program, resolved_calls) = parse_and_resolve(src)?;
+        let program = crate::parse_only(src).map_err(InterpError::Parse)?;
 
         let entry_canonical = match entry_path {
             Some(p) => Some(fs::canonicalize(p).map_err(|e| {
@@ -58,12 +76,22 @@ impl Importer {
             self.stack.push(canonical.clone());
         }
 
+        // Every one of this file's own `@file:Import`s is fully loaded,
+        // resolved, and run *before* this file itself is resolved — so its
+        // own `import`/`@file:Import` gets real, precise resolution against
+        // `self.packages`, already extended with everything those imports
+        // (transitively) export.
         let result = self.run_imports(&program, base_dir, interp);
 
         if entry_canonical.is_some() {
             self.stack.pop();
         }
         result?;
+
+        let resolved = crate::resolver::resolve_with_imports(&program, &self.packages);
+        if !resolved.type_errors.is_empty() {
+            return Err(InterpError::TypeErrors(resolved.type_errors));
+        }
 
         // Stamped onto every `FunctionValue` declared while this file's
         // own top-level statements run (see `Interpreter::current_file`) —
@@ -72,7 +100,7 @@ impl Importer {
         if let Some(canonical) = &entry_canonical {
             interp.current_file = Arc::from(canonical.as_path());
         }
-        interp.current_resolved = Rc::new(resolved_calls);
+        interp.current_resolved = Rc::new(resolved.resolved_calls);
 
         run_program(interp, &program)
     }
@@ -129,7 +157,7 @@ impl Importer {
                 import.span,
             )))
         })?;
-        let (program, resolved_calls) = parse_and_resolve(&source).map_err(|e| wrap(&canonical, e))?;
+        let program = crate::parse_only(&source).map_err(|e| wrap(&canonical, InterpError::Parse(e)))?;
 
         self.stack.push(canonical.clone());
         let child_base_dir = canonical
@@ -147,9 +175,19 @@ impl Importer {
         let caller_file = interp.current_file.clone();
         let caller_resolved = interp.current_resolved.clone();
         let result: Result<(), InterpError> = (|| {
+            // This file's own `@file:Import`s are loaded, resolved, and run
+            // *first* — by the time `program` itself is resolved below,
+            // `self.packages` already reflects everything they
+            // (transitively) export, so its own `import`/`@file:Import`
+            // gets real resolution too.
             self.run_imports(&program, &child_base_dir, interp)?;
+            let resolved = crate::resolver::resolve_with_imports(&program, &self.packages);
+            if !resolved.type_errors.is_empty() {
+                return Err(wrap(&canonical, InterpError::TypeErrors(resolved.type_errors)));
+            }
+            add_module_to_index(&mut self.packages, &program, &resolved, &canonical);
             interp.current_file = Arc::from(canonical.as_path());
-            interp.current_resolved = Rc::new(resolved_calls);
+            interp.current_resolved = Rc::new(resolved.resolved_calls);
             run_program(interp, &program).map_err(|e| wrap(&canonical, e))
         })();
         interp.current_file = caller_file;
@@ -162,22 +200,28 @@ impl Importer {
     }
 }
 
-/// Parses `src` and statically resolves it, in one pass, refusing to
-/// return a usable `Program` at all if `resolver::resolve` found any real
-/// type error — this is what removes the old separate `static_check`
-/// (its own independent re-parse+re-resolve of the same source) in favor
-/// of one shared analysis feeding both the "reject before running" check
-/// and execution itself. Returns the resolver's own `resolved_calls` map
-/// (call-site span → the one local-overload candidate it resolved to)
-/// alongside the `Program`, for the caller to hand to `Interpreter` before
-/// running these statements — see `Interpreter::current_resolved`.
-fn parse_and_resolve(src: &str) -> Result<(Program, HashMap<Span, Span>), InterpError> {
-    let program = crate::parse_only(src).map_err(InterpError::Parse)?;
-    let resolved = crate::resolver::resolve(&program);
-    if !resolved.type_errors.is_empty() {
-        return Err(InterpError::TypeErrors(resolved.type_errors));
+/// Folds `program`'s own top-level exports into `packages` right after it's
+/// been resolved — a `package`-declaring file's members become visible
+/// under its package name (joined with `.`), a package-less file's flatten
+/// into the shared unqualified namespace (see
+/// `package_index::PackageIndex::flat_members`'s doc comment) — so a
+/// *later*-loaded file's own `import`/`@file:Import` sees everything this
+/// one exports, matching `Interpreter::run_program`'s own genuinely-shared
+/// `globals`/`package_env` model exactly.
+fn add_module_to_index(packages: &mut PackageIndex, program: &Program, resolved: &ResolveResult, file: &Path) {
+    match &program.package {
+        Some(pkg) => {
+            let package_name = pkg.path.join(".");
+            for symbol in resolved.table.top_level_symbols() {
+                packages.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()));
+            }
+        }
+        None => {
+            for symbol in resolved.table.top_level_symbols() {
+                packages.add_flat_member(symbol.clone(), Some(file.to_path_buf()));
+            }
+        }
     }
-    Ok((program, resolved.resolved_calls))
 }
 
 /// Resolves `program`'s `import a.b.c` declarations (bringing each into
@@ -397,6 +441,42 @@ mod tests {
         );
 
         assert_eq!(run_in(&dir, "main.ksl").unwrap(), "Hi, World\nBye\n");
+    }
+
+    #[test]
+    fn wildcard_imported_call_with_a_mismatched_argument_type_is_rejected_before_running() {
+        // Real, filesystem-backed cross-file argument-type checking: a
+        // wildcard-imported function now gets exactly the same static
+        // rigor a local one already had, and a real type error is fatal
+        // (via `resolver::resolve_with_imports`'s `type_errors`), rejected
+        // before the script ever starts running — nothing is printed.
+        let dir = TempDir::new("wildcard_import_bad_arg");
+        dir.write("pkg.ksl", "package a.b\nfun square(x: Int): Int = x * x\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport a.b.*\nprintln(\"should not print\")\nprintln(square(\"nope\"))\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("expected Int"), "{err}");
+    }
+
+    #[test]
+    fn genuine_typo_unrelated_to_a_wildcard_import_is_still_flagged() {
+        let dir = TempDir::new("wildcard_import_typo");
+        dir.write("pkg.ksl", "package a.b\nfun greet(): String = \"hi\"\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport a.b.*\nfun unused(): Unit {\n    totallyNotAThing\n}\nprintln(greet())\n",
+        );
+
+        // Only a `type_errors`-fatal problem stops execution today
+        // (undefined-name stays a non-fatal `diagnostics` entry — see
+        // `docs/roadmap.md`'s Phase 2 note, and this same behavior for a
+        // never-called function's own body); the point of this test is
+        // that the wildcard import's own real member (`greet`) still
+        // resolves and runs correctly regardless of the unrelated typo.
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "hi\n");
     }
 
     #[test]

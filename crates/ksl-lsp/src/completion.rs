@@ -31,9 +31,11 @@ use crate::analysis::Analysis;
 ///
 /// Otherwise (no `.` prefix at all): locals and outer-scope symbols visible
 /// there, every stdlib function, every known package's full name (real and
-/// built-in alike — see `package_index`'s module doc comment), package-less
-/// flat cross-file members, and language keywords — merged in that order
-/// (most relevant first).
+/// built-in alike — see `package_index`'s module doc comment), every name
+/// this file's own `import`/`@file:Import` brought into bare scope (real
+/// or built-in package, wildcard or named, package-less flat namespace —
+/// see `resolver::ResolveResult::imported_symbols`), and language
+/// keywords — merged in that order (most relevant first).
 pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
@@ -137,19 +139,16 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         });
     }
 
-    // Top-level names of a package-less `@file:Import`ed file — flattened
-    // into this file's own global scope at runtime (see
-    // `package_index::PackageIndex::flat_member`'s doc comment), so they're
-    // offered right alongside this file's own locals, not under any
-    // package-qualified prefix.
-    for member in analysis.packages.flat_members() {
-        items.push(CompletionItem {
-            label: member.symbol.name.clone(),
-            kind: Some(symbol_completion_kind(member.symbol.kind)),
-            detail: Some(member.symbol.signature.clone()),
-            documentation: member.symbol.doc.clone().map(Documentation::String),
-            ..Default::default()
-        });
+    // Every name this file's own real `import a.b.c`/`import a.b.*`
+    // brought into bare scope, plus a package-less `@file:Import`ed file's
+    // top-level names (flattened into this file's own global scope at
+    // runtime — see `package_index::PackageIndex::flat_member`'s doc
+    // comment) — both are real, verified resolution now (see
+    // `resolver::ResolveResult::imported_symbols`), so offered right
+    // alongside this file's own locals, not under any package-qualified
+    // prefix.
+    for member in &analysis.resolved.imported_symbols {
+        items.push(package_member_completion(member));
     }
 
     // Derived straight from `ksl_core::token::KEYWORDS` — the lexer's own
@@ -806,6 +805,34 @@ mod tests {
 
         let a = analysis::analyze(text, None, &main_path).expect("should parse");
         let names = completion(&a, text, Position::new(1, 8)).into_iter().map(|i| i.label).collect::<Vec<_>>();
+        assert!(names.contains(&"greet".to_string()), "{names:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: a real (package-declaring) file's own wildcard
+    /// `import a.b.*` used to be invisible to general (no-dot-prefix)
+    /// completion — only a *package-less* `@file:Import`'s flat namespace
+    /// was ever consulted here. `import test.*` must offer `greet` too.
+    #[test]
+    fn completion_offers_names_brought_in_by_a_wildcard_import_of_a_real_package() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_completion_wildcard_pkg_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("greeter.ksl"),
+            "package test\nfun greet(name: String): String {\n    return name\n}\n",
+        )
+        .unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"greeter.ksl\")\nimport test.*\nprintln(greet(\"World\"))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        let names = completion(&a, text, Position::new(2, 8)).into_iter().map(|i| i.label).collect::<Vec<_>>();
         assert!(names.contains(&"greet".to_string()), "{names:?}");
 
         let _ = fs::remove_dir_all(&dir);

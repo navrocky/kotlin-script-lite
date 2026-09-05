@@ -25,6 +25,7 @@
 //!   than flagging ordinary, correct multi-file code as broken.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -302,9 +303,61 @@ pub struct ResolveResult {
     /// did, by matching a `FunctionValue`'s own `decl_span` against the
     /// value recorded here for a given call site.
     pub resolved_calls: HashMap<Span, Span>,
+    /// The cross-file counterpart of `resolved_calls`: every bare-name use
+    /// or call that resolved to a symbol brought in by a real `import`/
+    /// `@file:Import` (see `CrossFileImports`), or to a package-qualified
+    /// call resolved against a real user package (see the `MethodCall`
+    /// handling) — mapped to an exact reference to the symbol it came
+    /// from, matching the rigor a same-file declaration already gets.
+    pub cross_file_refs: HashMap<Span, CrossFileRef>,
+    /// Every symbol visible unqualified in this file purely because of a
+    /// real `import a.b.c`/`import a.b.*`, or a bare `@file:Import`'s
+    /// package-less flat namespace — see `CrossFileImports`. Exposed for a
+    /// caller that needs "what's visible here" as a whole, not just
+    /// whether one particular name resolves (e.g. `ksl-lsp`'s completion,
+    /// or its hover/goto-definition "no local declaration at all"
+    /// fallback) — `resolve_name`/the `Call` arm already do the equivalent
+    /// per-name lookup internally via `imports`, which this simply
+    /// flattens into one list.
+    pub imported_symbols: Vec<crate::package_index::PackageMember>,
 }
 
+/// An exact reference to a symbol resolved from outside this file — see
+/// `ResolveResult::cross_file_refs`. `file: None` means a synthetic stdlib
+/// package member (e.g. `kotlin.test.assertEquals`), which has no source
+/// file of its own, matching `package_index::PackageMember::file`'s same
+/// convention.
+#[derive(Debug, Clone)]
+pub struct CrossFileRef {
+    pub file: Option<PathBuf>,
+    pub def_span: Span,
+}
+
+/// Resolves `program` with no cross-file knowledge beyond the stdlib
+/// (`package_index::PackageIndex::new()`'s stdlib-only seeding) — a
+/// convenience wrapper over `resolve_with_imports` for callers with no
+/// filesystem access at all (this module's own unit tests, `static_check`).
+/// A script whose imports are all satisfied by real stdlib packages
+/// resolves identically either way; one with a real user/file-backed
+/// import needs `resolve_with_imports` with a real `PackageIndex` instead.
 pub fn resolve(program: &Program) -> ResolveResult {
+    resolve_with_imports(program, &crate::package_index::PackageIndex::new())
+}
+
+/// Like `resolve`, but with real cross-file `import a.b.c`/`import a.b.*`/
+/// `@file:Import` resolution against `packages` — a `PackageIndex` built by
+/// a caller with real filesystem access (`importer.rs` for execution,
+/// `ksl-lsp`'s analysis pipeline for the editor). Every symbol an import
+/// brings into scope is resolved for real here: an import naming a package
+/// or member that doesn't exist in `packages` is a diagnostic at the
+/// import's own span, and a name that *does* resolve gets an exact
+/// `CrossFileRef` recorded (see `ResolveResult::cross_file_refs`) — no
+/// blanket leniency for any import shape, matching the rigor of a local
+/// declaration exactly. See `CrossFileImports` for the resolution mechanism
+/// itself.
+pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::PackageIndex) -> ResolveResult {
+    let mut diagnostics = Vec::new();
+    let imports = CrossFileImports::build(program, packages, &mut diagnostics);
     let mut r = Resolver {
         table: SymbolTable {
             scopes: Vec::new(),
@@ -315,12 +368,12 @@ pub fn resolve(program: &Program) -> ResolveResult {
             method_receiver_types: Vec::new(),
             name_refs: Vec::new(),
         },
-        diagnostics: Vec::new(),
+        diagnostics,
         type_errors: Vec::new(),
         resolved_calls: HashMap::new(),
-        imported_names: program.imports_use.iter().filter(|u| !u.wildcard).map(|u| u.path.last().unwrap().clone()).collect(),
-        has_file_imports: !program.imports.is_empty(),
-        has_wildcard_import: program.imports_use.iter().any(|u| u.wildcard),
+        cross_file_refs: HashMap::new(),
+        imports,
+        packages,
         generic_params: Vec::new(),
         known_classes: HashSet::new(),
         return_type_stack: Vec::new(),
@@ -328,38 +381,95 @@ pub fn resolve(program: &Program) -> ResolveResult {
     };
     let global = r.push_scope(None, 0, FILE_SPAN);
     r.walk_stmts(&program.stmts, global, FILE_END);
-    ResolveResult { table: r.table, diagnostics: r.diagnostics, type_errors: r.type_errors, resolved_calls: r.resolved_calls }
+    let imported_symbols = r.imports.by_name.into_values().flatten().collect();
+    ResolveResult {
+        table: r.table,
+        diagnostics: r.diagnostics,
+        type_errors: r.type_errors,
+        resolved_calls: r.resolved_calls,
+        cross_file_refs: r.cross_file_refs,
+        imported_symbols,
+    }
 }
 
-struct Resolver {
+/// Precise, per-file cross-file *bare-name* import resolution — replaces
+/// the old `imported_names`/`has_file_imports`/`has_wildcard_import`
+/// blanket leniency. Built once, up front, from `program.imports_use`
+/// (`import a.b.c` / `import a.b.*`) and `program.imports`'s flat/package-
+/// less namespace (see `package_index::PackageIndex::flat_members`),
+/// against the caller-supplied `PackageIndex` — real, filesystem-backed
+/// knowledge of what every reachable file/stdlib package actually exports.
+/// Every entry here is a *real*, verified symbol: an `import` naming a
+/// package or member that doesn't exist is a diagnostic at the import's own
+/// span (pushed directly into the `diagnostics` vec passed to `build`),
+/// never silent leniency. A *qualified* call (`a.b.c(...)`, not brought in
+/// by any `import`) is resolved separately, directly against `packages`
+/// (see the `MethodCall` handling in `walk_expr_expected`) — this struct
+/// only covers names visible *unqualified*.
+struct CrossFileImports {
+    by_name: HashMap<String, Vec<crate::package_index::PackageMember>>,
+}
+
+impl CrossFileImports {
+    fn build(program: &Program, packages: &crate::package_index::PackageIndex, diagnostics: &mut Vec<RuntimeError>) -> Self {
+        let mut by_name: HashMap<String, Vec<crate::package_index::PackageMember>> = HashMap::new();
+        for use_ in &program.imports_use {
+            if use_.wildcard {
+                let package = use_.path.join(".");
+                if !packages.has_package(&package) {
+                    diagnostics.push(RuntimeError::new(format!("unknown package '{package}'"), use_.span));
+                    continue;
+                }
+                for member in packages.members_of(&package) {
+                    by_name.entry(member.symbol.name.clone()).or_default().push(member.clone());
+                }
+            } else {
+                // Checked by the parser: at least 2 segments, the last one
+                // the member name, everything before it the package name.
+                let member_name = use_.path.last().expect("import path has a member segment").clone();
+                let package = use_.path[..use_.path.len() - 1].join(".");
+                if !packages.has_package(&package) {
+                    diagnostics.push(RuntimeError::new(format!("unknown package '{package}'"), use_.span));
+                    continue;
+                }
+                match packages.find(&package, &member_name) {
+                    Some(found) => by_name.entry(member_name).or_default().push(found.clone()),
+                    None => diagnostics.push(RuntimeError::new(
+                        format!("undefined name '{}'", use_.path.join(".")),
+                        use_.span,
+                    )),
+                }
+            }
+        }
+        // Bare `@file:Import` with no `import` statement: every package-
+        // less imported file's top-level names are visible unqualified —
+        // matches `Interpreter::run_program`'s own flat/package-less
+        // namespace exactly (a single shared `globals` env regardless of
+        // which file provided a name), so this is real, verified
+        // resolution too, not a separate leniency — an import that brought
+        // in nothing (or nothing at all) simply contributes no candidates.
+        for member in packages.flat_members() {
+            by_name.entry(member.symbol.name.clone()).or_default().push(member.clone());
+        }
+        CrossFileImports { by_name }
+    }
+}
+
+struct Resolver<'a> {
     table: SymbolTable,
     diagnostics: Vec<RuntimeError>,
     type_errors: Vec<RuntimeError>,
     resolved_calls: HashMap<Span, Span>,
-    /// Bare names brought in by this file's own `import a.b.c` (the last
-    /// segment of each path) — never flagged as undefined, since exactly
-    /// which names these introduce is known precisely (unlike plain
-    /// `@file:Import`, see `has_file_imports`).
-    imported_names: HashSet<String>,
-    /// True if this file has any `@file:Import(...)` at all. Unlike
-    /// `import`, `@file:Import` dumps an *unknown* set of names into scope
-    /// (every top-level `fun`/`val` of a file this resolver never reads —
-    /// see the module doc comment), so there's no way to tell a name it
-    /// legitimately provides from a real typo. Blanket-suppresses the
-    /// undefined-name diagnostic file-wide rather than risk false
-    /// positives on every multi-file script — a real loss of precision
-    /// (a genuine typo of a name unrelated to any import also goes
-    /// unflagged), but a undefined-name check that's wrong on ordinary,
-    /// correct multi-file code is worse than one that's merely incomplete.
-    has_file_imports: bool,
-    /// True if this file has any wildcard `import a.b.*`. Same reasoning
-    /// and same blanket leniency as `has_file_imports` — a wildcard import
-    /// brings in an unknown-to-this-resolver set of names (it has no
-    /// access to the interpreter's runtime package envs), so this
-    /// suppresses the undefined-name diagnostic file-wide rather than risk
-    /// false positives on every name that wildcard import legitimately
-    /// provides.
-    has_wildcard_import: bool,
+    cross_file_refs: HashMap<Span, CrossFileRef>,
+    /// Real, precomputed cross-file bare-name resolution — see
+    /// `CrossFileImports`.
+    imports: CrossFileImports,
+    /// The real, filesystem-backed cross-file package index this file was
+    /// resolved with — consulted directly (not through `imports`) for a
+    /// *qualified* call (`a.b.c(...)`), which names its target package
+    /// outright rather than going through an `import` statement. See the
+    /// `MethodCall` handling in `walk_expr_expected`.
+    packages: &'a crate::package_index::PackageIndex,
     /// Names of generic type parameters in scope (from an enclosing
     /// declaration's own `<T, ...>` list) — always empty today, since no
     /// declaration has a `type_params` list yet; see
@@ -515,7 +625,7 @@ fn is_primitive(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Double | Type::Bool | Type::String | Type::Unit | Type::List)
 }
 
-impl Resolver {
+impl<'a> Resolver<'a> {
     fn push_scope(&mut self, parent: Option<usize>, depth: u32, bounds: Span) -> usize {
         self.table.scopes.push(ScopeData { parent, depth, bounds, names: HashMap::new() });
         self.table.scopes.len() - 1
@@ -680,8 +790,23 @@ impl Resolver {
             }
             return ty;
         }
-        if crate::stdlib::is_known(name) || self.imported_names.contains(name) || self.has_file_imports || self.has_wildcard_import {
+        if crate::stdlib::is_known(name) {
             return Type::Unknown;
+        }
+        // A name brought in by a real `import`/`@file:Import` — see
+        // `CrossFileImports`. More than one candidate (a real cross-file
+        // overload group) resolves to its *last* entry here, the same
+        // documented simplification `resolve_symbol_index` already applies
+        // to a local overload group for a non-call use — a real call site
+        // gets true per-overload resolution instead, in the `Call` arm.
+        if let Some(candidates) = self.imports.by_name.get(name) {
+            if let Some(found) = candidates.last() {
+                self.cross_file_refs.insert(
+                    use_span,
+                    CrossFileRef { file: found.file.clone(), def_span: found.symbol.def_span },
+                );
+                return found.symbol.ty.clone();
+            }
         }
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
         Type::Unknown
@@ -1586,6 +1711,54 @@ impl Resolver {
         }
     }
 
+    /// Same idea as `resolve_stdlib_overload`/`resolve_user_overload`, for a
+    /// call to a name brought in by a real cross-file `import`/
+    /// `@file:Import` (see `CrossFileImports`) — or a qualified call
+    /// (`a.b.c(...)`) resolved directly against `self.packages` — with more
+    /// than one overload in its source package. Same `types::resolve_overload`
+    /// core, fed from `PackageMember::symbol`. A `Unique` match records
+    /// `call_span -> (file, def_span)` in `cross_file_refs` — the cross-file
+    /// counterpart of `resolve_user_overload`'s `resolved_calls` entry.
+    fn resolve_cross_file_overload(
+        &mut self,
+        name: &str,
+        candidates: &[crate::package_index::PackageMember],
+        arg_infos: &[(Option<String>, Type)],
+        span: Span,
+    ) -> Type {
+        let arg_types: Vec<Type> = arg_infos.iter().map(|(_, t)| t.clone()).collect();
+        let candidate_params: Vec<Vec<Type>> = candidates.iter().map(|m| m.symbol.param_types.clone()).collect();
+        let candidate_param_slices: Vec<&[Type]> = candidate_params.iter().map(Vec::as_slice).collect();
+        match types::resolve_overload(&candidate_param_slices, &arg_types) {
+            types::OverloadResolution::Unique(i) => {
+                let m = &candidates[i];
+                self.cross_file_refs.insert(span, CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span });
+                m.symbol.return_type.clone()
+            }
+            types::OverloadResolution::Ambiguous(is) => {
+                let first_ret = candidates[is[0]].symbol.return_type.clone();
+                if is.iter().all(|&i| candidates[i].symbol.return_type == first_ret) { first_ret } else { Type::Unknown }
+            }
+            types::OverloadResolution::ArityMismatch => {
+                self.type_errors.push(RuntimeError::new(
+                    format!("no overload of '{name}' accepts {} argument(s)", arg_types.len()),
+                    span,
+                ));
+                Type::Unknown
+            }
+            types::OverloadResolution::NoMatch => {
+                if arg_types.iter().all(|t| *t != Type::Unknown) {
+                    let arg_list = arg_types.iter().map(Type::name).collect::<Vec<_>>().join(", ");
+                    self.type_errors.push(RuntimeError::new(
+                        format!("no overload of '{name}' matches argument types ({arg_list})"),
+                        span,
+                    ));
+                }
+                Type::Unknown
+            }
+        }
+    }
+
     /// Like `walk_expr`, but with an optional "expected type" for `expr`
     /// itself — used only by a `Lambda` at this exact position to infer its
     /// parameter types when it has no explicit annotation of its own (see
@@ -1702,27 +1875,70 @@ impl Resolver {
                 // both call forms are the same function. More than one
                 // overload (e.g. `kotlin.math.abs(-5)`) gets real overload
                 // resolution instead, exactly like the bare-name `Call`
-                // arm — a genuinely new capability for the qualified form.
-                // `None`/empty here (an unrecognized qualified path — a
-                // typo, or a real cross-file user package this single-file
-                // resolver has no static visibility into either way) falls
-                // through to `check_call_signature`'s own `None` case
-                // below, exactly preserving today's lenient `Type::Unknown`
-                // behavior.
+                // arm.
                 let overloads: Vec<&'static crate::stdlib::BuiltinSymbol> = qualified_path
                     .as_ref()
                     .map(|path| crate::stdlib::stdlib_qualified_overloads(path))
                     .unwrap_or_default();
-                let use_overload_resolution = overloads.len() > 1;
+                // Not a stdlib package/member at all — try a real,
+                // filesystem-backed user package next (`self.packages`),
+                // with the exact same rigor: an unresolved package or
+                // member is now a genuine diagnostic at the call's own
+                // span, not silent `Type::Unknown` leniency — matching the
+                // "no allowances anywhere" mandate for cross-file
+                // resolution (see `resolve_with_imports`'s doc comment).
+                let user_candidates: Vec<crate::package_index::PackageMember> = if !overloads.is_empty() {
+                    Vec::new()
+                } else {
+                    match &qualified_path {
+                        Some(path) => {
+                            let (package_segments, member) = path.split_at(path.len() - 1);
+                            let package = package_segments.join(".");
+                            let member = &member[0];
+                            if self.packages.has_package(&package) {
+                                let found: Vec<_> = self
+                                    .packages
+                                    .members_of(&package)
+                                    .iter()
+                                    .filter(|m| m.symbol.name == *member)
+                                    .cloned()
+                                    .collect();
+                                if found.is_empty() {
+                                    self.diagnostics.push(RuntimeError::new(
+                                        format!("undefined name '{}'", path.join(".")),
+                                        *method_span,
+                                    ));
+                                }
+                                found
+                            } else {
+                                self.diagnostics.push(RuntimeError::new(
+                                    format!("unknown package '{package}'"),
+                                    *method_span,
+                                ));
+                                Vec::new()
+                            }
+                        }
+                        None => Vec::new(),
+                    }
+                };
+                let use_overload_resolution = overloads.len() > 1 || user_candidates.len() > 1;
                 let signature = if use_overload_resolution {
                     None
                 } else {
-                    qualified_path.as_ref().and_then(|path| {
-                        crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
-                            let names = vec![String::new(); param_types.len()];
-                            (ret_ty, param_types, names)
+                    qualified_path
+                        .as_ref()
+                        .and_then(|path| {
+                            crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
+                                let names = vec![String::new(); param_types.len()];
+                                (ret_ty, param_types, names)
+                            })
                         })
-                    })
+                        .or_else(|| {
+                            user_candidates.first().map(|m| {
+                                let names = vec![String::new(); m.symbol.param_types.len()];
+                                (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names)
+                            })
+                        })
                 };
                 let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
                 // An unsafe (`.`) call on a still-nullable receiver is
@@ -1774,22 +1990,33 @@ impl Resolver {
                                 Type::Unknown
                             }
                         }
-                        // The qualified-path case (`kotlin.test.assertFalse(...)`):
-                        // `signature`/`overloads` is populated exactly when
-                        // the path resolved to real stdlib member(s) above;
+                        // The qualified-path case (`kotlin.test.assertFalse(...)`,
+                        // or a real user package's `a.b.c(...)`): `signature`/
+                        // `overloads`/`user_candidates` is populated exactly
+                        // when the path resolved to real member(s) above —
                         // this checks `arg_infos` against it (single
                         // overload) or resolves among several (multiple
-                        // overloads) and returns the real return type —
-                        // `None`/empty (unknown qualified path) falls back
-                        // to `Type::Unknown`, unchanged from before this
-                        // check existed.
+                        // overloads) and returns the real return type. An
+                        // unresolved path already got its own diagnostic
+                        // above (unknown package / undefined name) — falls
+                        // back to `Type::Unknown` here, same as any other
+                        // already-reported problem.
                         None => {
-                            if use_overload_resolution {
-                                let Some(path) = &qualified_path else { unreachable!() };
-                                let name = path.last().unwrap();
+                            let Some(path) = &qualified_path else { unreachable!() };
+                            let name = path.last().unwrap();
+                            if overloads.len() > 1 {
                                 self.resolve_stdlib_overload(name, &overloads, &arg_infos, *method_span)
+                            } else if user_candidates.len() > 1 {
+                                self.resolve_cross_file_overload(name, &user_candidates, &arg_infos, *method_span)
                             } else {
-                                self.check_call_signature(&arg_infos, signature, *method_span)
+                                let ty = self.check_call_signature(&arg_infos, signature, *method_span);
+                                if let Some(m) = user_candidates.first() {
+                                    self.cross_file_refs.insert(
+                                        *method_span,
+                                        CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span },
+                                    );
+                                }
+                                ty
                             }
                         }
                     }
@@ -1968,21 +2195,41 @@ impl Resolver {
                     }
                 };
                 let use_stdlib_overload_resolution = overloads.len() > 1;
-                let use_overload_resolution = use_local_overload_resolution || use_stdlib_overload_resolution;
 
-                // A checkable signature comes from either a local `fun`
-                // symbol or a non-overloaded stdlib function with a known
-                // machine-readable signature (a `BuiltinSymbol`'s own
-                // signature field is a free-text display string, not
-                // this). Stdlib params have no real names to match a
-                // named argument against (`String::new()` placeholders —
-                // any named-arg call to a stdlib function falls into the
-                // "unknown parameter" case below, a minor, documented
-                // limitation). Resolved *before* walking the arguments
-                // (unlike every other subexpression here) so a lambda
-                // argument whose matching parameter is itself a function
-                // type (`apply({ x -> x * 2 }, 5)`) can infer its own
-                // parameter types from that — see `walk_expr_expected`.
+                // A cross-file candidate group — a name brought in by a
+                // real `import`/`@file:Import` (see `CrossFileImports`) —
+                // is only consulted once neither a local symbol nor a
+                // stdlib function/overload set exists under this name,
+                // same precedence `resolve_name` already uses (stdlib
+                // default-imports always win a same-name collision).
+                let cross_candidates: Vec<crate::package_index::PackageMember> =
+                    if use_local_overload_resolution || !overloads.is_empty() {
+                        Vec::new()
+                    } else {
+                        match &callee.kind {
+                            ExprKind::Name(name) if self.resolve_symbol(scope, name).is_none() => {
+                                self.imports.by_name.get(name).cloned().unwrap_or_default()
+                            }
+                            _ => Vec::new(),
+                        }
+                    };
+                let use_cross_overload_resolution = cross_candidates.len() > 1;
+                let use_overload_resolution =
+                    use_local_overload_resolution || use_stdlib_overload_resolution || use_cross_overload_resolution;
+
+                // A checkable signature comes from a local `fun` symbol, a
+                // non-overloaded stdlib function, or a non-overloaded
+                // cross-file import, in that order — a `BuiltinSymbol`'s/
+                // `Symbol`'s own signature field is a free-text display
+                // string, not this. Params with no real names (stdlib and
+                // cross-file alike) use `String::new()` placeholders — any
+                // named-arg call against one falls into the "unknown
+                // parameter" case below, a minor, documented limitation.
+                // Resolved *before* walking the arguments (unlike every
+                // other subexpression here) so a lambda argument whose
+                // matching parameter is itself a function type
+                // (`apply({ x -> x * 2 }, 5)`) can infer its own parameter
+                // types from that — see `walk_expr_expected`.
                 let signature = if use_overload_resolution {
                     None
                 } else {
@@ -2018,6 +2265,12 @@ impl Resolver {
                                         let names = vec![String::new(); param_types.len()];
                                         (ret_ty, param_types, names)
                                     })
+                            })
+                            .or_else(|| {
+                                cross_candidates.first().map(|m| {
+                                    let names = vec![String::new(); m.symbol.param_types.len()];
+                                    (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names)
+                                })
                             }),
                         _ => None,
                     }
@@ -2041,8 +2294,16 @@ impl Resolver {
                     let ExprKind::Name(name) = &callee.kind else { unreachable!() };
                     return self.resolve_stdlib_overload(name, &overloads, &arg_infos, expr.span);
                 }
+                if use_cross_overload_resolution {
+                    let ExprKind::Name(name) = &callee.kind else { unreachable!() };
+                    return self.resolve_cross_file_overload(name, &cross_candidates, &arg_infos, expr.span);
+                }
 
-                self.check_call_signature(&arg_infos, signature, expr.span)
+                let ty = self.check_call_signature(&arg_infos, signature, expr.span);
+                if let Some(m) = cross_candidates.first() {
+                    self.cross_file_refs.insert(expr.span, CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span });
+                }
+                ty
             }
             ExprKind::Lambda { params, body } => self.walk_lambda(expr, params, body, scope, following, expected),
             ExprKind::If { cond, then_branch, else_branch } => {
@@ -2264,6 +2525,41 @@ mod tests {
         resolve(&program)
     }
 
+    /// A `PackageIndex` seeded with the stdlib plus one fake user package,
+    /// `util.math` (a real `fun square(x: Int): Int`, no backing file) —
+    /// lets a test exercise real, precise cross-file import resolution
+    /// without spinning up a temp-file harness (see `importer.rs`'s own
+    /// `TempDir` tests for real multi-file coverage). Matches the
+    /// `util.math.square` shape already used throughout this file's own
+    /// examples/comments as "some real function this resolver can't see
+    /// declared locally".
+    fn package_index_with_util_math() -> crate::package_index::PackageIndex {
+        let mut packages = crate::package_index::PackageIndex::new();
+        packages.add_member(
+            "util.math".to_string(),
+            Symbol {
+                name: "square".to_string(),
+                kind: SymbolKind::Fun,
+                def_span: Span::default(),
+                mutable: false,
+                signature: "fun square(x: Int): Int".to_string(),
+                ty: Type::Function(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::Int,
+                param_types: vec![Type::Int],
+                param_names: vec!["x".to_string()],
+                doc: None,
+            },
+            None,
+        );
+        packages
+    }
+
+    fn resolve_src_with_util_math(src: &str) -> ResolveResult {
+        let tokens = lexer::tokenize(src).unwrap();
+        let program = parser::parse(&tokens).unwrap();
+        resolve_with_imports(&program, &package_index_with_util_math())
+    }
+
     fn symbol_names_at(table: &SymbolTable, line: u32, col: u32) -> Option<(&str, SymbolKind)> {
         table.symbol_at(line, col).map(|s| (s.name.as_str(), s.kind))
     }
@@ -2356,35 +2652,124 @@ mod tests {
     #[test]
     fn name_brought_in_by_import_is_not_flagged() {
         // `square` is never declared in this file's own AST — it only
-        // exists via `import util.math.square` — so it must NOT be flagged,
-        // unlike a real typo (the bug this regression-tests: reported live
-        // after `package_basic.ksl` incorrectly flagged `square`).
-        let result = resolve_src("import util.math.square\nprintln(square(5))\n");
+        // exists via `import util.math.square`, resolved for real against a
+        // `PackageIndex` that genuinely has it — so it must NOT be flagged,
+        // unlike a real typo.
+        let result = resolve_src_with_util_math("import util.math.square\nprintln(square(5))\n");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]
-    fn unresolved_name_is_suppressed_file_wide_when_file_has_any_file_import() {
-        // `@file:Import` dumps an unknown set of names into scope (this
-        // resolver never reads the imported file) — there's no way to tell
-        // a name it legitimately provides from a genuine typo, so the
-        // undefined-name check is suppressed for the whole file rather than
-        // risk flagging correct code. This is the same bug the previous
-        // test covers, but for plain @file:Import (no explicit `import`)
-        // — the form that was already broken before package/import existed.
+    fn bare_file_import_no_longer_blanket_suppresses_undefined_names() {
+        // `@file:Import` used to dump an unknown set of names into scope,
+        // suppressing undefined-name checking for the *whole file* — real,
+        // precise resolution replaced that (see
+        // `resolve_with_imports`/`CrossFileImports`): with no real
+        // `PackageIndex` backing `greeter.ksl` (this test has no
+        // filesystem access at all — see `importer.rs`'s own `TempDir`
+        // tests for the real multi-file, genuinely-resolving case), `greet`
+        // is now correctly flagged, exactly like any other undefined name.
         let result = resolve_src("@file:Import(\"greeter.ksl\")\nprintln(greet(\"World\"))\n");
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("greet"));
     }
 
     #[test]
     fn import_alone_does_not_suppress_other_genuine_typos() {
-        // Only @file:Import blanket-suppresses (its provided names are
-        // truly unknowable here); `import` alone only whitelists the
-        // specific name(s) it names, so an unrelated typo elsewhere in a
-        // file that uses only `import` (no @file:Import) is still flagged.
-        let result = resolve_src("import util.math.square\nprintln(totallyNotAThing)\n");
-        assert_eq!(result.diagnostics.len(), 1);
+        // `import`ing a real, resolvable name doesn't affect any other
+        // name's own checking — an unrelated typo elsewhere is still
+        // flagged, exactly as if `square` had been declared locally.
+        let result = resolve_src_with_util_math("import util.math.square\nprintln(totallyNotAThing)\n");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
         assert!(result.diagnostics[0].message.contains("totallyNotAThing"));
+    }
+
+    #[test]
+    fn wildcard_import_of_an_unknown_package_is_a_diagnostic() {
+        let result = resolve_src("import a.b.*\nprintln(1)\n");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("unknown package 'a.b'"), "{}", result.diagnostics[0].message);
+    }
+
+    #[test]
+    fn named_import_of_a_nonexistent_member_in_a_real_package_is_a_diagnostic() {
+        let result = resolve_src_with_util_math("import util.math.cube\nprintln(1)\n");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("undefined name 'util.math.cube'"), "{}", result.diagnostics[0].message);
+    }
+
+    #[test]
+    fn wildcard_import_of_a_real_package_brings_in_every_member_precisely() {
+        let mut packages = package_index_with_util_math();
+        packages.add_member(
+            "util.math".to_string(),
+            Symbol {
+                name: "cube".to_string(),
+                kind: SymbolKind::Fun,
+                def_span: Span::default(),
+                mutable: false,
+                signature: "fun cube(x: Int): Int".to_string(),
+                ty: Type::Function(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::Int,
+                param_types: vec![Type::Int],
+                param_names: vec!["x".to_string()],
+                doc: None,
+            },
+            None,
+        );
+        let tokens = lexer::tokenize("import util.math.*\nval a = square(2)\nval b = cube(2)\nprintln(nope)\n").unwrap();
+        let program = parser::parse(&tokens).unwrap();
+        let result = resolve_with_imports(&program, &packages);
+        // Every real member is visible unqualified and type-checks...
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        // ...but a genuine typo unrelated to the wildcard import is still
+        // flagged, exactly as strictly as a local declaration would be.
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn wildcard_imported_call_with_a_mismatched_argument_type_is_flagged() {
+        let result = resolve_src_with_util_math("import util.math.*\nsquare(\"hi\")\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected Int"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn cross_file_import_records_an_exact_reference_to_the_resolved_symbol() {
+        // The bare callee name itself (`resolve_name`, via `walk_expr`) and
+        // the call expression as a whole (the `Call` arm's own single-
+        // candidate bookkeeping) each record their own entry — both point
+        // at the same real symbol, just at different use-site spans (the
+        // name's own span vs. the whole call's), matching how a local call
+        // similarly touches both `table.occurrences` and, for a real
+        // overload, `resolved_calls`.
+        let tokens = lexer::tokenize("import util.math.square\nsquare(1)\n").unwrap();
+        let program = parser::parse(&tokens).unwrap();
+        let result = resolve_with_imports(&program, &package_index_with_util_math());
+        assert!(!result.cross_file_refs.is_empty(), "{:?}", result.cross_file_refs);
+        for found in result.cross_file_refs.values() {
+            assert!(found.file.is_none()); // the fake util.math package has no backing file
+            assert_eq!(found.def_span, Span::default());
+        }
+    }
+
+    #[test]
+    fn qualified_call_into_an_unresolved_user_package_is_now_a_diagnostic() {
+        // Full strictness for a qualified *call*: an unresolved package is
+        // a real diagnostic now, not silent `Type::Unknown` leniency.
+        let result = resolve_src("util.math.square(5)\n");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("unknown package 'util.math'"), "{}", result.diagnostics[0].message);
+    }
+
+    #[test]
+    fn qualified_call_into_a_real_user_package_gets_real_argument_checking() {
+        let tokens = lexer::tokenize("util.math.square(\"hi\")\n").unwrap();
+        let program = parser::parse(&tokens).unwrap();
+        let result = resolve_with_imports(&program, &package_index_with_util_math());
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("expected Int"), "{}", result.type_errors[0].message);
     }
 
     #[test]
@@ -2620,12 +3005,16 @@ mod tests {
 
     #[test]
     fn unknown_typed_argument_is_never_flagged() {
-        // The argument's own type is Unknown (a package-qualified call
-        // result) — must never be flagged, matching the "Unknown is always
-        // compatible" rule.
+        // An unresolved qualified call (`util.math` doesn't exist in this
+        // zero-context `PackageIndex`) is its own genuine diagnostic now —
+        // full strictness for qualified calls — but its *type* is still
+        // `Type::Unknown`, so it must never additionally be flagged as a
+        // type mismatch, matching the "Unknown is always compatible" rule.
         let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(1, util.math.square(2))\n";
         let result = resolve_src(src);
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert!(result.diagnostics[0].message.contains("unknown package 'util.math'"), "{}", result.diagnostics[0].message);
     }
 
     #[test]

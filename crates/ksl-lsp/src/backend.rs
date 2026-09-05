@@ -45,7 +45,7 @@ impl Backend {
     }
 
     async fn publish_static_diagnostics(&self, uri: Url, text: &str) {
-        let diags = static_diagnostics(text);
+        let diags = static_diagnostics(text, &uri_to_path(&uri));
         self.publish(uri, diags).await;
     }
 
@@ -76,7 +76,7 @@ impl Backend {
             return;
         }
 
-        let static_diags = static_diagnostics(&text);
+        let static_diags = static_diagnostics(&text, &uri_to_path(&uri));
 
         let entry_uri = uri.clone();
         // `run_diagnostics` blocks its calling thread on `recv_timeout` (up

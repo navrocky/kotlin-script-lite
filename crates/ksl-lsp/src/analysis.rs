@@ -55,16 +55,17 @@ pub struct Analysis {
 /// cache a tree nobody asked to resolve yet would be wasted when no
 /// hover/goto-definition/completion request is pending.
 pub fn analyze(text: &str, last_good: Option<Arc<Program>>, own_file: &Path) -> Option<Analysis> {
+    let base_dir = own_file.parent().unwrap_or_else(|| Path::new("."));
     match ksl_core::parse_only(text) {
         Ok(program) => {
-            let resolved = resolver::resolve(&program);
-            let packages = package_index::build_package_index(&program, own_file);
+            let packages = package_index::build_package_index(&program, base_dir, Some(own_file));
+            let resolved = resolver::resolve_with_imports(&program, &packages);
             let imports = program.imports.clone();
             Some(Analysis { resolved, packages, imports, own_file: own_file.to_path_buf(), is_current: true })
         }
         Err(_) => last_good.map(|program| {
-            let resolved = resolver::resolve(&program);
-            let packages = package_index::build_package_index(&program, own_file);
+            let packages = package_index::build_package_index(&program, base_dir, Some(own_file));
+            let resolved = resolver::resolve_with_imports(&program, &packages);
             let imports = program.imports.clone();
             Analysis { resolved, packages, imports, own_file: own_file.to_path_buf(), is_current: false }
         }),

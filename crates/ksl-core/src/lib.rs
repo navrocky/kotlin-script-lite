@@ -5,6 +5,7 @@ pub mod error;
 pub mod importer;
 pub mod interpreter;
 pub mod lexer;
+pub mod package_index;
 pub mod parser;
 pub mod resolver;
 pub mod stdlib;

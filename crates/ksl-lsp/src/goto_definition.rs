@@ -9,8 +9,9 @@ use crate::diagnostics::span_to_range;
 /// resolves — via the cross-file package index, see
 /// `analysis::Analysis::packages` — to a `Location` in whichever file
 /// actually declares it; a bare name with no local declaration at all
-/// falls back to a package-less `@file:Import`ed file's flat member (see
-/// `PackageIndex::flat_member`); and, independent of all of the above, the
+/// falls back to whatever this file's own `import`/`@file:Import` brought
+/// into bare scope (see `resolver::ResolveResult::imported_symbols`); and,
+/// independent of all of the above, the
 /// file name inside an `@file:Import("...")` itself jumps straight to that
 /// file (its own start, since a whole file — not a declaration inside it —
 /// is the target).
@@ -39,9 +40,9 @@ pub fn goto_definition(analysis: &Analysis, uri: &Url, position: Position) -> Op
         // matching this whole `if let` already not returning on a `find`
         // miss either.
         if let Some(found) = analysis.packages.find(&package.join("."), &member[0]) {
-            if let Some(uri) = &found.file {
+            if let Some(uri) = found.file.as_deref().and_then(crate::package_index::path_to_url) {
                 return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: uri.clone(),
+                    uri,
                     range: span_to_range(found.symbol.def_span),
                 }));
             }
@@ -50,10 +51,14 @@ pub fn goto_definition(analysis: &Analysis, uri: &Url, position: Position) -> Op
 
     // Last resort: a bare name with no local declaration of its own at
     // all — same fallback order as `hover::hover`'s final branch, minus
-    // the stdlib case (a stdlib function has no source location to jump to).
+    // the stdlib case (a stdlib function has no source location to jump
+    // to). Covers a name this file's own `import`/`@file:Import` brought
+    // into bare scope (real or built-in package, wildcard or named, or a
+    // package-less flat namespace member — see
+    // `resolver::ResolveResult::imported_symbols`).
     let name = analysis.resolved.table.name_ref_at(line, col)?;
-    let found = analysis.packages.flat_member(name)?;
-    let uri = found.file.clone()?;
+    let found = analysis.resolved.imported_symbols.iter().find(|m| m.symbol.name == name)?;
+    let uri = crate::package_index::path_to_url(found.file.as_deref()?)?;
     Some(GotoDefinitionResponse::Scalar(Location {
         uri,
         range: span_to_range(found.symbol.def_span),
@@ -122,6 +127,35 @@ mod tests {
                 assert_eq!(loc.uri, uri_for(&greeter_path));
                 // Points at greet's own declaration, line 1.
                 assert_eq!(loc.range.start.line, 0);
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: a real (package-declaring) file's own wildcard
+    /// `import a.b.*` used to be invisible to goto-definition's own "no
+    /// local declaration at all" fallback — only a *package-less*
+    /// `@file:Import`'s flat namespace was ever consulted here.
+    #[test]
+    fn goto_definition_on_a_name_brought_in_by_a_wildcard_import_of_a_real_package() {
+        let dir = temp_dir("wildcard_pkg");
+        let greeter_path = dir.join("greeter.ksl");
+        fs::write(&greeter_path, "package test\nfun greet(name: String): String {\n    return name\n}\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"greeter.ksl\")\nimport test.*\nprintln(greet(\"World\"))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        let uri = uri_for(&main_path);
+        // "println(" is 8 chars, so "greet" starts at column 9, on line 3.
+        let response = goto_definition(&a, &uri, Position::new(2, 8)).expect("greet should resolve");
+        match response {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri, uri_for(&greeter_path));
+                // Points at greet's own declaration, line 2 (after `package test`).
+                assert_eq!(loc.range.start.line, 1);
             }
             other => panic!("expected a scalar location, got {other:?}"),
         }

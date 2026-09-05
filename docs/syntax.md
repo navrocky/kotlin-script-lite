@@ -563,6 +563,14 @@ below) — there's no parser-level way to tell `a` is a package rather than
 a local, so this is resolved at evaluation time: `a` is tried as a local
 first, and only treated as a package name if it isn't one.
 
+Every form above (`import a.b.c`, `import a.b.*`, `@file:Import`'s
+package-less flat namespace, and a bare qualified call) is checked
+**statically** too, not just at runtime, with the exact same rigor a local
+declaration gets: an unresolved package or member is a real diagnostic at
+the import/call site (`unknown package '...'`/`undefined name '...'`), and
+a resolved one gets real argument-count/type checking against its actual
+signature — an editor sees this live, before the script ever runs.
+
 ## Methods
 
 Some values support `.` method-call syntax, e.g. `"hi".uppercase()` —

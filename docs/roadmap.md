@@ -832,6 +832,116 @@ since it's an unrelated, separate resolver gap.
 
 ---
 
+## Phase 0.7 — Precise cross-file `import`/`@file:Import` resolution [DONE]
+
+Triggered by a user question ("why does a typo inside an uncalled function
+only error once the function is called?"), which surfaced something much
+bigger: `resolver.rs`'s undefined-name check was **blanket-suppressed for
+the whole file** the moment it had *any* wildcard `import a.b.*`
+(`has_wildcard_import`) or *any* `@file:Import(...)` (`has_file_imports`) —
+a precise single-name `import a.b.c` was also just blindly trusted
+(`imported_names`), never checked against what `a.b` actually exports. An
+initial narrower fix (make only *stdlib* wildcard imports precise, keep
+blanket leniency for user/file-backed packages) was explicitly rejected:
+the requirement is that **every** import — stdlib or user, wildcard or
+named, `import` or bare `@file:Import` — resolves for real, with an exact
+recorded reference to the symbol it names, and zero special-case leniency
+anywhere; a qualified call into an unresolved package (`util.math.square(2)`)
+is now a hard diagnostic too, not silent `Type::Unknown`.
+
+**The mechanism already existed, just in the wrong place.** `ksl-lsp`'s
+`package_index.rs` already built exactly this — a `PackageIndex` recursively
+walking `@file:Import` (never `import`/`ImportUse`, which carries no file
+path — see `ast::ImportUse`'s own doc comment), seeding every
+`stdlib::STDLIB_PACKAGES` entry unconditionally and reading each
+transitively-reachable file's `resolver::resolve(...).table.top_level_symbols()`
+— but purely for hover/completion/goto-definition, entirely disconnected
+from `resolver.rs`'s own diagnostics. Moved verbatim to
+`crates/ksl-core/src/package_index.rs` (`PackageMember::file` becomes
+`Option<PathBuf>` instead of `tower_lsp`'s `Option<Url>`, since `ksl-core`
+can't depend on it — `ksl-lsp`'s own copy is now a thin re-export plus a
+`path_to_url` conversion at its two call sites in `goto_definition.rs`),
+since `resolver::resolve_with_imports` (new) needs `PackageIndex` as an
+input parameter and `ksl-lsp` depends on `ksl-core`, never the reverse.
+`PackageIndex::new()` seeds the stdlib unconditionally (always fully known,
+regardless of filesystem context) — `resolve(program)` stays a thin
+zero-argument wrapper over `resolve_with_imports(program, &PackageIndex::new())`,
+so every one of the resolver's ~100 pre-existing single-file unit tests
+keeps compiling unchanged (a handful whose *assertions* encoded the old
+leniency needed real fixes — see below).
+
+**`resolver.rs`**: `imported_names`/`has_file_imports`/`has_wildcard_import`
+removed entirely, replaced by a new `CrossFileImports` (built once up
+front from `program.imports_use`, `program.imports`'s flat/package-less
+namespace, and the passed-in `PackageIndex`) — every `import` is checked
+for real: an unresolved package or member is a diagnostic at the import's
+own span (`"unknown package '...'"` / `"undefined name '...'"`, matching
+`Interpreter::resolve_qualified`'s existing runtime wording exactly), a
+resolved one is recorded into a new `ResolveResult::cross_file_refs:
+HashMap<Span, CrossFileRef>` (the cross-file counterpart of
+`resolved_calls`, since a reference needs a source *file*, not just a
+same-file span). `resolve_name`'s fallback chain is now: local scope →
+`stdlib::is_known` → `CrossFileImports` → real diagnostic, no exceptions.
+`Call`'s existing three-tier overload dance (local → stdlib) gained a
+fourth tier, consulted only when neither of the first two found anything —
+a cross-file name with more than one overload goes through the same
+`types::resolve_overload` core via a new `resolve_cross_file_overload`
+(mirroring `resolve_user_overload`/`resolve_stdlib_overload`); a single
+candidate feeds `check_call_signature` exactly like a local `fun`, so a
+wildcard-imported function now gets real argument-count/type checking it
+never had before. `MethodCall`'s qualified-path handling
+(`kotlin.test.assertFalse(...)`) gained the same treatment for a *user*
+package (`Resolver` now holds `packages: &'a PackageIndex` directly,
+consulted whenever the path isn't a stdlib member) — full strictness means
+an unresolved qualified call is now a diagnostic too, not the old lenient
+`Type::Unknown` fallback.
+
+**`importer.rs`**: gained a `packages: PackageIndex` field, seeded via
+`PackageIndex::new()` and extended (`add_module_to_index`) right after each
+file is resolved — one shared, ever-growing index across the whole run,
+not a leniency but the *correct* model: a package-less `@file:Import`ed
+file's names are genuinely global at runtime (`run_program`'s single shared
+`globals` env, `Interpreter::packages`'s single shared per-package env
+regardless of which file provided a name), so one shared index mirrors
+that exactly. `run_top_level`/`load_import`'s order inverted: a file's own
+`@file:Import`s are now fully loaded, resolved, and run *before* that file
+itself is resolved (previously resolution happened first, then imports) —
+otherwise `self.packages` wouldn't yet reflect what those imports export
+by the time the importing file needs it. Since each canonical path is
+still only ever parsed+resolved once (the pre-existing `loaded` dedup, now
+also gating `self.packages`'s extension), a file imported from several
+places is genuinely resolved exactly once and its exports reused, not
+reprocessed — no separate `ksl-lsp`-style re-walk of the import graph is
+needed at execution time at all.
+
+**Fallout fixed**: three resolver.rs tests whose assertions were the exact
+leniency being removed (`import util.math.square` with no real backing
+package, `@file:Import` with no real backing file) were rewritten against
+a new `package_index_with_util_math()` test helper (a `PackageIndex` with
+one hand-inserted fake `util.math.square` member, no temp files needed) or
+flipped to expect the new diagnostic. New tests cover: a wildcard/named
+import of a real package (temp-file-backed, `importer.rs`'s existing
+`TempDir` pattern) with a genuine unrelated typo still flagged, a
+type-mismatched argument to a wildcard-imported function now rejected
+*before* the script runs, an unknown package/member at both the `import`
+site and a qualified call site, and `cross_file_refs` actually getting
+populated. The full vendored Kotlin box-test corpus
+(`cargo test -p ksl-core --test kotlin_box_tests`) and the whole `ksl-lsp`
+suite (which now threads a real `PackageIndex` through `diagnostics.rs`'s
+`static_diagnostics`, doing real filesystem I/O on every `didChange` — a
+deliberate trade-off so live diagnostics never lag behind what `ksl-cli`
+would actually reject) both pass unchanged.
+
+**Still deliberately deferred, not part of this pass**: folding
+`diagnostics` (undefined-name, duplicate-declaration) into
+`importer.rs::parse_and_resolve`'s fatal check alongside `type_errors` —
+this is what originally motivated the investigation, but was meaningless
+to do before `import`/`@file:Import` resolution was actually precise (it
+would have rejected almost every multi-file script on a false positive).
+Now that it's precise, this is a small, focused follow-up.
+
+---
+
 ## Phase 1 — `.` postfix member-access syntax
 
 The linchpin: classes, inheritance, and extension functions are all
@@ -1092,10 +1202,11 @@ LSP wiring) still holds.
   from) — `tests/examples/closures.ksl` was rewritten to
   `fun apply(f: (Int) -> Int, x: Int): Int = f(x)` /
   `val double: (Int) -> Int = { x -> x * 2 }` accordingly.
-- **Still pending** (tracked, not part of this addendum): cross-file type
-  inference through `@file:Import`/`package` — a package-qualified call
-  (`util.math.square(5)`) still resolves to `Unknown` rather than a real
-  checked signature, same as originally shipped Phase 2.
+- **Since fixed** (was: "still pending, not part of this addendum"):
+  cross-file type inference through `@file:Import`/`package` — a
+  package-qualified call (`util.math.square(5)`) now resolves against a
+  real, filesystem-backed `PackageIndex` and gets real argument checking,
+  same as a local call — see Phase 0.7.
 
 ---
 

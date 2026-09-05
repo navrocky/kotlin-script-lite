@@ -1,3 +1,5 @@
 @file:Import("imports/greeter.ksl")
 
+import test.*
+
 println(greet("World"))

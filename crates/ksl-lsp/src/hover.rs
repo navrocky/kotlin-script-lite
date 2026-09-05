@@ -14,9 +14,10 @@ use crate::diagnostics::span_to_range;
 /// `s` is a real local) falls back further to `BUILTIN_METHOD_SIGNATURES`;
 /// finally, a bare name that never resolved to a local symbol at all (this
 /// resolver is single-file, see its module doc comment) falls back to
-/// `stdlib::default_imported_symbols()` (`println`, etc.) and then to a package-less
-/// `@file:Import`ed file's flat member (`greet`, brought in unqualified —
-/// see `package_index::PackageIndex::flat_member`).
+/// `stdlib::default_imported_symbols()` (`println`, etc.) and then to
+/// whatever this file's own `import`/`@file:Import` brought into bare
+/// scope (`greet`, brought in unqualified — see
+/// `resolver::ResolveResult::imported_symbols`).
 pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
     let line = position.line + 1;
     let col = position.character + 1;
@@ -58,13 +59,15 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
 
     // Last resort: a bare name with no local declaration of its own at
     // all — `occurrence_at` above only covers names that resolve to a real
-    // local symbol, so this is what's left for a stdlib function or a
-    // flat cross-file import.
+    // local symbol, so this is what's left for a stdlib function or a name
+    // this file's own `import`/`@file:Import` brought into bare scope
+    // (real or built-in package, wildcard or named, or a package-less flat
+    // namespace member — see `resolver::ResolveResult::imported_symbols`).
     let name = analysis.resolved.table.name_ref_at(line, col)?;
     if let Some(sym) = ksl_core::stdlib::default_imported_symbols().find(|s| s.name == name) {
         return Some(build_stdlib_function_hover(&ksl_core::stdlib::format_signature(sym), sym.doc));
     }
-    let found = analysis.packages.flat_member(name)?;
+    let found = analysis.resolved.imported_symbols.iter().find(|m| m.symbol.name == name)?;
     Some(build_hover(&found.symbol, None, analysis.is_current))
 }
 
@@ -266,6 +269,35 @@ mod tests {
         let a = analysis::analyze(text, None, &main_path).expect("should parse");
         // "println(" is 8 chars, so "greet" starts at column 9.
         let h = hover(&a, Position::new(1, 8)).expect("greet should hover");
+        assert!(markdown_value(&h).contains("fun greet"), "{}", markdown_value(&h));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: a real (package-declaring) file's own wildcard
+    /// `import a.b.*` used to be invisible to hover's own "no local
+    /// declaration at all" fallback — only a *package-less* `@file:Import`'s
+    /// flat namespace was ever consulted here.
+    #[test]
+    fn hover_on_a_name_brought_in_by_a_wildcard_import_of_a_real_package() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_hover_wildcard_pkg_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("greeter.ksl"),
+            "package test\nfun greet(name: String): String {\n    return name\n}\n",
+        )
+        .unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"greeter.ksl\")\nimport test.*\nprintln(greet(\"World\"))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        // "println(" is 8 chars, so "greet" starts at column 9, on line 3.
+        let h = hover(&a, Position::new(2, 8)).expect("greet should hover");
         assert!(markdown_value(&h).contains("fun greet"), "{}", markdown_value(&h));
 
         let _ = fs::remove_dir_all(&dir);
