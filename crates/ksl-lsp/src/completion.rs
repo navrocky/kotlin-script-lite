@@ -111,6 +111,16 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     let col = position.character + 1;
     let mut items = Vec::new();
 
+    // Inside a call's own argument list (`test(longParam<cursor>`) — offer
+    // `paramName =` for each of the callee's declared parameters not
+    // already claimed by an earlier named argument, on top of the usual
+    // locals/stdlib/etc. below (a bare identifier here could just as well
+    // be a positional argument's value, so this only adds to the list,
+    // never replaces it). See `call_arg_context`.
+    if let Some((callee, used_names)) = call_arg_context(&up_to_cursor) {
+        items.extend(named_arg_completions(analysis, &callee, &used_names, line, col));
+    }
+
     for symbol in analysis.resolved.table.symbols_in_scope(line, col) {
         items.push(CompletionItem {
             label: symbol.name.clone(),
@@ -292,6 +302,130 @@ fn next_segment_completions(analysis: &Analysis, prefix_path: &[String]) -> Vec<
                     kind: Some(CompletionItemKind::MODULE),
                     ..Default::default()
                 });
+            }
+        }
+    }
+    items
+}
+
+/// The callee name and already-used named-argument names (if any) for the
+/// call whose own argument list the cursor sits directly inside — e.g.
+/// `"test(longParam"` -> `Some(("test", vec![]))`, `"test(a = 1, "` ->
+/// `Some(("test", vec!["a".to_string()]))`. `None` when the cursor isn't
+/// directly inside any parens at all, or the innermost enclosing one isn't
+/// immediately preceded by an identifier (only whitespace allowed in
+/// between) — a bare grouping paren (`(1 + 2)`), or one right after an
+/// operator/comma. A *keyword* immediately followed by `(` (`if (`, `while
+/// (`) is textually indistinguishable from a call here and so still comes
+/// back as a "callee" (`"if"`, ...) rather than `None` — harmless, since
+/// nothing named `if` ever resolves to a real symbol downstream (see
+/// `named_arg_completions`), so no bogus completions result either way.
+///
+/// Like `dotted_prefix_before_cursor`/`type_position_before_cursor`, this is
+/// a raw-text recognizer (a call's own argument list doesn't exist as a
+/// complete AST node while mid-typed) tracking paren nesting the same way —
+/// an already-*closed* nested call's own named arguments (`outer(inner(x =
+/// 1), y<cursor>`) never leak into the still-open outer one's `used_names`,
+/// since each paren gets its own fresh tracking frame. A `==`/`!=`/`<=`/`>=`
+/// comparison is never mistaken for a named-argument assignment (checked by
+/// peeking the following character for `==`; the other three already leave
+/// no pending identifier by the time `=` is reached, since `!`/`<`/`>`
+/// aren't identifier characters). Single-line only, matching every sibling
+/// recognizer here (see `completion`'s own doc comment on `up_to_cursor`).
+fn call_arg_context(text_before_cursor: &str) -> Option<(String, Vec<String>)> {
+    struct Frame {
+        callee: Option<String>,
+        used_names: Vec<String>,
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut cur = String::new();
+    // The most recently completed identifier, still "live" as a candidate
+    // callee/argument-name as long as only whitespace has followed it —
+    // any other character (punctuation, an operator, a second identifier
+    // after a separator) clears it, since it no longer directly precedes
+    // whatever comes next.
+    let mut pending: Option<String> = None;
+    let mut chars = text_before_cursor.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+            continue;
+        }
+        if !cur.is_empty() {
+            pending = Some(std::mem::take(&mut cur));
+        }
+        match c {
+            ' ' | '\t' | '\r' | '\n' => {}
+            '(' => stack.push(Frame { callee: pending.take(), used_names: Vec::new() }),
+            ')' => {
+                stack.pop();
+                pending = None;
+            }
+            '=' if chars.peek() == Some(&'=') => {
+                chars.next();
+                pending = None;
+            }
+            '=' => {
+                if let (Some(frame), Some(name)) = (stack.last_mut(), pending.take()) {
+                    frame.used_names.push(name);
+                }
+            }
+            _ => pending = None,
+        }
+    }
+
+    let frame = stack.last()?;
+    Some((frame.callee.clone()?, frame.used_names.clone()))
+}
+
+/// `paramName =` completions for `callee`'s declared parameters, gathered
+/// from every source a callee name can resolve against — a local (possibly
+/// overloaded, see the `Fun` filter below) `fun`, a stdlib function, or a
+/// cross-file/`@file:Import`ed one (`resolver::ResolveResult::
+/// imported_symbols`) — same precedence-agnostic "just union every source"
+/// approach `completion`'s own bottom section already takes for locals vs.
+/// stdlib vs. imports. `used` (already-claimed names) and a placeholder
+/// empty-string param name (stdlib/cross-file params with no real name to
+/// match a named argument against at all — see `resolver::CallSignature`'s
+/// doc comment) are both skipped; deduplicated by name across every source
+/// and every overload.
+fn named_arg_completions(analysis: &Analysis, callee: &str, used: &[String], line: u32, col: u32) -> Vec<CompletionItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    let mut push = |name: &str, ty: ksl_core::types::Type, doc: Option<String>| {
+        if name.is_empty() || used.iter().any(|u| u == name) || !seen.insert(name.to_string()) {
+            return;
+        }
+        items.push(CompletionItem {
+            label: format!("{name} ="),
+            kind: Some(CompletionItemKind::VARIABLE),
+            detail: Some(format!("param {name}: {}", ty.name())),
+            documentation: doc.map(Documentation::String),
+            ..Default::default()
+        });
+    };
+
+    for sym in analysis.resolved.table.symbols_in_scope(line, col) {
+        if sym.kind == SymbolKind::Fun && sym.name == callee {
+            for (i, pname) in sym.param_names.iter().enumerate() {
+                let ty = sym.param_types.get(i).cloned().unwrap_or(ksl_core::types::Type::Unknown);
+                let doc = sym.param_docs.get(i).cloned().flatten();
+                push(pname, ty, doc);
+            }
+        }
+    }
+    if let Some(sym) = ksl_core::stdlib::default_imported_symbols().find(|s| s.name == callee) {
+        for p in sym.params {
+            push(p.name, p.ty.clone(), None);
+        }
+    }
+    for member in &analysis.resolved.imported_symbols {
+        if member.symbol.name == callee {
+            for (i, pname) in member.symbol.param_names.iter().enumerate() {
+                let ty = member.symbol.param_types.get(i).cloned().unwrap_or(ksl_core::types::Type::Unknown);
+                let doc = member.symbol.param_docs.get(i).cloned().flatten();
+                push(pname, ty, doc);
             }
         }
     }
@@ -1145,5 +1279,90 @@ mod tests {
         assert!(!names2.contains(&"length".to_string()), "{names2:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn call_arg_context_finds_the_callee_with_no_args_typed_yet() {
+        assert_eq!(call_arg_context("test(longParam"), Some(("test".to_string(), vec![])));
+    }
+
+    #[test]
+    fn call_arg_context_collects_already_used_named_arguments() {
+        assert_eq!(call_arg_context("test(a = 1, b"), Some(("test".to_string(), vec!["a".to_string()])));
+    }
+
+    #[test]
+    fn call_arg_context_a_closed_nested_calls_own_names_do_not_leak_into_the_outer_one() {
+        assert_eq!(
+            call_arg_context("outer(inner(x = 1), y"),
+            Some(("outer".to_string(), vec![])),
+            "inner's own 'x' must not appear in outer's used_names"
+        );
+    }
+
+    #[test]
+    fn call_arg_context_a_comparison_is_never_mistaken_for_a_named_argument() {
+        // `flag == true` must not register `flag` as a claimed name -- only
+        // `==`, never a lone `=`, appears here.
+        assert_eq!(call_arg_context("test(flag == true, b"), Some(("test".to_string(), vec![])));
+    }
+
+    #[test]
+    fn call_arg_context_stays_none_for_a_bare_grouping_paren() {
+        assert_eq!(call_arg_context("(1 + 2"), None);
+    }
+
+    #[test]
+    fn call_arg_context_stays_none_outside_any_open_parens() {
+        assert_eq!(call_arg_context("val x = 1"), None);
+    }
+
+    #[test]
+    fn named_arg_completion_offers_the_calls_declared_parameter() {
+        // The exact reported bug: `Ctrl+Space` right after typing a partial
+        // prefix of a declared parameter's name inside a call must offer
+        // `paramName =`, not nothing. The line is a fully-typed, parseable
+        // call (closing paren included) -- same reasoning as
+        // `completion_after_a_dot_offers_builtin_methods`: the cursor,
+        // placed right after "longParam" rather than at the line's end,
+        // exercises the exact same mid-typing detection a genuinely
+        // unclosed paren would, without needing a `last_good` fallback.
+        let text = "fun test(longParamName: String) {}\ntest(longParam)\n";
+        let names = labels(text, Position::new(1, 14)); // right after "test(longParam"
+        assert!(names.contains(&"longParamName =".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn named_arg_completion_excludes_a_name_already_used_earlier_in_the_same_call() {
+        let text = "fun test(a: Int, b: Int) {}\ntest(a = 1, b)\n";
+        let names = labels(text, Position::new(1, 13)); // right after "test(a = 1, b"
+        assert!(names.contains(&"b =".to_string()), "{names:?}");
+        assert!(!names.contains(&"a =".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn named_arg_completion_offers_every_overloads_parameters() {
+        // Real user-defined overloading (see `resolver::ScopeData::names`'s
+        // doc comment) -- both candidates' own parameter names are offered,
+        // since which overload applies isn't decided until the call is
+        // complete.
+        let text = "fun test(a: Int): Int = a\nfun test(x: String): String = x\ntest()\n";
+        let names = labels(text, Position::new(2, 5)); // right after "test("
+        assert!(names.contains(&"a =".to_string()), "{names:?}");
+        assert!(names.contains(&"x =".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn named_arg_completion_shows_the_parameters_own_param_doc() {
+        let text = "/**\n * @param longParamName the important one\n */\nfun test(longParamName: String) {}\ntest(longParam)\n";
+        let analysis = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
+        let item = completion(&analysis, text, Position::new(4, 14))
+            .into_iter()
+            .find(|i| i.label == "longParamName =")
+            .expect("longParamName = should be offered");
+        match item.documentation {
+            Some(Documentation::String(doc)) => assert!(doc.contains("the important one"), "{doc}"),
+            other => panic!("expected doc, got {other:?}"),
+        }
     }
 }
