@@ -43,8 +43,18 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
     let full_up_to_cursor = text_up_to_position(text, position);
 
-    // Checked first, ahead of every other (line-local) context below: a
-    // KDoc tag (`@param`, `@return`, ...) can only ever appear inside a
+    // Checked first, ahead of every other (line-local) context below, and
+    // ahead of `kdoc_tag_context` too: an `@param` tag's own parameter-name
+    // position (`@param <cursor>`) would otherwise still match nothing
+    // below and fall through to ordinary expression-position completion —
+    // offering the documented function's own name and every other
+    // global-scope symbol instead of its parameter names.
+    if let Some(comment_so_far) = kdoc_param_name_context(&full_up_to_cursor) {
+        let already_documented = kdoc_already_documented_param_names(comment_so_far);
+        return kdoc_param_name_completions(analysis, position, &already_documented);
+    }
+
+    // A KDoc tag (`@param`, `@return`, ...) can only ever appear inside a
     // `/** ... */` doc comment, which is usually multi-line — unlike the
     // other detectors here, this one needs the text from the *start of the
     // document*, not just the current line.
@@ -745,6 +755,86 @@ fn kdoc_tag_context(text_up_to_cursor: &str) -> Option<String> {
     partial.chars().all(|c| c.is_ascii_alphabetic()).then(|| partial.to_string())
 }
 
+/// Whether the cursor sits inside a still-open `/** ... */` doc comment, at
+/// the position to type an `@param` tag's own parameter name: right after
+/// the tag word `param` and at least one separating space, before any
+/// further whitespace — once a second run of whitespace appears, the rest
+/// of the line is the tag's free-text description, not the name anymore
+/// (`@param name the description` — only `name` is a completable
+/// parameter name). Returns the comment's own text *before* this `@param`
+/// tag on success, so the caller can find which parameter names this same
+/// comment already documents (`kdoc_already_documented_param_names`) and
+/// exclude them.
+fn kdoc_param_name_context(text_up_to_cursor: &str) -> Option<&str> {
+    let last_open = text_up_to_cursor.rfind("/**")?;
+    let after_open = &text_up_to_cursor[last_open + 3..];
+    if after_open.contains("*/") {
+        return None;
+    }
+    let last_at = after_open.rfind('@')?;
+    let after_at = &after_open[last_at + 1..];
+    let rest = after_at.strip_prefix("param")?;
+    if rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None; // e.g. "@parameter" -- not really the "param" tag
+    }
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    if trimmed.len() == rest.len() {
+        return None; // no whitespace typed yet after the tag word itself
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return None; // past the name, into the tag's free-text description
+    }
+    Some(&after_open[..last_at])
+}
+
+/// Every parameter name a `@param` tag already documents somewhere in
+/// `comment_prefix` (the doc comment's own text up to, but not including,
+/// the `@param` tag currently being typed) — so `kdoc_param_name_completions`
+/// doesn't suggest a name a second time.
+fn kdoc_already_documented_param_names(comment_prefix: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = comment_prefix;
+    while let Some(idx) = rest.find("@param") {
+        let after = &rest[idx + "@param".len()..];
+        if !after.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            let trimmed = after.trim_start_matches([' ', '\t']);
+            let name: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        rest = &rest[idx + "@param".len()..];
+    }
+    names
+}
+
+/// The still-undocumented parameter names of whichever function this
+/// `@param` tag belongs to — the nearest top-level `fun` declared at or
+/// after the cursor's own line (a KDoc comment always immediately precedes
+/// its declaration, with no blank line between — see `doc_comment.rs`'s
+/// module doc comment — so its target is simply the closest *following*
+/// declaration, without needing to locate the comment's own closing `*/`).
+fn kdoc_param_name_completions(
+    analysis: &Analysis,
+    position: Position,
+    already_documented: &[String],
+) -> Vec<CompletionItem> {
+    let cursor_line = position.line + 1;
+    let target = analysis
+        .resolved
+        .table
+        .top_level_symbols()
+        .filter(|s| s.kind == SymbolKind::Fun && s.def_span.line >= cursor_line)
+        .min_by_key(|s| s.def_span.line);
+    let Some(target) = target else { return Vec::new() };
+    target
+        .param_names
+        .iter()
+        .filter(|name| !already_documented.iter().any(|d| d == *name))
+        .map(|name| CompletionItem { label: name.clone(), kind: Some(CompletionItemKind::VARIABLE), ..Default::default() })
+        .collect()
+}
+
 /// Every KDoc block tag (kotlinlang.org/docs/kotlin-doc.html) this project
 /// recognizes — see `doc_comment.rs` for which ones are actually rendered
 /// in hover today (`@param`/`@return`); the rest are still offered here so
@@ -1183,6 +1273,62 @@ mod tests {
         assert!(kdoc_tag_context("/** closed */\n@").is_none());
         assert!(kdoc_tag_context("@file:Import(\"x\")").is_none());
         assert!(kdoc_tag_context("").is_none());
+    }
+
+    #[test]
+    fn kdoc_param_name_context_recognizes_the_name_position() {
+        // Right after "@param" and its one separating space -- the name
+        // position, nothing typed yet.
+        assert!(kdoc_param_name_context("/**\n * @param ").is_some());
+        // Partway through typing the name.
+        assert!(kdoc_param_name_context("/**\n * @param my").is_some());
+        // No space yet after the tag word -- still typing the tag itself,
+        // `kdoc_tag_context`'s job, not this one's.
+        assert!(kdoc_param_name_context("/**\n * @param").is_none());
+        // Past the name, into the tag's free-text description.
+        assert!(kdoc_param_name_context("/**\n * @param name the description").is_none());
+        // "@parameter" is not the "param" tag -- word-boundary check.
+        assert!(kdoc_param_name_context("/**\n * @parameter ").is_none());
+        // Comment already closed before the cursor.
+        assert!(kdoc_param_name_context("/** @param x closed */\n@param ").is_none());
+    }
+
+    #[test]
+    fn kdoc_already_documented_param_names_finds_every_complete_entry() {
+        assert_eq!(kdoc_already_documented_param_names(""), Vec::<String>::new());
+        assert_eq!(kdoc_already_documented_param_names(" * @param a the first\n * "), vec!["a".to_string()]);
+        assert_eq!(
+            kdoc_already_documented_param_names(" * @param a\n * @param b\n * "),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// The reported bug: typing inside an already-written `@param` tag
+    /// offered the documented function's own name and other global-scope
+    /// symbols instead of its parameter name.
+    #[test]
+    fn kdoc_param_completion_offers_the_documented_functions_parameter_name() {
+        let text = "/**\n * @param \n */\nfun myFunc(myParam: String) {}\n";
+        // Line 1 is " * @param " (10 chars) -- cursor right after the
+        // space that follows "@param".
+        let names = labels(text, Position::new(1, 10));
+        assert_eq!(names, vec!["myParam".to_string()], "{names:?}");
+    }
+
+    #[test]
+    fn kdoc_param_completion_excludes_a_name_already_documented_earlier_in_the_same_comment() {
+        let text = "/**\n * @param a first\n * @param \n */\nfun f(a: Int, b: Int) {}\n";
+        // Line 2 is " * @param " (10 chars) -- cursor right after its
+        // trailing space, about to document the second parameter.
+        let names = labels(text, Position::new(2, 10));
+        assert_eq!(names, vec!["b".to_string()], "{names:?}");
+    }
+
+    #[test]
+    fn kdoc_param_completion_stays_empty_with_no_following_function() {
+        let text = "/**\n * @param \n */\nval x = 1\n";
+        let names = labels(text, Position::new(1, 10));
+        assert!(names.is_empty(), "{names:?}");
     }
 
     #[test]
