@@ -528,7 +528,10 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen, "')'")?;
         self.skip_newlines();
         self.loop_depth += 1;
-        let body = self.parse_block_stmts();
+        // A `{ ... }` block or a single statement — same as `if`/`when`'s
+        // own branches (`parse_branch`), matching real Kotlin: `while
+        // (cond) break` with no braces is ordinary Kotlin, not special.
+        let body = self.parse_branch();
         self.loop_depth -= 1;
         Ok(Stmt::new(StmtKind::While { cond, body: body? }, span))
     }
@@ -543,7 +546,8 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen, "')'")?;
         self.skip_newlines();
         self.loop_depth += 1;
-        let body = self.parse_block_stmts();
+        // Braceless single-statement body allowed too — see `parse_while`.
+        let body = self.parse_branch();
         self.loop_depth -= 1;
         Ok(Stmt::new(
             StmtKind::For {
@@ -1345,6 +1349,23 @@ mod tests {
         parse_src("when (x) { 1 -> \"one\" else -> \"other\" }");
         parse_src("for (i in 1..10) { println(i) }");
         parse_src("while (x < 10) { x = x + 1 }");
+    }
+
+    #[test]
+    fn braceless_single_statement_while_and_for_bodies_parse() {
+        // Same as `if`/`when`'s own branches (`parse_branch`) -- a loop's
+        // body doesn't have to be a `{ ... }` block either.
+        let stmts = parse_src("for (i in 1..10) println(i)");
+        match &stmts[0].kind {
+            StmtKind::For { body, .. } => assert_eq!(body.len(), 1),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let stmts2 = parse_src("while (x < 10) x = x + 1");
+        match &stmts2[0].kind {
+            StmtKind::While { body, .. } => assert_eq!(body.len(), 1),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

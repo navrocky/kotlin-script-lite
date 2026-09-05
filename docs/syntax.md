@@ -239,10 +239,10 @@ assigned directly:
 val label = if (score > 50) "pass" else "fail"
 ```
 
-An `if`/`when` branch may be either a `{ ... }` block or, without braces, a
-single **statement** — not just an expression, so `return`/`break`/
-`continue` work in this position with no braces needed, same as real
-Kotlin:
+An `if`/`when` branch, or a `while`/`for` loop's own body, may be either a
+`{ ... }` block or, without braces, a single **statement** — not just an
+expression, so `return`/`break`/`continue` work in this position with no
+braces needed, same as real Kotlin:
 
 ```kotlin
 if (cond) { ... } else { ... }
@@ -285,6 +285,7 @@ If no arm matches and there's no `else`, the `when` evaluates to `Unit`.
 while (cond) {
     ...
 }
+while (cond) i = i + 1   // braceless single-statement body, same as if/when
 ```
 
 There is no `do { ... } while (cond)` form — only the condition-first
@@ -297,6 +298,7 @@ Iterates an inclusive `Int` range or a `List` (e.g. from `listOf(...)`):
 ```kotlin
 for (i in 1..5) { println(i) }
 for (item in listOf("a", "b")) { println(item) }
+for (i in 1..5) println(i)   // braceless single-statement body
 ```
 
 ### `break` / `continue` / `return`

@@ -1518,6 +1518,12 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
     }
 
     #[test]
+    fn braceless_for_and_while_bodies_run_correctly() {
+        let src = "var j = 0\nfor (i in listOf(1, 2, 3)) j = j + i\nprintln(j)\nvar k = 0\nwhile (k < 3) k = k + 1\nprintln(k)";
+        assert_eq!(run(src), "6\n3\n");
+    }
+
+    #[test]
     fn increment_an_undefined_name_is_a_runtime_error() {
         let err = run_err("x++\n");
         assert!(err.contains("undefined name 'x'"), "{err}");
