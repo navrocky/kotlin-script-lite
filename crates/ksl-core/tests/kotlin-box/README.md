@@ -84,7 +84,6 @@ fixed: move its path from `PENDING_FILES` to `ACTIVE_FILES` in
 
 | File | Blocked on |
 |---|---|
-| `controlStructures/doWhile.ksl` | `do { } while (...)` — no such loop construct in ksl yet (not on any roadmap phase as of this writing) |
-| `controlStructures/factorialTest.ksl` | same (`do`/`while`) |
+| `controlStructures/doWhile.ksl` | bare builtin property access (`z.length`, real Kotlin's own `String.length`) — deliberately out of scope until classes/properties exist (`docs/roadmap.md` Phase 6); `do { } while (...)` itself (Phase 0.8) no longer blocks this one |
 | `controlStructures/kt2147.ksl` | classes (`docs/roadmap.md` Phase 6) |
 | `basics/local_variable.ksl` | `throw` (`docs/roadmap.md` Phase 5) |

@@ -1,4 +1,4 @@
-// if/when as expressions, while, for over a range and a list, break/continue.
+// if/when as expressions, while, do/while, for over a range and a list, break/continue.
 fun classify(n: Int): String {
     return when {
         n < 0 -> "negative"
@@ -32,3 +32,10 @@ println("label = $label")
 for (word in listOf("a", "bb", "ccc")) {
     println("${word}: ${length(word)}")
 }
+
+// do/while: body runs at least once, condition checked after it.
+var count = 0
+do {
+    count = count + 1
+} while (count < 3)
+println("count = $count")

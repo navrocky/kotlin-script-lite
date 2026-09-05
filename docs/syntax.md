@@ -288,8 +288,19 @@ while (cond) {
 while (cond) i = i + 1   // braceless single-statement body, same as if/when
 ```
 
-There is no `do { ... } while (cond)` form — only the condition-first
-`while` above. See "Not supported" below.
+### `do` / `while`
+
+```kotlin
+do {
+    ...
+} while (cond)
+do i = i + 1 while (cond)   // braceless single-statement body, same as while
+```
+
+The body always runs at least once — `cond` is only checked *after* it,
+unlike `while`. `cond` is resolved/evaluated in the body's own scope, not
+the enclosing one, matching real Kotlin/Java: `do { val x = f() } while (x
+> 0)` can see `x`.
 
 ### `for`
 
@@ -594,7 +605,4 @@ map literal doesn't exist in real Kotlin at all), collection indexing
 a real `List<T>` rather than a special case — `try`/`catch`, coroutines,
 extension functions, and network imports. `.` method syntax only covers
 the small builtin set in [`stdlib.md`](stdlib.md#methods) — arbitrary
-field/method access on a value needs classes/objects first. There's also
-no `do { ... } while (cond)` loop — only condition-first `while` (see
-above); found missing during `docs/roadmap.md`'s Phase 0.5 audit, not yet
-on any roadmap phase.
+field/method access on a value needs classes/objects first.

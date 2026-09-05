@@ -35,6 +35,7 @@ PENDING_DIR="$ROOT/crates/ksl-core/tests/kotlin-box-pending"
 ACTIVE_FILES=(
   "controlStructures/bottles.kt"
   "controlStructures/continueInWhile.kt"
+  "controlStructures/factorialTest.kt"
   "controlStructures/ifConst1.kt"
   "controlStructures/kt1899.kt"
   "controlStructures/kt870.kt"
@@ -44,13 +45,15 @@ ACTIVE_FILES=(
 
 # --- kotlin-box-pending: vendored for visibility and future promotion,
 # each blocked on one concrete, already-tracked gap:
-#   doWhile.kt, factorialTest.kt  -- `do { } while (...)` (no such loop
-#                                     construct in ksl at all yet)
-#   kt2147.kt                     -- classes (roadmap Phase 6)
-#   local_variable.kt             -- `throw` (roadmap Phase 5)
+#   doWhile.kt        -- bare builtin property access (`z.length`, real
+#                         Kotlin's own `String.length`) -- deliberately
+#                         out of scope until classes/properties exist
+#                         (roadmap Phase 6); `do { } while (...)` itself
+#                         (Phase 0.8) is no longer what blocks this one.
+#   kt2147.kt         -- classes (roadmap Phase 6)
+#   local_variable.kt -- `throw` (roadmap Phase 5)
 PENDING_FILES=(
   "controlStructures/doWhile.kt"
-  "controlStructures/factorialTest.kt"
   "controlStructures/kt2147.kt"
   "basics/local_variable.kt"
   "elvis/nullNullOk.kt"

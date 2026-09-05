@@ -408,6 +408,7 @@ impl<'a> Parser<'a> {
             TokenKind::Val | TokenKind::Var => self.parse_val_decl(),
             TokenKind::Fun => self.parse_fun_decl(),
             TokenKind::While => self.parse_while(),
+            TokenKind::Do => self.parse_do_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Return => {
                 self.advance();
@@ -528,6 +529,32 @@ impl<'a> Parser<'a> {
         let body = self.parse_branch();
         self.loop_depth -= 1;
         Ok(Stmt::new(StmtKind::While { cond, body: body? }, span))
+    }
+
+    /// `do <body> while (<cond>)` — `body` first (a `{ ... }` block or a
+    /// single statement, same as `while`/`if`), then `while (<cond>)`.
+    /// Unlike `if`/`else`, a newline right after the body's own closing `}`
+    /// must be tolerated *unconditionally* here, not just when `while`
+    /// happens to follow: real Kotlin's own grammar makes `while (...)`
+    /// mandatory after a `do` body, so — unlike `else`, which is genuinely
+    /// optional and needs the lookahead in `skip_separators_if_else_follows`
+    /// to avoid swallowing an unrelated next statement's leading newline —
+    /// there's no "next statement" this could wrongly consume instead.
+    fn parse_do_while(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.span();
+        self.advance(); // do
+        self.skip_newlines();
+        self.loop_depth += 1;
+        // Braceless single-statement body allowed too — see `parse_while`.
+        let body = self.parse_branch();
+        self.loop_depth -= 1;
+        let body = body?;
+        self.skip_newlines();
+        self.expect(TokenKind::While, "'while'")?;
+        self.expect(TokenKind::LParen, "'('")?;
+        let cond = self.parse_expr()?;
+        self.expect(TokenKind::RParen, "')'")?;
+        Ok(Stmt::new(StmtKind::DoWhile { body, cond }, span))
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
@@ -1438,6 +1465,45 @@ mod tests {
             StmtKind::While { body, .. } => assert_eq!(body.len(), 1),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn do_while_parses_braced_and_braceless_bodies() {
+        let stmts = parse_src("do { x = x + 1 } while (x < 10)");
+        match &stmts[0].kind {
+            StmtKind::DoWhile { body, cond } => {
+                assert_eq!(body.len(), 1);
+                assert!(matches!(cond.kind, ExprKind::Binary { .. }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Braceless single-statement body, same as `while`/`for`.
+        let stmts2 = parse_src("do x++ while (x < 10)");
+        match &stmts2[0].kind {
+            StmtKind::DoWhile { body, .. } => assert_eq!(body.len(), 1),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_while_tolerates_a_newline_between_the_bodys_closing_brace_and_while() {
+        // Unlike `else` (genuinely optional, needs a lookahead that only
+        // commits if `else` really follows), `while` is mandatory after a
+        // `do` body, so an unconditional `skip_newlines` is correct here.
+        let stmts = parse_src("do {\n    x = x + 1\n}\nwhile (x < 10)\n");
+        match &stmts[0].kind {
+            StmtKind::DoWhile { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_while_allows_break_and_continue_in_its_body() {
+        // `loop_depth` must be bumped for a `do` body exactly like `while`'s
+        // — this would be a parse error ("only allowed inside a loop") if
+        // `parse_do_while` forgot to do that.
+        parse_src("do {\n    if (x) break\n    if (y) continue\n} while (x < 10)");
     }
 
     #[test]

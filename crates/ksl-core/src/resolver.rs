@@ -1385,6 +1385,19 @@ impl<'a> Resolver<'a> {
                 self.narrowed = ambient;
                 Type::Unit
             }
+            StmtKind::DoWhile { body, cond } => {
+                // Unlike `While`, `cond` is walked in the *body's own*
+                // scope (opened once, shared by both), not `scope` — real
+                // Kotlin/Java semantics: `do { val x = 1 } while (x > 0)`
+                // sees `x`, since the body always runs before `cond` is
+                // ever checked. No narrowing carried into the body either:
+                // unlike `while`, the body isn't gated by `cond` being true
+                // (it always runs at least once).
+                let do_scope = self.open_scope(scope, stmt.span, following, ScopeKind::Loop);
+                self.walk_stmts(body, do_scope, following);
+                self.walk_expr(cond, do_scope, following);
+                Type::Unit
+            }
             StmtKind::For { var_name, var_name_span, iterable, body } => {
                 self.walk_expr(iterable, scope, following);
                 // Ranges are always `Int..Int` (enforced at runtime too —
@@ -3124,6 +3137,28 @@ mod tests {
         // reset loop context either -- keep searching past it.
         let result = resolve_src("while (true) {\n    if (true) {\n        break\n    }\n}\n");
         assert!(result.table.inside_a_loop_at(3, 9));
+    }
+
+    #[test]
+    fn inside_a_loop_at_is_true_inside_a_do_whiles_own_body() {
+        let result = resolve_src("do {\n    break\n} while (true)\n");
+        assert!(result.table.inside_a_loop_at(2, 5));
+    }
+
+    #[test]
+    fn do_whiles_condition_resolves_a_name_declared_in_its_own_body() {
+        // Real Kotlin/Java semantics: `cond` is resolved in the body's own
+        // scope, not the enclosing one, since the body always runs before
+        // `cond` is ever checked -- must NOT be an "undefined name"
+        // diagnostic. See `interpreter.rs`'s matching runtime test.
+        let result = resolve_src("do {\n    val x = 1\n} while (x > 0)\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn do_whiles_body_local_does_not_leak_past_the_loop() {
+        let result = resolve_src("do {\n    val x = 1\n} while (true)\nprintln(x)\n");
+        assert!(!result.diagnostics.is_empty(), "'x' must not be visible after the loop");
     }
 
     #[test]

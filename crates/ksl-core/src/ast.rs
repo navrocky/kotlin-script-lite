@@ -309,6 +309,16 @@ pub enum StmtKind {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    /// `do <body> while (<cond>)` — unlike `While`, the body always runs at
+    /// least once (`cond` is checked *after* the body, not before), and
+    /// `cond` is resolved/evaluated in the body's own scope, not the
+    /// enclosing one — matching real Kotlin/Java: `do { val x = ... }
+    /// while (x > 0)` sees `x`. See `resolver::Resolver::walk_stmt` and
+    /// `Interpreter::exec_stmt`'s own `DoWhile` handling for exactly how.
+    DoWhile {
+        body: Vec<Stmt>,
+        cond: Expr,
+    },
     For {
         var_name: String,
         /// Span of just the loop variable name, used for hover/goto-definition.

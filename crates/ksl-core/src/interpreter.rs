@@ -455,6 +455,27 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(())
             }
+            StmtKind::DoWhile { body, cond } => {
+                loop {
+                    let loop_env = env.child();
+                    match self.exec_block(body, &loop_env) {
+                        // `continue` still needs `cond` checked (against
+                        // this same iteration's env, see below) before
+                        // deciding whether to loop again — it only skips
+                        // the rest of the body, not the condition check.
+                        Ok(_) | Err(Flow::Continue) => {}
+                        Err(Flow::Break) => break,
+                        Err(e) => return Err(e),
+                    }
+                    // Evaluated against `loop_env`, not `env` — matching
+                    // `resolver.rs`'s `DoWhile` handling: `cond` can see
+                    // this iteration's own body-local variables.
+                    if !self.eval_expr(cond, &loop_env)?.is_truthy() {
+                        break;
+                    }
+                }
+                Ok(())
+            }
             StmtKind::For {
                 var_name,
                 iterable,
@@ -1416,6 +1437,58 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
             run(r#"for (x in listOf("a", "b")) { println(x) }"#),
             "a\nb\n"
         );
+    }
+
+    #[test]
+    fn do_while_runs_the_body_at_least_once() {
+        // The one thing that distinguishes it from `while`: the condition
+        // is checked *after* the body, so a false-from-the-start condition
+        // still lets the body run exactly once.
+        assert_eq!(run("var ran = 0\ndo { ran = ran + 1 } while (false)\nprintln(ran)"), "1\n");
+    }
+
+    #[test]
+    fn do_while_loops_while_true_like_kotlin() {
+        assert_eq!(
+            run("var i = 0\nvar count = 0\ndo {\n    count = count + 1\n    i = i + 1\n} while (i < 5)\nprintln(count)"),
+            "5\n"
+        );
+        // Braceless single-statement body.
+        assert_eq!(run("var x = 0\ndo x = x + 1 while (x < 3)\nprintln(x)"), "3\n");
+    }
+
+    #[test]
+    fn do_while_break_exits_without_checking_the_condition_again() {
+        let src = "var i = 0\ndo {\n    i = i + 1\n    if (i == 3) break\n} while (true)\nprintln(i)";
+        assert_eq!(run(src), "3\n");
+    }
+
+    #[test]
+    fn do_while_continue_still_checks_the_condition_before_looping_again() {
+        // `continue` skips the rest of the body but must not skip the
+        // condition check too, or this would loop forever instead of
+        // stopping at 5.
+        let src =
+            "var i = 0\nvar evens = 0\ndo {\n    i = i + 1\n    if (i % 2 != 0) continue\n    evens = evens + 1\n} while (i < 5)\nprintln(evens)";
+        assert_eq!(run(src), "2\n");
+    }
+
+    #[test]
+    fn do_while_condition_sees_the_bodys_own_locals() {
+        // Real Kotlin/Java semantics: unlike `while`, a `do`-loop's
+        // condition is resolved/evaluated in the body's own scope, since
+        // the body always runs before the condition is ever checked.
+        let src = "var i = 0\ndo {\n    val doubled = i * 2\n    i = i + 1\n} while (doubled < 6)\nprintln(i)";
+        assert_eq!(run(src), "4\n");
+    }
+
+    #[test]
+    fn do_while_gives_each_iteration_its_own_fresh_scope() {
+        // Same per-iteration scoping `while`/`for` already have: declaring
+        // the same name again on the next iteration isn't a redeclaration
+        // error.
+        let src = "var i = 0\ndo {\n    val tmp = i\n    i = tmp + 1\n} while (i < 3)\nprintln(i)";
+        assert_eq!(run(src), "3\n");
     }
 
     #[test]

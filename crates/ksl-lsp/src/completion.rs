@@ -909,7 +909,7 @@ mod tests {
         let general_text = "val outer = 1\nfun f(p: Int): Int {\n    val inner = 2\n    return inner\n}\n";
         let general_names = labels(general_text, Position::new(3, 4));
         let general_kws = [
-            "fun", "val", "var", "if", "when", "while", "for", "return", "null", "true", "false",
+            "fun", "val", "var", "if", "when", "while", "do", "for", "return", "null", "true", "false",
         ];
         for kw in general_kws {
             assert!(general_names.contains(&kw.to_string()), "'{kw}' wasn't offered inside a function body");

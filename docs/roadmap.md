@@ -98,6 +98,10 @@ Phase 0: tech-debt (NativeFn span, break/continue fix)
    +--> Phase 0.5: Kotlin box-test conformance harness [initial cut shipped]
    |    (independent side-track — starts here, grows opportunistically as
    |    every later phase lands, never gates or is gated by anything below)
+   +--> Phase 0.8: `do { ... } while (cond)` [DONE]
+   |    (independent side-track, surfaced by Phase 0.5's audit — same
+   |    dependency-graph position `++`/`--` had, no prerequisites beyond
+   |    Phase 0, gates nothing below)
    v
 Phase 1: `.` postfix member-access syntax  <-- blocks 6, 7, 8
    |
@@ -353,20 +357,16 @@ duplicated here, so it doesn't go stale.
   instead of hand-rolling an expression-only wrapper; see `docs/syntax.md`
   ("Control flow", "if"/"when") and `parser.rs`/`interpreter.rs`'s new
   regression tests.
-- **A fourth, larger gap surfaced by the same audit, deliberately left
-  unaddressed by this phase**: ksl has **no `do { ... } while (cond)`
-  loop** at all — not a smaller "missing operator" fix like `++`/`--`, but
-  a whole new loop construct (new keyword, new `StmtKind`, new parser/
-  interpreter/resolver support) disproportionate to this phase's own
-  scope. Documented in `docs/syntax.md`'s "Not supported" and tracked via
-  `kotlin-box-pending/controlStructures/{doWhile,factorialTest}.ksl` — not
-  yet its own roadmap phase; whoever picks it up next should give it one
-  (dependency-graph position: independent, like `++`/`--` was, no
-  prerequisites beyond Phase 0).
-- **Vendored so far**: 7 active
-  (`controlStructures/{bottles,continueInWhile,ifConst1,kt1899,kt870}.ksl`,
-  `elvis/nullNullOk.ksl`, `basics/concatenation.ksl`) + 4 pending
-  (`controlStructures/{doWhile,factorialTest,kt2147}.ksl`,
+- **A fourth, larger gap surfaced by the same audit**: ksl had **no
+  `do { ... } while (cond)` loop** at all — not a smaller "missing
+  operator" fix like `++`/`--`, but a whole new loop construct (new
+  keyword, new `StmtKind`, new parser/interpreter/resolver support)
+  disproportionate to this phase's own scope. Deliberately left
+  unaddressed *here*; shipped later as its own **Phase 0.8** (see below).
+- **Vendored so far**: 8 active
+  (`controlStructures/{bottles,continueInWhile,factorialTest,ifConst1,kt1899,kt870}.ksl`,
+  `elvis/nullNullOk.ksl`, `basics/concatenation.ksl`) + 3 pending
+  (`controlStructures/{doWhile,kt2147}.ksl`,
   `basics/local_variable.ksl`), all at pinned SHA
   `8fc606186b9d2be2bce6b390f7bf12f7cdb41adc` — see
   `crates/ksl-core/tests/kotlin-box/README.md`'s own table for exactly
@@ -939,6 +939,44 @@ this is what originally motivated the investigation, but was meaningless
 to do before `import`/`@file:Import` resolution was actually precise (it
 would have rejected almost every multi-file script on a false positive).
 Now that it's precise, this is a small, focused follow-up.
+
+---
+
+## Phase 0.8 — `do { ... } while (cond)` [DONE]
+
+Surfaced by Phase 0.5's box-test audit as a real, previously-untracked gap
+(`kotlin-box-pending/controlStructures/{doWhile,factorialTest}.ksl`),
+deliberately deferred there since it's a whole new loop construct, not a
+smaller fix. Independent of every other phase — no prerequisites beyond
+Phase 0, same dependency-graph position `++`/`--` had.
+
+**Shipped**: new `TokenKind::Do`/keyword, `StmtKind::DoWhile { body, cond
+}`. Parser: `parse_do_while` mirrors `parse_while` (braceless
+single-statement body via the existing `parse_branch`, `loop_depth`
+bumped the same way so `break`/`continue` are legal inside), with an
+unconditional `skip_newlines()` between the body and the mandatory
+`while (cond)` — unlike `if`/`else`'s own lookahead
+(`skip_separators_if_else_follows`), no lookahead-then-maybe-rollback is
+needed here since `while` isn't optional the way `else` is, so there's no
+"next unrelated statement" a newline-skip could wrongly swallow instead.
+
+**The one real semantic subtlety, not just new syntax**: matching real
+Kotlin/Java, `cond` is resolved (`resolver.rs`) and evaluated
+(`interpreter.rs`) in the loop body's *own* scope, not the enclosing
+one — `do { val x = f() } while (x > 0)` sees `x`, since the body always
+runs at least once before `cond` is ever checked (unlike `while`, where
+`cond` gates *whether* the body runs at all, so it's evaluated in the
+outer scope, before the body's own scope even opens). Interpreter detail:
+`continue` inside a `do`-body must still evaluate `cond` (against that
+same iteration's env) before deciding whether to loop again — it only
+skips the rest of the body, not the condition check; `break` skips the
+condition check entirely and exits.
+
+**Box tests**: `controlStructures/factorialTest.ksl` promoted to
+`kotlin-box/` (real `do {...} while(...)` loop, verified against real
+Kotlin's own `box()` convention). `controlStructures/doWhile.ksl` stays
+pending — it also uses a bare `z.length` property access, a separate,
+still-open gap (Phase 6) unrelated to `do`/`while` itself.
 
 ---
 

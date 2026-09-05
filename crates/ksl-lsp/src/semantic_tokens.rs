@@ -30,7 +30,7 @@ const VARIABLE: u32 = 4;
 fn token_type_index(kind: &TokenKind) -> Option<u32> {
     use TokenKind::*;
     let idx = match kind {
-        Fun | Val | Var | If | Else | When | While | For | In | Return | Break | Continue
+        Fun | Val | Var | If | Else | When | While | Do | For | In | Return | Break | Continue
         | Package | Import | Null | Bool(_) => KEYWORD,
 
         Int(_) | Double(_) => NUMBER,
