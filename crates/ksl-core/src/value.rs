@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -8,8 +7,19 @@ use std::sync::Arc;
 use crate::ast::{FunBody, Param, TypeAnnotation};
 use crate::environment::Env;
 use crate::error::{Flow, Span};
+use crate::gc::{GcHandle, GcRef, Trace};
 use crate::interpreter::Interpreter;
 
+/// Invariant: a native function must never capture an `Env` or a `Value`
+/// in its own Rust closure — `Interpreter::collect_cycles`'s reachability
+/// trace (`value_refs`, `Trace::trace_refs`) can only see through `Value`'s
+/// own variants, not into an opaque `Box<dyn Fn>`'s captures. An `Env`
+/// captured that way would be invisible to the trace, so a collection pass
+/// could wrongly treat it as unreachable garbage and clear it while the
+/// closure still silently holds it — corrupting state, not just leaking
+/// it. Every registration in `stdlib.rs` operates only on its own
+/// `Vec<Value>` arguments and the `&mut Interpreter` passed in; keep it
+/// that way.
 pub type NativeFn = dyn Fn(&mut Interpreter, Vec<Value>, Span) -> Result<Value, Flow>;
 
 #[derive(Clone)]
@@ -20,7 +30,13 @@ pub enum Value {
     Str(Rc<str>),
     Unit,
     Null,
-    List(Rc<RefCell<Vec<Value>>>),
+    // `GcRef` is deliberately `pub(crate)`, not part of `ksl-core`'s public
+    // API — external code should only ever reach a `List`'s contents
+    // through `Value`'s own methods (`Display`, `values_equal`, ...), the
+    // same way it already can't construct/inspect `FunctionValue.closure`
+    // directly beyond what `Value`'s own API exposes.
+    #[allow(private_interfaces)]
+    List(GcRef<Vec<Value>>),
     Function(Rc<FunctionValue>),
     Native(Rc<NativeValue>),
     /// Real user-defined function overloading: a second (or later) `fun`
@@ -32,6 +48,52 @@ pub enum Value {
     /// already uses for this. Never produced for a lambda (anonymous,
     /// never shares a name with anything to group with).
     Overload(Rc<Vec<Rc<FunctionValue>>>),
+}
+
+/// A `List`'s backing store is itself a GC-tracked node (not just something
+/// `Env`/`Object` transparently see through) — necessary, not incidental:
+/// if two different tracked nodes each held a reference to the *same*
+/// shared list, and the list's own contents were only walked transparently
+/// through each holder's own trace, `Interpreter::collect_cycles` would
+/// double-count the list's single real edge to whatever it contains once
+/// per holder, and — worse — would have no way to notice the list itself
+/// being held from *outside* the tracked graph entirely (e.g. handed back
+/// to an embedder from a call and kept there between calls). Giving `List`
+/// its own node, exactly like `Env`, is what lets the algorithm's real
+/// `Rc::strong_count` check see that correctly.
+impl Trace for Vec<Value> {
+    fn trace_refs(&self, out: &mut Vec<GcHandle>) {
+        for v in self {
+            value_refs(v, out);
+        }
+    }
+
+    fn clear(&mut self) {
+        Vec::clear(self);
+    }
+}
+
+/// Every GC-tracked node (`Env`, `List`, and — once they exist — a class
+/// instance's fields, a `Map`'s entries, ...) this value directly (one
+/// level) holds. This exhaustive match — no wildcard arm — is the one
+/// place in the whole mechanism that can't be automated away: it's what
+/// makes adding a new `Value` variant that can hold a `GcRef` a compile
+/// error (`non-exhaustive patterns`) until this function is updated, so
+/// forgetting to wire a new container into cycle collection isn't a
+/// silent bug, it's a build failure.
+pub(crate) fn value_refs(v: &Value, out: &mut Vec<GcHandle>) {
+    match v {
+        Value::Function(f) => out.push(f.closure.handle()),
+        Value::Overload(group) => out.extend(group.iter().map(|f| f.closure.handle())),
+        Value::List(l) => out.push(l.handle()),
+        Value::Int(_)
+        | Value::Double(_)
+        | Value::Bool(_)
+        | Value::Str(_)
+        | Value::Unit
+        | Value::Null
+        | Value::Native(_) => {}
+    }
 }
 
 pub struct FunctionValue {
@@ -137,7 +199,7 @@ impl Value {
             (Value::Unit, Value::Unit) => true,
             (Value::Null, Value::Null) => true,
             (Value::List(x), Value::List(y)) => {
-                Rc::ptr_eq(x, y) || {
+                GcRef::ptr_eq(x, y) || {
                     let (xb, yb) = (x.borrow(), y.borrow());
                     xb.len() == yb.len()
                         && xb.iter().zip(yb.iter()).all(|(a, b)| Value::values_equal(a, b))

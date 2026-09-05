@@ -1,9 +1,7 @@
 //! `kotlin.collections` — `listOf`. Auto-imported, matching real Kotlin.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::environment::Env;
+use crate::gc::GcRef;
 use crate::resolver::SymbolKind;
 use crate::types::Type;
 use crate::value::Value;
@@ -26,5 +24,5 @@ pub(super) const PACKAGE: BuiltinPackage = BuiltinPackage {
 
 /// Registers `kotlin.collections`'s members (`listOf`) onto `env`.
 fn populate(env: &Env) {
-    register(env, "listOf", |_interp, args, _span| Ok(Value::List(Rc::new(RefCell::new(args)))));
+    register(env, "listOf", |interp, args, _span| Ok(Value::List(GcRef::new(interp.gc.clone(), args))));
 }

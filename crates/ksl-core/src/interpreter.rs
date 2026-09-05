@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,6 +7,7 @@ use std::sync::Arc;
 use crate::ast::*;
 use crate::environment::{AssignError, Env};
 use crate::error::{Flow, RuntimeError, Span, StackFrame};
+use crate::gc::GcRegistry;
 use crate::value::{function_signature, FunctionValue, Value};
 
 pub struct Interpreter<'a> {
@@ -47,6 +47,15 @@ pub struct Interpreter<'a> {
     /// place until `run_in_env` reads them off into the error itself (see
     /// that function) and clears this back to empty.
     call_stack: Vec<StackFrame>,
+    /// This interpreter's own cycle-collection registry — every `Env`/
+    /// `List` (and, eventually, every other GC-tracked container) created
+    /// anywhere in its lifetime registers into this one automatically at
+    /// construction time (see `gc::GcRef::new`), so nothing here needs to
+    /// remember to opt in. `collect_cycles` reads it to find candidates
+    /// for its trial-deletion pass. Shared (`Rc`, not owned outright)
+    /// because `Env`/`List`/etc. each carry a handle to it too — see
+    /// `gc.rs`'s module doc comment.
+    pub(crate) gc: Rc<GcRegistry>,
     /// Test-only instrumentation: counts calls that fell through to
     /// `call_overload`'s by-runtime-value search, as opposed to the
     /// `ExprKind::Call` fast path that uses the resolver's own
@@ -55,9 +64,27 @@ pub struct Interpreter<'a> {
     overload_search_count: u32,
 }
 
+/// Every named `fun` creates a real `Rc` cycle (`StmtKind::FunDecl`'s
+/// `closure: env.clone()`, stored back into that same `env`) — plain `Rc`
+/// drop can never reclaim that on its own. `globals`/each package `Env`
+/// legitimately need to keep such cycles alive for the interpreter's whole
+/// life (breaking them earlier would break recursion/re-invocation), so the
+/// only correct place to break them is right here, when the `Interpreter`
+/// itself is going away for good and nothing needs `globals` to keep
+/// working anymore.
+impl<'a> Drop for Interpreter<'a> {
+    fn drop(&mut self) {
+        self.globals.clear();
+        for env in self.packages.values() {
+            env.clear();
+        }
+    }
+}
+
 impl<'a> Interpreter<'a> {
     pub fn new(out: &'a mut dyn std::io::Write) -> Self {
         let globals = Env::new();
+        let gc = globals.registry();
         let mut packages = HashMap::new();
         // One synthetic package env per `stdlib::STDLIB_PACKAGES` entry —
         // real Kotlin packages (`kotlin.io`, `kotlin.test`, ...), not
@@ -87,6 +114,7 @@ impl<'a> Interpreter<'a> {
             current_file: Arc::from(Path::new("<script>")),
             current_resolved: Rc::new(HashMap::new()),
             call_stack: Vec::new(),
+            gc,
             #[cfg(test)]
             overload_search_count: 0,
         }
@@ -95,6 +123,15 @@ impl<'a> Interpreter<'a> {
     #[cfg(test)]
     pub(crate) fn overload_search_count(&self) -> u32 {
         self.overload_search_count
+    }
+
+    /// Test-only: how many still-live GC-tracked nodes the registry
+    /// currently holds — used to prove `collect_cycles` keeps this bounded
+    /// across repeated calls rather than growing with the number of calls
+    /// made.
+    #[cfg(test)]
+    pub(crate) fn registry_len(&self) -> usize {
+        self.gc.len()
     }
 
     /// The call stack captured at the point of the most recent uncaught
@@ -132,6 +169,96 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Reclaims `Env`s that became unreachable-but-cyclic since the last
+    /// collection (or since construction) — e.g. a locally-scoped closure
+    /// that captured its own defining scope, called once and no longer
+    /// needed. Plain `Rc` drop can't reclaim such a cycle on its own (see
+    /// `Interpreter`'s `Drop` impl's doc comment for the general problem);
+    /// this runs the trial-deletion algorithm real Kotlin's GC would do
+    /// implicitly, restricted to exactly the cyclic case that reference
+    /// counting alone can't handle. Returns how many `Env`s were reclaimed
+    /// this way (0 is the common, expected result — most code creates no
+    /// such cycles).
+    ///
+    /// # Only call this between top-level calls into a loaded program
+    /// Calling this while a KSL call is still executing on the Rust stack
+    /// (e.g. from inside a `NativeFn` callback, or any other re-entrant
+    /// path) is unsound: the currently-executing call's own local `Env`
+    /// chain typically lives only as a Rust-local variable somewhere on
+    /// the call stack (see `call_function_inner`'s `call_env`) — it is not
+    /// reachable from `globals`/`packages`, and `call_stack:
+    /// Vec<StackFrame>` holds no `Env` at all. A collection pass run at
+    /// that moment would see zero external anchor for that env chain and
+    /// could clear out the still-running call's own variables mid-
+    /// execution, corrupting it rather than merely freeing memory. Safe
+    /// call sites: right after `run`/`run_in_env` returns (`Ok` or `Err`),
+    /// before making the next top-level call into the loaded program.
+    pub fn collect_cycles(&mut self) -> usize {
+        let live = self.gc.live_nodes();
+        if live.is_empty() {
+            return 0;
+        }
+
+        let index_of = |h: &crate::gc::GcHandle| {
+            let target = h.upgrade()?;
+            live.iter().position(|l| Rc::ptr_eq(l, &target))
+        };
+
+        // Real strong count minus our own transient hold via `live` — the
+        // one and only place this algorithm needs that `-1` compensation.
+        let mut counts: Vec<usize> = live.iter().map(|n| Rc::strong_count(n).saturating_sub(1)).collect();
+
+        // Subtract every reference held by *another* candidate — what's
+        // left is each candidate's count of holders *outside* the set.
+        for node in &live {
+            let mut refs = Vec::new();
+            node.borrow().trace_refs(&mut refs);
+            for neighbor in &refs {
+                if let Some(i) = index_of(neighbor) {
+                    counts[i] = counts[i].saturating_sub(1);
+                }
+            }
+        }
+
+        // Seed real roots (globals/packages) plus every candidate with a
+        // positive external count, then transitively mark everything
+        // reachable from them.
+        let mut reachable = vec![false; live.len()];
+        let mut worklist: Vec<usize> = counts.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, _)| i).collect();
+        for root in std::iter::once(self.globals.handle()).chain(self.packages.values().map(Env::handle)) {
+            if let Some(i) = index_of(&root) {
+                worklist.push(i);
+            }
+        }
+        while let Some(i) = worklist.pop() {
+            if reachable[i] {
+                continue;
+            }
+            reachable[i] = true;
+            let mut refs = Vec::new();
+            live[i].borrow().trace_refs(&mut refs);
+            for neighbor in &refs {
+                if let Some(j) = index_of(neighbor) {
+                    if !reachable[j] {
+                        worklist.push(j);
+                    }
+                }
+            }
+        }
+
+        // Whatever's left unreached has no anchor outside this set at
+        // all — true unreachable cyclic garbage. Clearing it breaks the
+        // cycle; ordinary `Rc` drop reclaims the rest.
+        let mut cleared = 0;
+        for (i, node) in live.iter().enumerate() {
+            if !reachable[i] {
+                node.borrow_mut().clear();
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
     fn run_in_env_inner(&mut self, stmts: &[Stmt], env: &Env) -> Result<(), Flow> {
         for stmt in stmts {
             self.exec_stmt(stmt, env)?;
@@ -143,10 +270,7 @@ impl<'a> Interpreter<'a> {
     /// top-level code runs in, and that a `name.member`/`import
     /// name.member` reference resolves `member` against.
     pub fn package_env(&mut self, name: &str) -> Env {
-        self.packages
-            .entry(name.to_string())
-            .or_insert_with(|| self.globals.child())
-            .clone()
+        self.packages.entry(name.to_string()).or_insert_with(|| self.globals.child()).clone()
     }
 
     /// Resolves a package-qualified path like `["a","b","greet"]` — package
@@ -269,7 +393,7 @@ impl<'a> Interpreter<'a> {
                         AssignOp::Rem => BinaryOp::Rem,
                         AssignOp::Set => unreachable!(),
                     };
-                    apply_binary(bop, cur, rhs, stmt.span)?
+                    apply_binary(&self.gc, bop, cur, rhs, stmt.span)?
                 };
                 env.assign(name, new_val).map_err(|e| match e {
                     AssignError::Undefined => {
@@ -477,7 +601,7 @@ impl<'a> Interpreter<'a> {
                     IncDecOp::Inc => BinaryOp::Add,
                     IncDecOp::Dec => BinaryOp::Sub,
                 };
-                let new_val = apply_binary(bop, cur.clone(), Value::Int(1), expr.span)?;
+                let new_val = apply_binary(&self.gc, bop, cur.clone(), Value::Int(1), expr.span)?;
                 env.assign(name, new_val.clone()).map_err(|e| match e {
                     AssignError::Undefined => RuntimeError::new(format!("undefined name '{name}'"), expr.span),
                     AssignError::NotMutable => RuntimeError::new(format!("cannot reassign val '{name}'"), expr.span),
@@ -507,7 +631,7 @@ impl<'a> Interpreter<'a> {
                 }
                 let l = self.eval_expr(lhs, env)?;
                 let r = self.eval_expr(rhs, env)?;
-                apply_binary(*op, l, r, expr.span)
+                apply_binary(&self.gc, *op, l, r, expr.span)
             }
             ExprKind::Range { start, end } => {
                 let s = self.eval_expr(start, env)?;
@@ -515,7 +639,7 @@ impl<'a> Interpreter<'a> {
                 match (s, e) {
                     (Value::Int(a), Value::Int(b)) => {
                         let items: Vec<Value> = (a..=b).map(Value::Int).collect();
-                        Ok(Value::List(Rc::new(RefCell::new(items))))
+                        Ok(Value::List(crate::gc::GcRef::new(self.gc.clone(), items)))
                     }
                     (s, e) => Err(RuntimeError::new(
                         format!("range bounds must be Int, got {} and {}", s.type_name(), e.type_name()),
@@ -566,15 +690,20 @@ impl<'a> Interpreter<'a> {
                 else_branch,
             } => {
                 if self.eval_expr(cond, env)?.is_truthy() {
-                    self.exec_block(then_branch, &env.child())
+                    let child = env.child();
+                    self.exec_block(then_branch, &child)
                 } else if let Some(eb) = else_branch {
-                    self.exec_block(eb, &env.child())
+                    let child = env.child();
+                    self.exec_block(eb, &child)
                 } else {
                     Ok(Value::Unit)
                 }
             }
             ExprKind::When { subject, arms } => self.eval_when(subject.as_deref(), arms, env),
-            ExprKind::Block(stmts) => self.exec_block(stmts, &env.child()),
+            ExprKind::Block(stmts) => {
+                let child = env.child();
+                self.exec_block(stmts, &child)
+            }
             ExprKind::NullLit => Ok(Value::Null),
             ExprKind::Elvis { lhs, rhs } => {
                 let l = self.eval_expr(lhs, env)?;
@@ -594,7 +723,8 @@ impl<'a> Interpreter<'a> {
         };
         for arm in arms {
             if arm.is_else {
-                return self.exec_block(&arm.body, &env.child());
+                let child = env.child();
+                return self.exec_block(&arm.body, &child);
             }
             for cond in &arm.conditions {
                 let matched = match cond {
@@ -605,7 +735,8 @@ impl<'a> Interpreter<'a> {
                     WhenCondition::Bool(e) => self.eval_expr(e, env)?.is_truthy(),
                 };
                 if matched {
-                    return self.exec_block(&arm.body, &env.child());
+                    let child = env.child();
+                    return self.exec_block(&arm.body, &child);
                 }
             }
         }
@@ -910,7 +1041,7 @@ fn compare_values(l: &Value, r: &Value, span: Span) -> Result<Ordering, Flow> {
     }
 }
 
-fn apply_binary(op: BinaryOp, l: Value, r: Value, span: Span) -> Result<Value, Flow> {
+fn apply_binary(gc: &Rc<GcRegistry>, op: BinaryOp, l: Value, r: Value, span: Span) -> Result<Value, Flow> {
     use BinaryOp::*;
     match op {
         Add => match (&l, &r) {
@@ -919,7 +1050,7 @@ fn apply_binary(op: BinaryOp, l: Value, r: Value, span: Span) -> Result<Value, F
             (Value::List(a), Value::List(b)) => {
                 let mut v = a.borrow().clone();
                 v.extend(b.borrow().iter().cloned());
-                Ok(Value::List(Rc::new(RefCell::new(v))))
+                Ok(Value::List(crate::gc::GcRef::new(gc.clone(), v)))
             }
             _ => match numeric_pair(&l, &r) {
                 Some((a, b)) => Ok(Value::Double(a + b)),
@@ -1012,7 +1143,9 @@ mod tests {
         let program = crate::parse_only(src).expect("valid syntax");
         let mut out = Vec::new();
         let mut interp = super::Interpreter::new(&mut out);
-        match interp.run(&program.stmts) {
+        let result = interp.run(&program.stmts);
+        drop(interp);
+        match result {
             Ok(()) => Ok(String::from_utf8(out).unwrap()),
             Err(crate::error::Flow::Error(e)) => Err(e.message),
             Err(_) => panic!("expected a Flow::Error"),
@@ -1024,6 +1157,118 @@ mod tests {
             Ok(_) => panic!("expected script to fail:\n{src}"),
             Err(e) => e,
         }
+    }
+
+    /// Isolates the cycle mechanics from the interpreter entirely: builds a
+    /// bare `Env` holding a `Value::Function` whose own `closure` points
+    /// back at it (the exact shape `StmtKind::FunDecl` produces for every
+    /// named function), proves plain `drop` cannot reduce its strong count
+    /// on its own (the cycle keeps it alive), and that `clear()` does.
+    #[test]
+    fn clear_breaks_a_self_referential_env_function_cycle() {
+        let env = crate::environment::Env::new();
+        let self_ref = std::rc::Rc::new(crate::value::FunctionValue {
+            name: Some("foo".to_string()),
+            params: Vec::new(),
+            return_type: None,
+            body: crate::ast::FunBody::Block(Vec::new()),
+            closure: env.clone(),
+            file: std::sync::Arc::from(std::path::Path::new("<test>")),
+            decl_span: crate::error::Span::default(),
+            resolved_calls: std::rc::Rc::new(std::collections::HashMap::new()),
+        });
+        env.define(
+            "foo",
+            crate::value::Value::Function(self_ref),
+            false,
+            crate::types::Type::Unknown,
+        );
+
+        // Held externally by our own `env` binding, plus internally by
+        // `self_ref.closure` — 2, not 1, proving the cycle exists.
+        assert_eq!(env.strong_count(), 2);
+        env.clear();
+        // `clear()` drops the `Value::Function` (and thus its `closure`
+        // handle) out of `vars` — only our own external handle remains.
+        assert_eq!(env.strong_count(), 1);
+    }
+
+    /// The real, end-to-end regression: every named `fun` (here, a
+    /// self-recursive one) leaves its own defining scope reachable only
+    /// through itself once nothing outside the `Interpreter` needs it
+    /// anymore. Proves `Interpreter`'s `Drop` impl (not just the isolated
+    /// `Env`-level mechanics above) actually breaks that cycle in the real
+    /// `globals` scope produced by running a real script.
+    #[test]
+    fn dropping_the_interpreter_reclaims_a_self_recursive_functions_cycle() {
+        let program = crate::parse_only("fun foo() { foo() }\n").expect("valid syntax");
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+
+        let globals = interp.globals.clone();
+        // Held by `interp.globals`, our own clone, and internally by
+        // `foo`'s own `closure` — at least 3, proving the cycle exists
+        // before teardown.
+        assert!(globals.strong_count() >= 3, "{}", globals.strong_count());
+
+        drop(interp);
+        // Only our own external clone remains once `Interpreter::drop`
+        // has cleared `globals` (and thus `foo`'s cyclic `closure`).
+        assert_eq!(globals.strong_count(), 1);
+    }
+
+    /// The target embedding pattern: load a program once, then call into
+    /// it repeatedly with the interpreter reused across calls (`globals`
+    /// persists, exactly as `Interpreter::run`/`run_in_env`'s own doc
+    /// comments already describe). Each call to `make` here defines its
+    /// own locally-scoped, self-referential closure that never escapes
+    /// into `globals` — without `collect_cycles`, each such call would
+    /// leave one more permanently-live `Env` behind. Proves the registry
+    /// stays bounded across many calls instead of growing with the call
+    /// count.
+    #[test]
+    fn collect_cycles_reclaims_a_local_self_referential_closure_across_repeated_calls() {
+        let src = "fun make(): Int {\n    fun inner() { inner() }\n    return 1\n}\n";
+        let program = crate::parse_only(src).expect("valid syntax");
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+        let make = interp.globals.get("make").expect("make is defined");
+        // `globals` plus one `Env` per stdlib package (both register too,
+        // like everything else — see `gc::GcRef::new`) are permanent,
+        // always-reachable baseline nodes, not a leak; what must stay
+        // bounded is everything *beyond* that fixed baseline.
+        let baseline = interp.registry_len();
+
+        for _ in 0..50 {
+            assert!(interp.call_value(make.clone(), Vec::new(), crate::error::Span::default()).is_ok());
+            interp.collect_cycles();
+        }
+        let len = interp.registry_len();
+        assert_eq!(len, baseline, "registry grew beyond its fixed baseline across repeated calls");
+    }
+
+    /// Guards the trial-deletion algorithm's correctness in the other
+    /// direction: something genuinely reachable from `globals` must
+    /// survive a collection pass and keep working afterward, not just
+    /// "not crash".
+    #[test]
+    fn collect_cycles_does_not_clear_a_function_still_reachable_from_globals() {
+        let src = "fun counter(): Int { return 42 }\n";
+        let program = crate::parse_only(src).expect("valid syntax");
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+
+        interp.collect_cycles();
+
+        let counter = interp.globals.get("counter").expect("counter is defined");
+        let result = interp.call_value(counter, Vec::new(), crate::error::Span::default());
+        assert!(
+            matches!(result, Ok(crate::value::Value::Int(42))),
+            "counter() should still work after collect_cycles"
+        );
     }
 
     #[test]

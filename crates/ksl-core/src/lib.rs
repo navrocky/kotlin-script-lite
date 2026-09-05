@@ -3,6 +3,7 @@ pub mod completion_probe;
 pub mod doc_comment;
 pub mod environment;
 pub mod error;
+pub(crate) mod gc;
 pub mod importer;
 pub mod interpreter;
 pub mod lexer;

@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::gc::{GcHandle, GcRef, GcRegistry, Trace};
 use crate::types::{self, Type};
-use crate::value::Value;
+use crate::value::{self, Value};
 
 struct Binding {
     value: Value,
@@ -24,10 +24,28 @@ struct EnvData {
     parent: Option<Env>,
 }
 
-/// A lexical scope. Cheaply cloneable (`Rc` handle) so closures can capture
-/// the environment active at their definition site.
+impl Trace for EnvData {
+    fn trace_refs(&self, out: &mut Vec<GcHandle>) {
+        if let Some(p) = &self.parent {
+            out.push(p.handle());
+        }
+        for binding in self.vars.values() {
+            value::value_refs(&binding.value, out);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.vars.clear();
+        self.parent = None;
+    }
+}
+
+/// A lexical scope. Cheaply cloneable (a `GcRef` handle) so closures can
+/// capture the environment active at their definition site. Backed by
+/// `GcRef<EnvData>`, not a bare `Rc<RefCell<EnvData>>` — see `gc.rs`'s
+/// module doc comment for why every such container needs to be a `GcRef`.
 #[derive(Clone)]
-pub struct Env(Rc<RefCell<EnvData>>);
+pub struct Env(GcRef<EnvData>);
 
 pub enum AssignError {
     Undefined,
@@ -37,17 +55,11 @@ pub enum AssignError {
 
 impl Env {
     pub fn new() -> Self {
-        Env(Rc::new(RefCell::new(EnvData {
-            vars: HashMap::new(),
-            parent: None,
-        })))
+        Env(GcRef::new(GcRegistry::new(), EnvData { vars: HashMap::new(), parent: None }))
     }
 
     pub fn child(&self) -> Self {
-        Env(Rc::new(RefCell::new(EnvData {
-            vars: HashMap::new(),
-            parent: Some(self.clone()),
-        })))
+        Env(GcRef::new(self.0.registry(), EnvData { vars: HashMap::new(), parent: Some(self.clone()) }))
     }
 
     /// `declared_type` is `Type::Unknown` for every binding except a
@@ -107,5 +119,47 @@ impl Env {
             Some(p) => p.assign(name, value),
             None => Err(AssignError::Undefined),
         }
+    }
+
+    /// Forcibly drops every binding (and the parent link) this scope holds,
+    /// breaking any `Rc` cycle running back through it (e.g. a named
+    /// function's own `closure` pointing back at the scope that defines
+    /// it — see `Interpreter`'s `Drop` impl, the only caller). Clearing
+    /// `parent` too, not just `vars`, is deliberate: a cleared `Env` should
+    /// be predictably, fully dead rather than silently falling through to a
+    /// parent chain that may itself be mid-teardown for an unrelated
+    /// reason.
+    pub(crate) fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    /// Test-only: how many strong `Rc` handles point at this scope right
+    /// now — used to prove a cycle exists (count stays above what's held
+    /// externally) and that `clear`/`Interpreter`'s `Drop` actually breaks
+    /// it. `collect_cycles` itself reads the same count generically, via
+    /// `Rc::strong_count` on the type-erased node — see `gc::GcRef`.
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+
+    /// A non-owning, type-erased handle for `Interpreter::gc`'s registry
+    /// and for `EnvData::trace_refs`'s own output — see `gc::GcHandle`.
+    pub(crate) fn handle(&self) -> GcHandle {
+        self.0.handle()
+    }
+
+    /// The registry this scope's chain of child scopes will register into
+    /// — same as whatever `Interpreter` created the root of this chain,
+    /// since `child` always derives it from `self` rather than taking one
+    /// from the caller.
+    pub(crate) fn registry(&self) -> Rc<GcRegistry> {
+        self.0.registry()
+    }
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self::new()
     }
 }

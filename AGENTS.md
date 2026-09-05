@@ -79,6 +79,34 @@ sequence) that the end-to-end examples don't check.
 - **Values are `Rc`-based, not `Arc`.** This interpreter is single-threaded
   by design; don't introduce `Send`/`Sync`/threading to `Value`,
   `Env`, or `Interpreter`.
+- **`Rc` cycles and memory: two separate mechanisms, don't conflate them.**
+  Every named `fun` creates a real self-referential `Rc` cycle (its own
+  `closure` points back at the scope that defines it) — plain `Rc` drop
+  never reclaims that alone. (1) `Interpreter`'s `Drop` impl unconditionally
+  clears `globals`/every package `Env` — this is automatic, needs no
+  embedder action, and is the only place safe to break a cycle that's
+  legitimately load-bearing for the interpreter's whole life. (2)
+  `Interpreter::collect_cycles()` is an explicit, embedder-invoked
+  trial-deletion pass (CPython `gc`-module style) for transient cycles
+  created and abandoned *between* top-level calls on a reused `Interpreter`
+  (the "load a program once, call it many times" pattern) — **never call
+  it while a KSL call is still executing on the Rust stack** (e.g. from
+  inside a `NativeFn`), since a currently-running call's own local `Env`
+  chain is typically unreachable from `globals`/`packages` on purpose, and
+  a collection pass at that moment would clear it out from under the call.
+  See `collect_cycles`'s own doc comment for the full reasoning.
+  `collect_cycles`'s registry is generic (`gc.rs`'s `Trace`/`GcRef`), not
+  specific to `Env`: any container that can hold `Value`s reaching back
+  into the graph (`Env`, `List`, and eventually a class instance's fields,
+  a `Map`'s entries, ...) should be a `GcRef<T>` where `T: Trace`, never a
+  bare `Rc<RefCell<T>>` — `GcRef::new` is the only way to construct one and
+  it always registers itself, so there's no call site to remember. The one
+  place that still needs a human: `value::value_refs`'s exhaustive match
+  from a `Value` variant to the `GcRef`(s) it directly holds — written with
+  no wildcard arm on purpose, so a new `Value` variant that wraps a `GcRef`
+  fails to compile until this function says what it reaches. See `gc.rs`'s
+  module doc comment for the full design and why a container type (not
+  just `Value`'s own variants) needs its own tracked node.
 
 ## Adding a feature checklist
 

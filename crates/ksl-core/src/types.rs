@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(Type::from_value(&Value::Bool(true)).name(), Value::Bool(true).type_name());
         assert_eq!(Type::from_value(&Value::str("x")).name(), Value::str("x").type_name());
         assert_eq!(Type::from_value(&Value::Unit).name(), Value::Unit.type_name());
-        let list = Value::List(Rc::new(std::cell::RefCell::new(Vec::new())));
+        let list = Value::List(crate::gc::GcRef::new(crate::gc::GcRegistry::new(), Vec::new()));
         assert_eq!(Type::from_value(&list).name(), list.type_name());
     }
 

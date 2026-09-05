@@ -354,9 +354,9 @@ mod tests {
         let mut out = Vec::new();
         let mut interp = Interpreter::new(&mut out);
         let entry_path = dir.path().join(entry_file);
-        Importer::new()
-            .run_top_level(&src, dir.path(), Some(&entry_path), &mut interp)
-            .map_err(|e| e.to_string())?;
+        let result = Importer::new().run_top_level(&src, dir.path(), Some(&entry_path), &mut interp).map_err(|e| e.to_string());
+        drop(interp);
+        result?;
         Ok(String::from_utf8(out).unwrap())
     }
 
