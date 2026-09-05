@@ -50,11 +50,27 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     }
 
     if let Some(ctx) = file_import_context(&up_to_cursor) {
-        return match ctx {
-            FileImportContext::AtHead => file_head_completion(),
-            FileImportContext::AfterFileColon => import_keyword_completion(),
-            FileImportContext::InsidePath(partial) => file_path_completions(&analysis.own_file, &partial),
-        };
+        match ctx {
+            // `@file:Import(...)` is governed by the same header-only
+            // ordering rule as `import a.b.c`/`package` (see
+            // `keyword_allowed`'s doc comment) — offering to *start*
+            // typing one past that point would suggest something that
+            // can't actually go there. Once a path string is already
+            // being typed (`InsidePath`), though, still finishing it out
+            // is harmless (and still useful) regardless of position.
+            FileImportContext::AtHead | FileImportContext::AfterFileColon => {
+                if at_or_before(position.line + 1, position.character + 1, analysis.first_stmt_span) {
+                    return match ctx {
+                        FileImportContext::AtHead => file_head_completion(),
+                        FileImportContext::AfterFileColon => import_keyword_completion(),
+                        FileImportContext::InsidePath(_) => unreachable!(),
+                    };
+                }
+            }
+            FileImportContext::InsidePath(partial) => {
+                return file_path_completions(&analysis.own_file, &partial);
+            }
+        }
     }
 
     if import_use_context(&up_to_cursor) {
@@ -946,6 +962,22 @@ mod tests {
     }
 
     #[test]
+    fn file_import_completion_does_not_offer_to_start_past_the_header() {
+        // `@file:Import(...)` is governed by the same header-only ordering
+        // rule as `import`/`package` -- typing "@" after real code has
+        // already started must not offer to start one here. "@" past the
+        // header doesn't parse on its own (see `parse_program`'s module
+        // doc comment), so this goes through the same `last_good` fallback
+        // `falls_back_to_last_good_tree_when_mid_typing` exercises.
+        let good = std::sync::Arc::new(ksl_core::parse_only("println(1)\n").unwrap());
+        let path = Path::new("/tmp/nonexistent_test.ksl");
+        let text = "println(1)\n@f\n";
+        let a = analysis::analyze(text, Some(good), path).expect("should fall back");
+        let names: Vec<String> = completion(&a, text, Position::new(1, 2)).into_iter().map(|i| i.label).collect();
+        assert!(!names.contains(&"file".to_string()), "{names:?}");
+    }
+
+    #[test]
     fn falls_back_to_last_good_tree_when_mid_typing() {
         let good = "fun f(p: Int): Int {\n    return p\n}\n";
         let path = Path::new("/tmp/nonexistent_test.ksl");
@@ -1033,17 +1065,20 @@ mod tests {
     #[test]
     fn completion_after_at_offers_file_keyword() {
         // `@f` alone doesn't parse, so `completion()` is called directly
-        // against a separate, validly-parsed `Analysis` — the `AtHead`
-        // branch never touches `analysis.resolved` anyway (see
+        // against a separate, validly-parsed `Analysis` — an *empty*
+        // document, so its `first_stmt_span` is `None` and doesn't
+        // spuriously gate this (still header-only) position (see
+        // `keyword_allowed`'s doc comment) — the `AtHead` branch itself
+        // never touches `analysis.resolved` either way (see
         // `file_import_context`'s doc comment).
-        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
         let names: Vec<String> = completion(&a, "@f\n", Position::new(0, 2)).into_iter().map(|i| i.label).collect();
         assert_eq!(names, vec!["file".to_string()]);
     }
 
     #[test]
     fn completion_after_file_colon_offers_import_keyword() {
-        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
         let names: Vec<String> =
             completion(&a, "@file:Im\n", Position::new(0, 8)).into_iter().map(|i| i.label).collect();
         assert_eq!(names, vec!["Import".to_string()]);
@@ -1054,7 +1089,7 @@ mod tests {
         // The exact reported bug: right after typing `@file:`, before any
         // letter of "Import" — must still offer it, not just once a prefix
         // of "Import" has already been typed.
-        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
         let names: Vec<String> =
             completion(&a, "@file:\n", Position::new(0, 6)).into_iter().map(|i| i.label).collect();
         assert_eq!(names, vec!["Import".to_string()]);
@@ -1173,7 +1208,7 @@ mod tests {
 
     #[test]
     fn completion_after_at_in_a_closed_doc_comment_does_not_offer_kdoc_tags() {
-        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
         let text = "/** already closed */\n@file:Import(\"x.ksl\")\n";
         // Cursor right after the "@" of "@file:Import" on line 2 -- must be
         // recognized as the file-import head, not confused with kdoc tags.
@@ -1184,7 +1219,7 @@ mod tests {
 
     #[test]
     fn completion_after_at_outside_any_doc_comment_does_not_offer_kdoc_tags() {
-        let a = analysis::analyze("println(1)\n", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
         let names: Vec<String> =
             completion(&a, "@f\n", Position::new(0, 2)).into_iter().map(|i| i.label).collect();
         assert_eq!(names, vec!["file".to_string()], "must still resolve to the file-import head, not kdoc tags");
