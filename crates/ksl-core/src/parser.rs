@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
-use crate::error::{ParseError, Span};
+use crate::error::{Expected, IdentRole, ParseError, Span};
 use crate::token::{Token, TokenKind};
 
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
@@ -92,18 +92,14 @@ impl<'a> Parser<'a> {
         if self.check(&kind) {
             Ok(self.advance())
         } else {
-            Err(self.err(format!(
-                "expected {what}, found {:?}",
-                self.peek_kind()
-            )))
+            let mut e = self.err(format!("expected {what}, found {:?}", self.peek_kind()));
+            e.expected.push(Expected::Token(kind));
+            Err(e)
         }
     }
 
     fn err(&self, message: impl Into<String>) -> ParseError {
-        ParseError {
-            message: message.into(),
-            span: self.span(),
-        }
+        ParseError::new(message, self.span())
     }
 
     fn skip_separators(&mut self) {
@@ -125,21 +121,31 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_ident(&mut self) -> Result<String, ParseError> {
-        Ok(self.expect_ident_spanned()?.0)
+    /// `role` is what grammatical position this identifier fills — see
+    /// `error::IdentRole`'s doc comment — recorded on the returned error
+    /// (never consulted on success) so a completion caller re-parsing text
+    /// truncated at the cursor can tell "expects a type name" apart from
+    /// "expects a brand-new binding name", which are both just "an
+    /// identifier" at the token level.
+    fn expect_ident(&mut self, role: IdentRole) -> Result<String, ParseError> {
+        Ok(self.expect_ident_spanned(role)?.0)
     }
 
     /// Like `expect_ident`, but also returns the identifier token's own
     /// span (not the caller's `self.span()` at some other position) — used
     /// where the exact name span matters for hover/goto-definition.
-    fn expect_ident_spanned(&mut self) -> Result<(String, Span), ParseError> {
+    fn expect_ident_spanned(&mut self, role: IdentRole) -> Result<(String, Span), ParseError> {
         let span = self.span();
         match self.peek_kind().clone() {
             TokenKind::Ident(name) => {
                 self.advance();
                 Ok((name, span))
             }
-            other => Err(self.err(format!("expected identifier, found {other:?}"))),
+            other => {
+                let mut e = self.err(format!("expected identifier, found {other:?}"));
+                e.expected.push(Expected::Identifier(role));
+                Err(e)
+            }
         }
     }
 
@@ -202,7 +208,7 @@ impl<'a> Parser<'a> {
     fn parse_import_use(&mut self) -> Result<ImportUse, ParseError> {
         let span = self.span();
         self.advance(); // 'import'
-        let (first, first_span) = self.expect_ident_spanned()?;
+        let (first, first_span) = self.expect_ident_spanned(IdentRole::QualifiedPathSegment)?;
         let mut path = vec![first];
         let mut full_span = first_span;
         let mut wildcard = false;
@@ -214,7 +220,7 @@ impl<'a> Parser<'a> {
                 wildcard = true;
                 break;
             }
-            let (segment, segment_span) = self.expect_ident_spanned()?;
+            let (segment, segment_span) = self.expect_ident_spanned(IdentRole::QualifiedPathSegment)?;
             full_span = full_span.merge(&segment_span);
             path.push(segment);
         }
@@ -224,10 +230,7 @@ impl<'a> Parser<'a> {
         // `path` is package + member — at least 2 segments required, same
         // rule as before this method grew wildcard support.
         if !wildcard && path.len() < 2 {
-            return Err(ParseError {
-                message: "import path must be package-qualified, e.g. 'import a.b.c'".into(),
-                span: full_span,
-            });
+            return Err(ParseError::new("import path must be package-qualified, e.g. 'import a.b.c'", full_span));
         }
         Ok(ImportUse { path, wildcard, span: span.merge(&full_span) })
     }
@@ -267,7 +270,7 @@ impl<'a> Parser<'a> {
                 return Err(self.err("expected '->' after a parenthesized type list".to_string()));
             }
         } else {
-            let (name, name_span) = self.expect_ident_spanned()?;
+            let (name, name_span) = self.expect_ident_spanned(IdentRole::TypeName)?;
             TypeAnnotation::Named(name, name_span)
         };
         if matches!(self.peek_kind(), TokenKind::Question) {
@@ -285,11 +288,11 @@ impl<'a> Parser<'a> {
     /// `FieldAccess`/`MethodCall` by `parse_postfix`) always require a
     /// dotted path, never a bare single name.
     fn parse_dotted_path(&mut self) -> Result<(Vec<String>, Span), ParseError> {
-        let (first, first_span) = self.expect_ident_spanned()?;
+        let (first, first_span) = self.expect_ident_spanned(IdentRole::QualifiedPathSegment)?;
         let mut path = vec![first];
         let mut full_span = first_span;
         while self.matches(&TokenKind::Dot) {
-            let (segment, segment_span) = self.expect_ident_spanned()?;
+            let (segment, segment_span) = self.expect_ident_spanned(IdentRole::QualifiedPathSegment)?;
             full_span = full_span.merge(&segment_span);
             path.push(segment);
         }
@@ -299,12 +302,12 @@ impl<'a> Parser<'a> {
     fn parse_file_import(&mut self) -> Result<ImportDecl, ParseError> {
         let span = self.span();
         self.expect(TokenKind::At, "'@'")?;
-        let head = self.expect_ident()?;
+        let head = self.expect_ident(IdentRole::FileImportHead)?;
         if head != "file" {
             return Err(self.err(format!("expected 'file' after '@', found '{head}'")));
         }
         self.expect(TokenKind::Colon, "':'")?;
-        let name = self.expect_ident()?;
+        let name = self.expect_ident(IdentRole::FileImportAnnotationName)?;
         if name != "Import" {
             return Err(self.err(format!(
                 "unknown file annotation '@file:{name}' (only 'Import' is supported)"
@@ -346,10 +349,7 @@ impl<'a> Parser<'a> {
             }
         };
         if s.is_empty() {
-            return Err(ParseError {
-                message: "import path must not be empty".into(),
-                span: start,
-            });
+            return Err(ParseError::new("import path must not be empty", start));
         }
         Ok((s, start.merge(&end)))
     }
@@ -424,20 +424,14 @@ impl<'a> Parser<'a> {
             TokenKind::Break => {
                 self.advance();
                 if self.loop_depth == 0 {
-                    return Err(ParseError {
-                        message: "'break' is only allowed inside a loop".into(),
-                        span: start,
-                    });
+                    return Err(ParseError::new("'break' is only allowed inside a loop", start));
                 }
                 Ok(Stmt::new(StmtKind::Break, start))
             }
             TokenKind::Continue => {
                 self.advance();
                 if self.loop_depth == 0 {
-                    return Err(ParseError {
-                        message: "'continue' is only allowed inside a loop".into(),
-                        span: start,
-                    });
+                    return Err(ParseError::new("'continue' is only allowed inside a loop", start));
                 }
                 Ok(Stmt::new(StmtKind::Continue, start))
             }
@@ -453,7 +447,7 @@ impl<'a> Parser<'a> {
         let doc_comment = self.doc_comments.remove(&span.line);
         let mutable = matches!(self.peek_kind(), TokenKind::Var);
         self.advance(); // val/var
-        let (name, name_span) = self.expect_ident_spanned()?;
+        let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
         let type_annotation =
             if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
         self.expect(TokenKind::Assign, "'='")?;
@@ -475,7 +469,7 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         self.expect(TokenKind::LParen, "'('")?;
         while !matches!(self.peek_kind(), TokenKind::RParen) {
-            let (name, name_span) = self.expect_ident_spanned()?;
+            let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
             let type_annotation =
                 if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
             let default = if self.matches(&TokenKind::Assign) {
@@ -501,7 +495,7 @@ impl<'a> Parser<'a> {
         let span = self.span();
         let doc_comment = self.doc_comments.remove(&span.line);
         self.advance(); // fun
-        let (name, name_span) = self.expect_ident_spanned()?;
+        let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
         let params = self.parse_params()?;
         self.skip_newlines();
         let return_type =
@@ -540,7 +534,7 @@ impl<'a> Parser<'a> {
         let span = self.span();
         self.advance(); // for
         self.expect(TokenKind::LParen, "'('")?;
-        let (var_name, var_name_span) = self.expect_ident_spanned()?;
+        let (var_name, var_name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
         self.expect(TokenKind::In, "'in'")?;
         let iterable = self.parse_expr()?;
         self.expect(TokenKind::RParen, "')'")?;
@@ -769,7 +763,7 @@ impl<'a> Parser<'a> {
             _ => None,
         } {
             self.advance();
-            let (name, name_span) = self.expect_ident_spanned()?;
+            let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
             return Ok(Expr::new(
                 ExprKind::IncDec { op, name, name_span, prefix: true },
                 span,
@@ -812,7 +806,7 @@ impl<'a> Parser<'a> {
             } else if matches!(self.peek_kind(), TokenKind::Dot | TokenKind::QuestionDot) {
                 let safe = matches!(self.peek_kind(), TokenKind::QuestionDot);
                 self.advance(); // '.' or '?.'
-                let (member, member_span) = self.expect_ident_spanned()?;
+                let (member, member_span) = self.expect_ident_spanned(IdentRole::Other)?;
                 let full_span = expr.span.merge(&member_span);
                 expr = if matches!(self.peek_kind(), TokenKind::LParen) {
                     let args = self.parse_call_args()?;
@@ -879,7 +873,7 @@ impl<'a> Parser<'a> {
             let (name, name_span) = if matches!(self.peek_kind(), TokenKind::Ident(_))
                 && matches!(self.peek_at(1), TokenKind::Assign)
             {
-                let (n, span) = self.expect_ident_spanned()?;
+                let (n, span) = self.expect_ident_spanned(IdentRole::Other)?;
                 self.advance(); // '='
                 (Some(n), Some(span))
             } else {
@@ -1130,6 +1124,44 @@ mod tests {
     fn parse_err(src: &str) -> ParseError {
         let tokens = tokenize(src).unwrap();
         parse(&tokens).unwrap_err()
+    }
+
+    // ---- ParseError::expected (see error::Expected's doc comment) ----
+
+    #[test]
+    fn expect_populates_expected_token_on_failure() {
+        let e = parse_err("while (true");
+        assert!(e.expected.contains(&Expected::Token(TokenKind::RParen)), "{:?}", e.expected);
+    }
+
+    #[test]
+    fn expect_ident_spanned_reports_type_name_role_in_a_type_position() {
+        let e = parse_err("val x: ");
+        assert!(
+            e.expected.contains(&Expected::Identifier(IdentRole::TypeName)),
+            "{:?}",
+            e.expected
+        );
+    }
+
+    #[test]
+    fn expect_ident_spanned_reports_new_binding_name_role_after_val() {
+        let e = parse_err("val ");
+        assert!(
+            e.expected.contains(&Expected::Identifier(IdentRole::NewBindingName)),
+            "{:?}",
+            e.expected
+        );
+    }
+
+    #[test]
+    fn expect_ident_spanned_reports_qualified_path_segment_role_after_import_dot() {
+        let e = parse_err("import a.");
+        assert!(
+            e.expected.contains(&Expected::Identifier(IdentRole::QualifiedPathSegment)),
+            "{:?}",
+            e.expected
+        );
     }
 
     #[test]

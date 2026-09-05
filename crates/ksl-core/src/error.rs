@@ -1,3 +1,4 @@
+use crate::token::TokenKind;
 use crate::value::Value;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -64,10 +65,77 @@ impl fmt::Display for Span {
     }
 }
 
+/// What grammatical role an identifier plays at the point it was required
+/// — lets a completion caller distinguish, say, "a type name was expected"
+/// (offer primitive types) from "a brand-new binding name was expected"
+/// (offer nothing in particular), which `Expected::Identifier` alone can't:
+/// both are "an identifier goes here" at the token level, but very
+/// different positions semantically. `Other` covers the two call sites
+/// completion doesn't care about (a postfix `.member` name, a named
+/// argument's own label) — never consulted, just keeps every
+/// `expect_ident`/`expect_ident_spanned` call site honest about which role
+/// applies instead of silently defaulting to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentRole {
+    /// Right after a type-annotation's `:` (`val x: |`, a param's/fun's
+    /// return type) — `parser::Parser::parse_type_annotation`.
+    TypeName,
+    /// A `val`/`var`/`fun`/parameter/`for`-loop-variable name being
+    /// declared (or, for `++x`/`x++`, referenced) — every call site where
+    /// completion has nothing more specific to offer than "you're naming
+    /// something here."
+    NewBindingName,
+    /// A segment of a `package`/`import` dotted path.
+    QualifiedPathSegment,
+    /// The `file` in `@file:Import(...)` — `parser::Parser::parse_file_import`.
+    FileImportHead,
+    /// The `Import` in `@file:Import(...)`.
+    FileImportAnnotationName,
+    /// Not consulted by completion at all.
+    Other,
+}
+
+/// What would have made a failed parse succeed at the point it failed —
+/// structured, not just `ParseError::message`'s free text, so a caller
+/// (`ksl-lsp`'s completion) can ask "what's grammatically valid to type
+/// right here" by re-parsing the text truncated at the cursor and reading
+/// this off the resulting error, instead of guessing from raw text. Only
+/// ever populated at the few funnel points that fail predictably (`expect`,
+/// `expect_ident`/`expect_ident_spanned`, and `parser::Parser::
+/// parse_postfix`'s own enrichment of a call's argument list) — every
+/// free-text `self.err(...)` site leaves `ParseError::expected` empty,
+/// which is a known, accepted gap (see `ksl-lsp`'s `completion_probe`
+/// module doc comment), not an oversight.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expected {
+    /// A single specific token was required next — `expect`'s own `kind`
+    /// argument, captured directly.
+    Token(TokenKind),
+    Identifier(IdentRole),
+    /// Specifically inside a call's still-open argument list — richer than
+    /// a bare `Token(RParen)`/`Token(Comma)`, since the `Call`/`MethodCall`
+    /// AST node doesn't exist yet while its own arg list is incomplete, so
+    /// there's nothing else a caller could read "which callee"/"which
+    /// names already used" off of.
+    CallArgument { callee: Option<String>, already_named: Vec<String> },
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
     pub span: Span,
+    /// See `Expected`'s doc comment. Empty by default — use
+    /// `ParseError::new` for every free-text `self.err(...)`-style site,
+    /// which leaves this empty; only `expect`/`expect_ident`/
+    /// `expect_ident_spanned`'s own error branches (and `parse_postfix`'s
+    /// `CallArgument` enrichment) populate it.
+    pub expected: Vec<Expected>,
+}
+
+impl ParseError {
+    pub fn new(message: impl Into<String>, span: Span) -> Self {
+        ParseError { message: message.into(), span, expected: Vec::new() }
+    }
 }
 
 /// One call-stack frame — `signature` is a human-readable rendering (e.g.

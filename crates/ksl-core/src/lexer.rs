@@ -153,10 +153,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn err(&self, message: impl Into<String>) -> ParseError {
-        ParseError {
-            message: message.into(),
-            span: self.span(),
-        }
+        ParseError::new(message, self.span())
     }
 
     /// Consumes and emits exactly one token in "normal" (non-template-text)
@@ -544,10 +541,7 @@ impl<'a> Lexer<'a> {
                         Some('"') => '"',
                         Some('$') => '$',
                         Some(other) => {
-                            return Err(ParseError {
-                                message: format!("unknown escape sequence '\\{other}'"),
-                                span,
-                            })
+                            return Err(ParseError::new(format!("unknown escape sequence '\\{other}'"), span))
                         }
                         None => return Err(self.err("unterminated string literal")),
                     };
