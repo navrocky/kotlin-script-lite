@@ -1,5 +1,7 @@
+use ksl_core::error::{Expected, IdentRole};
 use ksl_core::resolver::SymbolKind;
 use ksl_core::stdlib::BUILTIN_METHOD_SIGNATURES;
+use ksl_core::token::TokenKind;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
 use crate::analysis::Analysis;
@@ -39,37 +41,52 @@ use crate::analysis::Analysis;
 pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
+    let full_up_to_cursor = text_up_to_position(text, position);
 
     // Checked first, ahead of every other (line-local) context below: a
     // KDoc tag (`@param`, `@return`, ...) can only ever appear inside a
     // `/** ... */` doc comment, which is usually multi-line — unlike the
     // other detectors here, this one needs the text from the *start of the
     // document*, not just the current line.
-    if kdoc_tag_context(&text_up_to_position(text, position)).is_some() {
+    if kdoc_tag_context(&full_up_to_cursor).is_some() {
         return kdoc_tag_completions();
     }
+
+    // What the real parser would need next, found by re-parsing the text
+    // truncated exactly at the cursor and reading off what the resulting
+    // error (if any) was expecting — see `ksl_core::completion_probe`'s
+    // module doc comment. This is the "mid-typing an incomplete construct"
+    // half of context detection; facts about an *already-complete*
+    // construct (inside a loop, before the file's header ends, right
+    // after a dangling `if`) are read straight off `analysis.resolved`
+    // instead — see `keyword_allowed`.
+    let expected = ksl_core::completion_probe::expected_at_cursor(&full_up_to_cursor);
 
     if let Some(ctx) = file_import_context(&up_to_cursor) {
         match ctx {
             // `@file:Import(...)` is governed by the same header-only
-            // ordering rule as `import a.b.c`/`package` (see
-            // `keyword_allowed`'s doc comment) — offering to *start*
-            // typing one past that point would suggest something that
-            // can't actually go there. Once a path string is already
-            // being typed (`InsidePath`), though, still finishing it out
-            // is harmless (and still useful) regardless of position.
-            FileImportContext::AtHead | FileImportContext::AfterFileColon => {
-                if at_or_before(position.line + 1, position.character + 1, analysis.first_stmt_span) {
-                    return match ctx {
-                        FileImportContext::AtHead => file_head_completion(),
-                        FileImportContext::AfterFileColon => import_keyword_completion(),
-                        FileImportContext::InsidePath(_) => unreachable!(),
-                    };
-                }
+            // ordering rule as `import a.b.c`/`package` — the real parser
+            // only ever recognizes `@`/`file`/`Import` as this construct
+            // while still in the file's header (see
+            // `parser::Parser::parse_imports`); past that point a stray
+            // `@` fails with a free-text "unexpected token" error instead,
+            // which never populates `expected` at all, so this check
+            // naturally comes back empty there with no separate position
+            // check needed. Once a path string is already being typed
+            // (`InsidePath`), though, still finishing it out is harmless
+            // (and still useful) regardless of position.
+            FileImportContext::AtHead if expected.contains(&Expected::Identifier(IdentRole::FileImportHead)) => {
+                return file_head_completion();
+            }
+            FileImportContext::AfterFileColon
+                if expected.contains(&Expected::Identifier(IdentRole::FileImportAnnotationName)) =>
+            {
+                return import_keyword_completion();
             }
             FileImportContext::InsidePath(partial) => {
                 return file_path_completions(&analysis.own_file, &partial);
             }
+            _ => {}
         }
     }
 
@@ -78,7 +95,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         return package_path_completions(analysis, &prefix_path, None, false);
     }
 
-    if type_position_before_cursor(&up_to_cursor) {
+    if expected.contains(&Expected::Identifier(IdentRole::TypeName)) {
         return ksl_core::types::PRIMITIVE_TYPES
             .iter()
             .map(|(name, _)| CompletionItem {
@@ -185,7 +202,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     // can start, but a handful have real grammar restrictions of their own
     // (see its doc comment).
     for (kw, _) in ksl_core::token::KEYWORDS {
-        if keyword_allowed(kw, analysis, &up_to_cursor, line, col) {
+        if keyword_allowed(kw, analysis, &expected, line, col) {
             items.push(CompletionItem {
                 label: kw.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
@@ -215,12 +232,12 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
 ///   yet (`resolver::SymbolTable::else_allowed_at`, a real fact read off
 ///   the resolved tree — not a guess about whatever `}` happens to precede
 ///   the cursor).
-/// - `in`: only inside a `for (...)` header's own loop-variable position,
-///   or somewhere a value could plausibly continue with an infix operator
-///   (approximated the same way: the character right before the cursor
-///   looks like the end of one) — never at a fresh statement-start
-///   position, where `in` can't legally appear at all.
-fn keyword_allowed(kw: &str, analysis: &Analysis, up_to_cursor: &str, line: u32, col: u32) -> bool {
+/// - `in`: only where the real parser would need it next — right after a
+///   `for (name` header's own loop variable (`Expected::Token(In)`, from
+///   `parser::Parser::parse_for`'s own `self.expect(TokenKind::In, ...)`
+///   failing there) — see `ksl_core::completion_probe`. Never at a fresh
+///   statement-start position, where `in` can't legally appear at all.
+fn keyword_allowed(kw: &str, analysis: &Analysis, expected: &[Expected], line: u32, col: u32) -> bool {
     match kw {
         "package" => {
             analysis.package.is_none()
@@ -230,7 +247,7 @@ fn keyword_allowed(kw: &str, analysis: &Analysis, up_to_cursor: &str, line: u32,
         "import" => at_or_before(line, col, analysis.first_stmt_span),
         "break" | "continue" => analysis.resolved.table.inside_a_loop_at(line, col),
         "else" => analysis.resolved.table.else_allowed_at(line, col),
-        "in" => for_loop_var_position(up_to_cursor) || looks_like_after_a_value(up_to_cursor),
+        "in" => expected.contains(&Expected::Token(TokenKind::In)),
         _ => true,
     }
 }
@@ -243,46 +260,6 @@ fn at_or_before(line: u32, col: u32, bound: Option<ksl_core::error::Span>) -> bo
         None => true,
         Some(b) => (line, col) <= (b.line, b.col),
     }
-}
-
-/// `true` right after a `for (name` header, with no `in` typed yet — the
-/// one place `in` is *required*, not just a plausible infix operator.
-/// Raw-text, same reasoning as `type_position_before_cursor`: `for (i` has
-/// no complete AST node to read this off of while `in`/the iterable are
-/// still unwritten. Reuses `call_arg_context`'s own paren-tracking (rather
-/// than a plain substring search for `"for"`, which would also wrongly
-/// match inside an unrelated identifier like `format(`) to confirm `for`
-/// is a real standalone word immediately before the currently-open paren,
-/// not part of a longer name.
-fn for_loop_var_position(text_before_cursor: &str) -> bool {
-    let Some((callee, _)) = call_arg_context(text_before_cursor) else { return false };
-    if callee != "for" {
-        return false;
-    }
-    // `call_arg_context` confirms this paren is still the sole open one,
-    // so the last `(` in the text is exactly its own opening paren.
-    let open = text_before_cursor.rfind('(').expect("call_arg_context found an open paren");
-    let inside = text_before_cursor[open + 1..].trim_end();
-    // Exactly one bare identifier so far, nothing else (no comma, no `in`,
-    // no value) — `for (i`, optionally with trailing whitespace.
-    !inside.is_empty() && inside.chars().all(|c| c.is_alphanumeric() || c == '_')
-}
-
-/// `true` when the last non-whitespace character before the cursor looks
-/// like the end of a complete value (an identifier/number, or a closing
-/// `)`/`]`/`"`) — a coarse stand-in for "an infix operator could
-/// grammatically follow here," since there's no expression-level AST to
-/// consult while an operator itself is what's being typed. Deliberately
-/// permissive (a handful of statement-end positions, like right after a
-/// `val x = 5`, will also match) in favor of ruling out the clearly-wrong
-/// positions `in` was showing up in before this — a fresh line, right
-/// after `{`/`(`/`,`/a keyword, etc.
-fn looks_like_after_a_value(text_before_cursor: &str) -> bool {
-    text_before_cursor
-        .trim_end()
-        .chars()
-        .last()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_' || matches!(c, ')' | ']' | '"'))
 }
 
 /// Splits the text immediately before the cursor into a dotted-path prefix
@@ -430,7 +407,7 @@ fn next_segment_completions(analysis: &Analysis, prefix_path: &[String]) -> Vec<
 /// nothing named `if` ever resolves to a real symbol downstream (see
 /// `named_arg_completions`), so no bogus completions result either way.
 ///
-/// Like `dotted_prefix_before_cursor`/`type_position_before_cursor`, this is
+/// Like `dotted_prefix_before_cursor`, this is
 /// a raw-text recognizer (a call's own argument list doesn't exist as a
 /// complete AST node while mid-typed) tracking paren nesting the same way —
 /// an already-*closed* nested call's own named arguments (`outer(inner(x =
@@ -574,59 +551,6 @@ fn builtin_method_completions(receiver_type: Option<&ksl_core::types::Type>) -> 
         .collect()
 }
 
-/// Whether the cursor sits in type-annotation position: right after a `:`
-/// or `->`, or anywhere inside the (possibly nested) type that follows one
-/// — including inside a function type's own `(...)` parameter list, e.g.
-/// `val f: (I` or `val f: (Int) -> I`. Scans the whole line up to the
-/// cursor (every `:` in the grammar introduces a type — `val`/`var`/
-/// parameter annotations and `fun` return types, `parser.rs`'s only three
-/// `Colon` call sites — so hitting one anywhere is unambiguous), tracking
-/// a single `in_type` flag plus a stack recording, for each currently-open
-/// `(`, whether it's a function type's own parameter list (`TypeList` —
-/// entered while already in type position, so its contents start in type
-/// position too, and a `,` inside it stays in type position for the next
-/// parameter) or an ordinary call/`fun`-decl parameter list (`NameList` —
-/// entered *not* in type position, so its contents start out awaiting a
-/// name/argument, and a `,` inside it goes back to that, not to type
-/// position). The `NameList` case is why `fun f(a: Int, b` correctly does
-/// *not* offer type completions while typing `b`'s name, even though an
-/// earlier `:` already appeared on the same line — without tracking which
-/// kind of list we're in, that earlier `:` alone would be indistinguishable
-/// from actually still being inside `a`'s own type. No special handling is
-/// needed for `->` itself: it's inert to this state machine, so `in_type`
-/// simply stays whatever it already was on either side of it, which is
-/// exactly right (a function type continues being "type position" straight
-/// through its own arrow).
-fn type_position_before_cursor(text_before_cursor: &str) -> bool {
-    #[derive(Clone, Copy)]
-    enum ParenKind {
-        /// A function type's own parameter list — bare types only, no
-        /// names (`(Int, String) -> Result`).
-        TypeList,
-        /// An ordinary call's arguments or a `fun`-decl's own parameter
-        /// list — `name: Type` pairs, or bare argument expressions.
-        NameList,
-    }
-
-    let mut in_type = false;
-    let mut stack: Vec<ParenKind> = Vec::new();
-    for c in text_before_cursor.chars() {
-        match c {
-            ':' => in_type = true,
-            '=' | '{' => in_type = false,
-            ',' => in_type = matches!(stack.last(), Some(ParenKind::TypeList)),
-            '(' => {
-                let kind = if in_type { ParenKind::TypeList } else { ParenKind::NameList };
-                stack.push(kind);
-                in_type = matches!(kind, ParenKind::TypeList);
-            }
-            ')' => in_type = matches!(stack.pop(), Some(ParenKind::TypeList)),
-            _ => {}
-        }
-    }
-    in_type
-}
-
 /// `true` for a non-empty run of ASCII digits — used to recognize a
 /// dotted-prefix segment that's actually (part of) a numeric literal
 /// rather than an identifier, so its type can be assigned directly
@@ -648,7 +572,10 @@ fn symbol_completion_kind(kind: SymbolKind) -> CompletionItemKind {
 /// doesn't exist as an AST node while mid-typed (same reason
 /// `dotted_prefix_before_cursor` operates on raw text: an incomplete
 /// `@file:Import("` fails to parse at all), so this is a raw-text
-/// recognizer, same approach as `type_position_before_cursor`.
+/// recognizer. Its `AtHead`/`AfterFileColon` results still get validated
+/// against `ksl_core::completion_probe::expected_at_cursor` before
+/// `completion()` trusts them (see there) — this only narrows down
+/// *which* of the three positions the cursor might be in, textually.
 enum FileImportContext {
     /// Right after `@` plus a partial prefix of `file` — e.g. `@f`, `@fil`.
     AtHead,
@@ -904,12 +831,20 @@ mod tests {
         assert!(else_names.contains(&"else".to_string()), "{else_names:?}");
 
         // Fully-typed and parseable (closing paren/body included) -- the
-        // cursor, placed right after "for (i" rather than at the line's
-        // end, exercises the same mid-typing detection an unclosed paren
-        // would (same reasoning as `named_arg_completion_offers_the_calls_
-        // declared_parameter`).
+        // cursor, placed right after "for (i " (note the trailing space)
+        // rather than at the line's end, exercises the same mid-typing
+        // detection an unclosed paren would (same reasoning as
+        // `named_arg_completion_offers_the_calls_declared_parameter`).
+        // The space matters: `parser::Parser::expected_at_cursor` can't
+        // tell a *complete* one-letter variable name apart from a still-
+        // growing prefix of a longer one from text alone, so `in` is only
+        // reported once something (even just whitespace) has clearly
+        // ended the name -- see `keyword_allowed`'s doc comment. This also
+        // matches the grammar for real: `for(iin1..3)` would lex as one
+        // identifier `iin1`, so *some* separator is unavoidable here
+        // anyway.
         let for_header = "for (i in 1..3) {\n}\n";
-        let in_names = labels(for_header, Position::new(0, 6));
+        let in_names = labels(for_header, Position::new(0, 7));
         assert!(in_names.contains(&"in".to_string()), "{in_names:?}");
 
         for (kw, _) in ksl_core::token::KEYWORDS {
@@ -950,6 +885,16 @@ mod tests {
         let no_brace = "val x = 1\n";
         let names4 = labels(no_brace, Position::new(1, 0));
         assert!(!names4.contains(&"else".to_string()), "{names4:?}");
+    }
+
+    #[test]
+    fn in_is_not_offered_inside_a_for_header_before_the_variable_name_exists() {
+        // The exact reported bug: `in` must not appear the moment `for (`
+        // is typed, before any variable name has been written at all.
+        let for_header = "for (i in 1..3) {\n}\n";
+        // "for (" is 5 chars -- cursor right after the opening paren.
+        let names = labels(for_header, Position::new(0, 5));
+        assert!(!names.contains(&"in".to_string()), "{names:?}");
     }
 
     #[test]
@@ -1281,53 +1226,6 @@ mod tests {
         let text = "fun f(p: Int): Int {\n    return p\n}\n";
         let names = labels(text, Position::new(0, 9)); // right after "fun f(p: "
         assert!(names.contains(&"Int".to_string()), "{names:?}");
-    }
-
-    #[test]
-    fn type_position_before_cursor_rejects_non_type_positions() {
-        assert!(!type_position_before_cursor("val x = "));
-        assert!(!type_position_before_cursor("println("));
-        assert!(!type_position_before_cursor(""));
-    }
-
-    #[test]
-    fn type_position_before_cursor_inside_a_function_types_own_parens() {
-        assert!(type_position_before_cursor("val f: ("));
-        assert!(type_position_before_cursor("val f: (I"));
-    }
-
-    #[test]
-    fn type_position_before_cursor_after_a_function_types_comma() {
-        // A second parameter inside a function type's own list is still a
-        // type (`(Int, String) -> ...`), unlike a `fun`-decl's own comma.
-        assert!(type_position_before_cursor("val f: (Int, "));
-    }
-
-    #[test]
-    fn type_position_before_cursor_after_the_arrow() {
-        assert!(type_position_before_cursor("val f: (Int) -> "));
-        assert!(type_position_before_cursor("val f: (Int) -> I"));
-    }
-
-    #[test]
-    fn type_position_before_cursor_handles_nested_function_types() {
-        assert!(type_position_before_cursor("val f: ((Int) -> Int) -> "));
-        assert!(type_position_before_cursor("val f: ((I"));
-    }
-
-    #[test]
-    fn type_position_before_cursor_rejects_a_subsequent_params_name() {
-        // The bug a naive "any `:` on this line" check would have: typing
-        // `b`'s *name* right after `a`'s type must not offer type
-        // completions just because an earlier `:` appeared on the line.
-        assert!(!type_position_before_cursor("fun f(a: Int, b"));
-        // But `b`'s own type position, right after, is correctly detected.
-        assert!(type_position_before_cursor("fun f(a: Int, b: I"));
-    }
-
-    #[test]
-    fn type_position_before_cursor_rejects_inside_a_default_values_call() {
-        assert!(!type_position_before_cursor("fun f(a: Int = compute("));
     }
 
     #[test]

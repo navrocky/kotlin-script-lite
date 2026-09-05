@@ -75,8 +75,56 @@ mod tests {
     }
 
     #[test]
+    fn stays_empty_for_non_type_positions() {
+        assert_eq!(expected_at_cursor("val x = "), Vec::new());
+        assert_eq!(expected_at_cursor("println("), Vec::new());
+        assert_eq!(expected_at_cursor(""), Vec::new());
+    }
+
+    #[test]
     fn reports_type_name_role_with_nothing_typed_yet() {
         assert_eq!(expected_at_cursor("val x: "), vec![Expected::Identifier(IdentRole::TypeName)]);
+    }
+
+    #[test]
+    fn type_name_role_covers_a_function_types_own_parameter_list() {
+        // A function type's own `(...)` (bare types only, e.g. `(Int,
+        // String) -> Result`) still reports `TypeName` throughout,
+        // including right after its own comma and its own `->`, and
+        // through arbitrary nesting.
+        for src in [
+            "val f: (",
+            "val f: (I",
+            "val f: (Int, ",
+            "val f: (Int) -> ",
+            "val f: (Int) -> I",
+            "val f: ((Int) -> Int) -> ",
+            "val f: ((I",
+        ] {
+            assert_eq!(
+                expected_at_cursor(src),
+                vec![Expected::Identifier(IdentRole::TypeName)],
+                "{src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_name_role_does_not_leak_into_a_subsequent_params_own_name() {
+        // The bug a naive "any ':' seen so far on this line" check would
+        // have: typing `b`'s own *name* right after `a`'s type must not
+        // report `TypeName` just because an earlier `:` already appeared.
+        assert_eq!(
+            expected_at_cursor("fun f(a: Int, b"),
+            vec![Expected::Identifier(IdentRole::NewBindingName)]
+        );
+        // But `b`'s own type position, right after, is correctly `TypeName`.
+        assert_eq!(expected_at_cursor("fun f(a: Int, b: I"), vec![Expected::Identifier(IdentRole::TypeName)]);
+    }
+
+    #[test]
+    fn type_name_role_does_not_leak_into_a_default_values_own_call() {
+        assert_eq!(expected_at_cursor("fun f(a: Int = compute("), Vec::new());
     }
 
     #[test]
