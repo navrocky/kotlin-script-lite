@@ -36,6 +36,13 @@ use crate::types::Type;
 pub struct PackageMember {
     pub symbol: Symbol,
     pub file: Option<PathBuf>,
+    /// The package this member was indexed under (`Some("util.math")` for
+    /// `add_member`), or `None` for a package-less `@file:Import`'s flat
+    /// member (`add_flat_member`) — which has no package to qualify it
+    /// with, since it's referenced bare at its use site. Lets a caller
+    /// (`ksl-lsp`'s hover) show a member's fully qualified name rather than
+    /// just its bare one.
+    pub package: Option<String>,
 }
 
 #[derive(Default)]
@@ -68,11 +75,14 @@ impl PackageIndex {
     }
 
     pub(crate) fn add_member(&mut self, package: String, symbol: Symbol, file: Option<PathBuf>) {
-        self.members.entry(package).or_default().push(PackageMember { symbol, file });
+        self.members
+            .entry(package.clone())
+            .or_default()
+            .push(PackageMember { symbol, file, package: Some(package) });
     }
 
     pub(crate) fn add_flat_member(&mut self, symbol: Symbol, file: Option<PathBuf>) {
-        self.flat.entry(symbol.name.clone()).or_default().push(PackageMember { symbol, file });
+        self.flat.entry(symbol.name.clone()).or_default().push(PackageMember { symbol, file, package: None });
     }
 
     pub fn members_of(&self, package: &str) -> &[PackageMember] {
@@ -120,6 +130,7 @@ fn builtin_symbol(sym: &crate::stdlib::BuiltinSymbol) -> Symbol {
         return_type: Type::Unknown,
         param_types: Vec::new(),
         param_names: Vec::new(),
+        param_docs: Vec::new(),
         doc: Some(sym.doc.to_string()),
     }
 }

@@ -228,6 +228,10 @@ pub enum BinaryOp {
 #[derive(Debug, Clone)]
 pub struct Arg {
     pub name: Option<String>,
+    /// Span of just the `name` label itself (before the `=`), for hover/
+    /// goto-definition on a named argument at a call site — `None` for a
+    /// positional argument, which has no label of its own.
+    pub name_span: Option<Span>,
     pub value: Expr,
 }
 

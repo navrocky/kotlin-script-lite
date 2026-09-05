@@ -23,13 +23,23 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
     let col = position.character + 1;
 
     if let Some((occurrence_span, symbol)) = analysis.resolved.table.occurrence_at(line, col) {
-        return Some(build_hover(symbol, Some(occurrence_span), analysis.is_current));
+        return Some(build_hover(symbol, Some(occurrence_span), analysis.is_current, None));
+    }
+
+    // A named argument's own label at a call site (`name` in
+    // `greet(name = "World")`) — never a real local declaration/use of its
+    // own (see `named_arg_label_at`'s doc comment), so it's checked before
+    // `qualified_ref_at`/`method_ref_at` below, none of which apply to it
+    // either.
+    if let Some((label_span, symbol)) = analysis.resolved.table.named_arg_label_at(line, col) {
+        return Some(build_hover(symbol, Some(label_span), analysis.is_current, None));
     }
 
     if let Some((qualified_span, path)) = analysis.resolved.table.qualified_ref_at(line, col) {
         let (package, member) = path.split_at(path.len() - 1);
-        let found = analysis.packages.find(&package.join("."), &member[0])?;
-        return Some(build_hover(&found.symbol, Some(qualified_span), analysis.is_current));
+        let package = package.join(".");
+        let found = analysis.packages.find(&package, &member[0])?;
+        return Some(build_hover(&found.symbol, Some(qualified_span), analysis.is_current, Some(&package)));
     }
 
     // No qualified-name candidate at all at this position — either the
@@ -68,7 +78,22 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
         return Some(build_stdlib_function_hover(&ksl_core::stdlib::format_signature(sym), sym.doc));
     }
     let found = analysis.resolved.imported_symbols.iter().find(|m| m.symbol.name == name)?;
-    Some(build_hover(&found.symbol, None, analysis.is_current))
+    Some(build_hover(&found.symbol, None, analysis.is_current, found.package.as_deref()))
+}
+
+/// Inserts `package.` right before `name`'s first occurrence in
+/// `signature` — e.g. `("fun square(x: Int): Int", "square", "util.math")`
+/// becomes `"fun util.math.square(x: Int): Int"`. Every `signature` this is
+/// ever called with is built by `resolver`/`stdlib` itself in the fixed
+/// `<keyword> <name>(...)`/`<keyword> <name>: <type>` shape, so `name`'s
+/// first occurrence is always its own declaration site, never some
+/// unrelated substring — falls back to the bare signature, unqualified,
+/// on the (never-expected-in-practice) chance it isn't found at all.
+fn qualify_signature(signature: &str, name: &str, package: &str) -> String {
+    match signature.find(name) {
+        Some(idx) => format!("{}{package}.{name}{}", &signature[..idx], &signature[idx + name.len()..]),
+        None => signature.to_string(),
+    }
 }
 
 fn build_builtin_method_hover(signature: &str, doc: &str) -> Hover {
@@ -91,14 +116,25 @@ fn build_stdlib_function_hover(signature: &str, doc: &str) -> Hover {
     }
 }
 
-fn build_hover(symbol: &Symbol, range_span: Option<Span>, is_current: bool) -> Hover {
+/// `symbol`'s hover, with its signature qualified by `package` (if any) —
+/// `Some("util.math")` turns `fun square(x: Int): Int` into
+/// `fun util.math.square(x: Int): Int`, matching how it's actually
+/// referenced from outside its own package. `None` for a same-file
+/// declaration/use (`occurrence_at`) or a named-argument label
+/// (`named_arg_label_at`), neither of which has — or needs — a package
+/// qualifier of its own.
+fn build_hover(symbol: &Symbol, range_span: Option<Span>, is_current: bool, package: Option<&str>) -> Hover {
     let kind_label = match symbol.kind {
         SymbolKind::Val => "val",
         SymbolKind::Var => "var",
         SymbolKind::Fun => "function",
         SymbolKind::Param => "parameter",
     };
-    let mut value = format!("```ksl\n{}\n```\n\n*{}*", symbol.signature, kind_label);
+    let signature = match package {
+        Some(pkg) if !pkg.is_empty() => qualify_signature(&symbol.signature, &symbol.name, pkg),
+        _ => symbol.signature.clone(),
+    };
+    let mut value = format!("```ksl\n{}\n```\n\n*{}*", signature, kind_label);
     if let Some(doc) = &symbol.doc {
         value.push_str("\n\n");
         value.push_str(doc);
@@ -298,7 +334,10 @@ mod tests {
         let a = analysis::analyze(text, None, &main_path).expect("should parse");
         // "println(" is 8 chars, so "greet" starts at column 9, on line 3.
         let h = hover(&a, Position::new(2, 8)).expect("greet should hover");
-        assert!(markdown_value(&h).contains("fun greet"), "{}", markdown_value(&h));
+        // Fully qualified by its real package, even though it's referenced
+        // bare here (via the wildcard `import test.*`) — see
+        // `build_hover`'s `package` parameter.
+        assert!(markdown_value(&h).contains("fun test.greet"), "{}", markdown_value(&h));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -384,6 +423,64 @@ mod tests {
         let h = hover_at("println(kotlin.test.assertEquals(1, 1))\n", 1, 25).expect("should have hover info");
         let text = markdown_value(&h);
         assert!(text.contains("assertEquals"), "{text}");
+        // Fully qualified, not just the bare name — see `build_hover`'s
+        // `package` parameter.
+        assert!(text.contains("kotlin.test.assertEquals"), "{text}");
+    }
+
+    #[test]
+    fn hover_on_a_package_qualified_call_to_a_real_user_package_shows_the_full_name() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_hover_qualified_pkg_name_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("pkg.ksl"), "package util.math\nfun square(x: Int): Int {\n    return x * x\n}\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"pkg.ksl\")\nprintln(util.math.square(5))\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        // "println(util.math." is 19 chars, so "square" starts at column 20.
+        let h = hover(&a, Position::new(1, 19)).expect("square should hover");
+        assert!(markdown_value(&h).contains("fun util.math.square(x: Int): Int"), "{}", markdown_value(&h));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hover_on_a_named_arguments_label_at_a_call_site_shows_its_parameter() {
+        let text = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nprintln(add(a = 1, b = 2))\n";
+        // "println(add(" is 12 chars, so "a" starts at column 13.
+        let h = hover_at(text, 4, 13).expect("the 'a' label should hover");
+        let value = markdown_value(&h);
+        assert!(value.contains("param a: Int"), "{value}");
+        assert!(value.contains("parameter"), "{value}");
+        // "println(add(a = 1, " is 19 chars, so "b" starts at column 20.
+        let h_b = hover_at(text, 4, 20).expect("the 'b' label should hover");
+        assert!(markdown_value(&h_b).contains("param b: Int"), "{}", markdown_value(&h_b));
+    }
+
+    #[test]
+    fn hover_on_a_named_arguments_label_shows_that_params_own_doc() {
+        let text = "/**\n * Adds two numbers.\n * @param a the first number\n */\nfun add(a: Int, b: Int): Int {\n    return a + b\n}\nprintln(add(a = 1, b = 2))\n";
+        // "println(add(" is 12 chars, so "a" starts at column 13, on line 8.
+        let h = hover_at(text, 8, 13).expect("the 'a' label should hover");
+        let value = markdown_value(&h);
+        assert!(value.contains("the first number"), "{value}");
+        assert!(!value.contains("Adds two numbers"), "{value}");
+    }
+
+    #[test]
+    fn hover_on_a_positional_arguments_value_is_unaffected_by_named_arg_label_hover() {
+        // A positional argument's *value* (`1`, not a label) must keep
+        // resolving exactly as before -- it never has a `name_span` of its
+        // own, so `named_arg_label_at` must not spuriously claim it.
+        let text = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nprintln(add(1, 2))\n";
+        // "println(add(" is 12 chars, so "1" starts at column 13.
+        let h = hover_at(text, 4, 13);
+        assert!(h.is_none(), "{h:?}");
     }
 }
 

@@ -839,17 +839,17 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen, "'('")?;
         let mut args = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RParen) {
-            let name = if matches!(self.peek_kind(), TokenKind::Ident(_))
+            let (name, name_span) = if matches!(self.peek_kind(), TokenKind::Ident(_))
                 && matches!(self.peek_at(1), TokenKind::Assign)
             {
-                let n = self.expect_ident()?;
+                let (n, span) = self.expect_ident_spanned()?;
                 self.advance(); // '='
-                Some(n)
+                (Some(n), Some(span))
             } else {
-                None
+                (None, None)
             };
             let value = self.parse_expr()?;
-            args.push(Arg { name, value });
+            args.push(Arg { name, name_span, value });
             if !self.matches(&TokenKind::Comma) {
                 break;
             }

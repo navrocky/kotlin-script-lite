@@ -74,6 +74,13 @@ pub struct Symbol {
     /// (`f(a = 1)`) be checked by name instead of position. Empty for
     /// every other kind.
     pub param_names: Vec<String>,
+    /// Only meaningful for `SymbolKind::Fun`: one parameter's own `@param`
+    /// description (if any), same order as `param_types`/`param_names` —
+    /// lets a named-argument call site (`f(a = 1)`) show that specific
+    /// parameter's doc on hover without needing the whole function's doc
+    /// (which bundles every parameter together, see `doc` below). Empty for
+    /// every other kind.
+    pub param_docs: Vec<Option<String>>,
     /// Doc-comment text for hover/completion, already rendered to a final
     /// display string (mirrors `signature`'s "pre-rendered once" shape,
     /// no separate structured type on `Symbol`). For `Fun`/`Val`/`Var`:
@@ -86,6 +93,15 @@ pub struct Symbol {
     /// or a `doc_comment::ParsedDoc` that turned out entirely empty).
     pub doc: Option<String>,
 }
+
+/// A callee's checkable signature, as used by `walk_call_args`/
+/// `check_call_signature`: return type, one resolved type per declared
+/// parameter, one name per parameter (an empty string where the callee has
+/// no real parameter names of its own — see the `Call`/`MethodCall`
+/// handling in `walk_expr_expected`), and one `@param` description per
+/// parameter (`None` where there is none, or where the callee has no doc
+/// comments to begin with, e.g. a stdlib function).
+type CallSignature = (Type, Vec<Type>, Vec<String>, Vec<Option<String>>);
 
 /// A `following` hint (see `Resolver::walk_stmt`) meaning "there's no
 /// concrete next sibling — extends to the end of the file." A scope's
@@ -170,6 +186,14 @@ pub struct SymbolTable {
     /// `stdlib::root_symbols()` or a cross-file flat index, neither of
     /// which this single-file resolver knows about itself.
     name_refs: Vec<(Span, String)>,
+    /// Every named-argument label's own span at a call site (`f(a = 1)`),
+    /// alongside a synthesized `Symbol` describing that specific declared
+    /// parameter — built from whichever callee signature `walk_call_args`
+    /// resolved (see there), even when that's a cross-file or stdlib
+    /// callee this resolver otherwise never builds real `Symbol`s for.
+    /// Empty for a positional argument, or when the callee's signature (and
+    /// so which parameter this name refers to) couldn't be resolved at all.
+    named_arg_labels: Vec<(Span, Symbol)>,
 }
 
 impl SymbolTable {
@@ -218,6 +242,17 @@ impl SymbolTable {
             .iter()
             .find(|(span, _)| span.contains_line_col(line, col))
             .map(|(_, name)| name.as_str())
+    }
+
+    /// The named-argument label (if any) whose own span covers
+    /// `(line, col)` — e.g. `name` in `greet(name = "World")` — with a
+    /// synthesized `Symbol` describing that specific parameter. See
+    /// `named_arg_labels`'s doc comment.
+    pub fn named_arg_label_at(&self, line: u32, col: u32) -> Option<(Span, &Symbol)> {
+        self.named_arg_labels
+            .iter()
+            .find(|(span, _)| span.contains_line_col(line, col))
+            .map(|(span, symbol)| (*span, symbol))
     }
 
     /// Every symbol declared directly at this file's top level (scope 0,
@@ -367,6 +402,7 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
             method_refs: Vec::new(),
             method_receiver_types: Vec::new(),
             name_refs: Vec::new(),
+            named_arg_labels: Vec::new(),
         },
         diagnostics,
         type_errors: Vec::new(),
@@ -670,6 +706,7 @@ impl<'a> Resolver<'a> {
         return_type: Type,
         param_types: Vec<Type>,
         param_names: Vec<String>,
+        param_docs: Vec<Option<String>>,
         doc: Option<String>,
     ) -> usize {
         // Real overloading — several `Fun` declarations sharing one name —
@@ -711,6 +748,7 @@ impl<'a> Resolver<'a> {
             return_type,
             param_types,
             param_names,
+            param_docs,
             doc,
         });
         self.table.scopes[scope].names.entry(name.to_string()).or_default().push(idx);
@@ -1041,7 +1079,7 @@ impl<'a> Resolver<'a> {
                     .map(crate::doc_comment::parse)
                     .map(|d| d.summary)
                     .filter(|s| !s.is_empty());
-                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new(), doc);
+                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), doc);
                 Type::Unit
             }
             StmtKind::Assign { name, op, value } => {
@@ -1120,6 +1158,15 @@ impl<'a> Resolver<'a> {
                     })
                     .collect();
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                // Same source `walk_params` below pulls each param's own
+                // `@param` text from — computed here too so the *function*
+                // symbol can hand a specific parameter's doc to a named-
+                // argument call site (see `walk_call_args`) without needing
+                // the whole combined `fun_doc` block.
+                let param_docs: Vec<Option<String>> = params
+                    .iter()
+                    .map(|p| parsed_doc.as_ref().and_then(|d| d.param(&p.name)).map(str::to_string))
+                    .collect();
                 // Defined in the *outer* scope (not the function's own
                 // body scope) so both callers and recursive calls from
                 // within the body resolve it — matches how `FunDecl`'s
@@ -1144,6 +1191,7 @@ impl<'a> Resolver<'a> {
                     ret_ty.clone(),
                     param_types.clone(),
                     param_names,
+                    param_docs,
                     fun_doc,
                 );
                 let fn_scope = self.open_scope(scope, stmt.span, following);
@@ -1274,6 +1322,7 @@ impl<'a> Resolver<'a> {
                     Type::Unknown,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                     None,
                 );
                 self.walk_stmts(body, for_scope, following);
@@ -1348,7 +1397,7 @@ impl<'a> Resolver<'a> {
             // any named this parameter — a param has no doc-comment syntax
             // of its own (see `ast::Param`'s doc comment).
             let doc = fun_doc.and_then(|d| d.param(&p.name)).map(str::to_string);
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new(), doc);
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), doc);
         }
     }
 
@@ -1405,6 +1454,7 @@ impl<'a> Resolver<'a> {
                 Type::Unknown,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 None,
             );
             return vec![inferred];
@@ -1434,7 +1484,7 @@ impl<'a> Resolver<'a> {
                 Type::Unknown => format!("param {}", p.name),
                 t => format!("param {}: {}", p.name, t.name()),
             };
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new(), None);
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new(), Vec::new(), None);
             param_types.push(inferred);
         }
         param_types
@@ -1513,25 +1563,61 @@ impl<'a> Resolver<'a> {
     /// infer its own parameter types from it (`apply({ x -> x * 2 }, 5)`).
     /// `signature` is `None` for a callee with no checkable signature at
     /// all — every argument is still walked (occurrences/diagnostics still
-    /// recorded), just with no expected type propagated. Returns each
-    /// argument's own name (if any) and inferred type, for
-    /// `check_call_signature` below to check against `signature`.
+    /// recorded), just with no expected type propagated. Its 4th element is
+    /// one `@param` description per declared parameter (same order as the
+    /// other three), used below to give a named argument's own label a
+    /// hover `Symbol` of its own. Returns each argument's own name (if any)
+    /// and inferred type, for `check_call_signature` below to check against
+    /// `signature`.
     fn walk_call_args(
         &mut self,
         args: &[Arg],
-        signature: Option<&(Type, Vec<Type>, Vec<String>)>,
+        signature: Option<&CallSignature>,
         scope: usize,
         following: Span,
     ) -> Vec<(Option<String>, Type)> {
         let mut arg_infos: Vec<(Option<String>, Type)> = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let expected_param_ty = signature.and_then(|(_, param_types, param_names)| {
-                match &a.name {
-                    Some(n) => param_names.iter().position(|p| p == n).and_then(|i| param_types.get(i)),
-                    None => param_types.get(i),
-                }
+            let named_param_idx =
+                a.name.as_ref().and_then(|n| signature.and_then(|(_, _, param_names, _)| param_names.iter().position(|p| p == n)));
+            let expected_param_ty = signature.and_then(|(_, param_types, _, _)| match &a.name {
+                Some(_) => named_param_idx.and_then(|i| param_types.get(i)),
+                None => param_types.get(i),
             });
             let t = self.walk_expr_expected(&a.value, scope, following, expected_param_ty);
+            // A named argument's own label (`name` in `f(name = ...)`) gets
+            // a synthesized `Symbol` for hover — built here, not derived
+            // from `occurrence_at`, since it doesn't refer to any locally
+            // visible declaration of its own (the callee's parameter might
+            // be declared in another file entirely, or be a stdlib/cross-
+            // file placeholder with no real name to match at all).
+            if let (Some(name), Some(name_span), Some(idx)) = (&a.name, a.name_span, named_param_idx) {
+                if let Some((_, param_types, _, param_docs)) = signature {
+                    if let Some(param_ty) = param_types.get(idx) {
+                        let sig = match param_ty {
+                            Type::Unknown => format!("param {name}"),
+                            t => format!("param {name}: {}", t.name()),
+                        };
+                        let doc = param_docs.get(idx).cloned().flatten();
+                        self.table.named_arg_labels.push((
+                            name_span,
+                            Symbol {
+                                name: name.clone(),
+                                kind: SymbolKind::Param,
+                                def_span: name_span,
+                                mutable: false,
+                                signature: sig,
+                                ty: param_ty.clone(),
+                                return_type: Type::Unknown,
+                                param_types: Vec::new(),
+                                param_names: Vec::new(),
+                                param_docs: Vec::new(),
+                                doc,
+                            },
+                        ));
+                    }
+                }
+            }
             arg_infos.push((a.name.clone(), t));
         }
         arg_infos
@@ -1554,10 +1640,10 @@ impl<'a> Resolver<'a> {
     fn check_call_signature(
         &mut self,
         arg_infos: &[(Option<String>, Type)],
-        signature: Option<(Type, Vec<Type>, Vec<String>)>,
+        signature: Option<CallSignature>,
         span: Span,
     ) -> Type {
-        let Some((ret_ty, param_types, param_names)) = signature else {
+        let Some((ret_ty, param_types, param_names, _)) = signature else {
             return Type::Unknown;
         };
         let mut claimed = vec![false; param_types.len()];
@@ -1930,13 +2016,14 @@ impl<'a> Resolver<'a> {
                         .and_then(|path| {
                             crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
                                 let names = vec![String::new(); param_types.len()];
-                                (ret_ty, param_types, names)
+                                let docs = vec![None; param_types.len()];
+                                (ret_ty, param_types, names, docs)
                             })
                         })
                         .or_else(|| {
                             user_candidates.first().map(|m| {
                                 let names = vec![String::new(); m.symbol.param_types.len()];
-                                (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names)
+                                (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names, m.symbol.param_docs.clone())
                             })
                         })
                 };
@@ -2251,10 +2338,11 @@ impl<'a> Resolver<'a> {
                                 // unlike a `fun` declaration, never names its
                                 // parameters).
                                 if s.kind == SymbolKind::Fun {
-                                    Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone()))
+                                    Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone(), s.param_docs.clone()))
                                 } else if let Type::Function(params, ret) = &s.ty {
                                     let names = vec![String::new(); params.len()];
-                                    Some(((**ret).clone(), params.clone(), names))
+                                    let docs = vec![None; params.len()];
+                                    Some(((**ret).clone(), params.clone(), names, docs))
                                 } else {
                                     None
                                 }
@@ -2263,13 +2351,14 @@ impl<'a> Resolver<'a> {
                                 crate::stdlib::stdlib_call_types(name)
                                     .map(|(param_types, ret_ty)| {
                                         let names = vec![String::new(); param_types.len()];
-                                        (ret_ty, param_types, names)
+                                        let docs = vec![None; param_types.len()];
+                                        (ret_ty, param_types, names, docs)
                                     })
                             })
                             .or_else(|| {
                                 cross_candidates.first().map(|m| {
                                     let names = vec![String::new(); m.symbol.param_types.len()];
-                                    (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names)
+                                    (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names, m.symbol.param_docs.clone())
                                 })
                             }),
                         _ => None,
@@ -2547,6 +2636,7 @@ mod tests {
                 return_type: Type::Int,
                 param_types: vec![Type::Int],
                 param_names: vec!["x".to_string()],
+                param_docs: Vec::new(),
                 doc: None,
             },
             None,
@@ -2713,6 +2803,7 @@ mod tests {
                 return_type: Type::Int,
                 param_types: vec![Type::Int],
                 param_names: vec!["x".to_string()],
+                param_docs: Vec::new(),
                 doc: None,
             },
             None,
@@ -3206,6 +3297,34 @@ mod tests {
         let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(a = 1, b = 2)\n";
         let result = resolve_src(src);
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn named_arg_label_at_hovers_the_calls_matching_parameter() {
+        let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(a = 1, b = 2)\n";
+        let result = resolve_src(src);
+        // "add(a = 1, b = 2)" -- "a" starts at column 5 on line 4.
+        let (span, sym) = result.table.named_arg_label_at(4, 5).expect("a should hover");
+        assert_eq!(sym.name, "a");
+        assert_eq!(sym.signature, "param a: Int");
+        assert_eq!(span.line, 4);
+        // "b" starts at column 12 on the same line.
+        let (_, sym_b) = result.table.named_arg_label_at(4, 12).expect("b should hover");
+        assert_eq!(sym_b.name, "b");
+    }
+
+    #[test]
+    fn named_arg_label_at_shows_the_calls_param_doc() {
+        // Doc comments are only attached to declarations by
+        // `parser::parse_with_docs` (see `crate::parse_only`) — plain
+        // `parser::parse` (what `resolve_src` above uses) never attaches
+        // one, so this test builds its own `Program` instead.
+        let src = "/**\n * Adds two numbers.\n * @param a the first number\n */\nfun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(a = 1, b = 2)\n";
+        let program = crate::parse_only(src).expect("should parse");
+        let result = resolve(&program);
+        // "add(a = 1, b = 2)" is on line 8, "a" starts at column 5.
+        let (_, sym) = result.table.named_arg_label_at(8, 5).expect("a should hover");
+        assert_eq!(sym.doc.as_deref(), Some("the first number"));
     }
 
     #[test]
