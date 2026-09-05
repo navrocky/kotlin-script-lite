@@ -185,7 +185,7 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     // can start, but a handful have real grammar restrictions of their own
     // (see its doc comment).
     for (kw, _) in ksl_core::token::KEYWORDS {
-        if keyword_allowed(kw, analysis, text, position, &up_to_cursor, line, col) {
+        if keyword_allowed(kw, analysis, &up_to_cursor, line, col) {
             items.push(CompletionItem {
                 label: kw.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
@@ -211,25 +211,16 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
 /// - `break`/`continue`: only inside an enclosing loop (`resolver::
 ///   SymbolTable::inside_a_loop_at`, matching `parser::Parser::
 ///   loop_depth`'s own rule, including its reset at a fun/lambda boundary).
-/// - `else`: only right after a closing `}` (a heuristic, not a precise
-///   "does this `}` really close an `if`/`when` with no `else` of its own
-///   yet" check — offering it after some unrelated block's `}` is a rare,
-///   harmless false positive next to "offered literally everywhere",
-///   which is the actual bug this fixes).
+/// - `else`: only right after a real `if` that has no `else` of its own
+///   yet (`resolver::SymbolTable::else_allowed_at`, a real fact read off
+///   the resolved tree — not a guess about whatever `}` happens to precede
+///   the cursor).
 /// - `in`: only inside a `for (...)` header's own loop-variable position,
 ///   or somewhere a value could plausibly continue with an infix operator
 ///   (approximated the same way: the character right before the cursor
 ///   looks like the end of one) — never at a fresh statement-start
 ///   position, where `in` can't legally appear at all.
-fn keyword_allowed(
-    kw: &str,
-    analysis: &Analysis,
-    text: &str,
-    position: Position,
-    up_to_cursor: &str,
-    line: u32,
-    col: u32,
-) -> bool {
+fn keyword_allowed(kw: &str, analysis: &Analysis, up_to_cursor: &str, line: u32, col: u32) -> bool {
     match kw {
         "package" => {
             analysis.package.is_none()
@@ -238,7 +229,7 @@ fn keyword_allowed(
         }
         "import" => at_or_before(line, col, analysis.first_stmt_span),
         "break" | "continue" => analysis.resolved.table.inside_a_loop_at(line, col),
-        "else" => text_up_to_position(text, position).trim_end().ends_with('}'),
+        "else" => analysis.resolved.table.else_allowed_at(line, col),
         "in" => for_loop_var_position(up_to_cursor) || looks_like_after_a_value(up_to_cursor),
         _ => true,
     }

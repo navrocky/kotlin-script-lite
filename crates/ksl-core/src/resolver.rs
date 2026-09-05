@@ -215,6 +215,14 @@ pub struct SymbolTable {
     /// Empty for a positional argument, or when the callee's signature (and
     /// so which parameter this name refers to) couldn't be resolved at all.
     named_arg_labels: Vec<(Span, Symbol)>,
+    /// Every `if` expression with no `else` of its own, as `(if_span,
+    /// following)` — `if_span` is the whole `if`'s own span (widened to its
+    /// then-branch's real closing extent, see `parser::Parser::prev_span`),
+    /// `following` is wherever the next sibling construct begins. Lets a
+    /// caller (`ksl-lsp`'s completion) answer "would `else` be legal right
+    /// here" from a real fact instead of a raw-text "does this look like
+    /// it's right after a `}`" guess — see `else_allowed_at`.
+    dangling_ifs: Vec<(Span, Span)>,
 }
 
 impl SymbolTable {
@@ -361,6 +369,23 @@ impl SymbolTable {
             }
         }
     }
+
+    /// `true` when `else` typed at `(line, col)` would attach to a real
+    /// `if` with no `else` of its own yet — the gap right after that
+    /// `if`'s own closing extent, up to (not including) wherever the next
+    /// sibling construct begins, same "gap belongs to what comes after"
+    /// rule `open_scope`'s bounds already use. Replaces a raw-text "does
+    /// this look like it's right after some `}`" guess, which couldn't
+    /// tell an `if` needing an `else` apart from any other block's own
+    /// closing brace.
+    pub fn else_allowed_at(&self, line: u32, col: u32) -> bool {
+        let pos = (line, col);
+        self.dangling_ifs.iter().any(|(if_span, following)| {
+            let if_end = (if_span.end_line, if_span.end_col);
+            let following_start = (following.line, following.col);
+            if_end <= pos && pos < following_start
+        })
+    }
 }
 
 pub struct ResolveResult {
@@ -448,6 +473,7 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
             method_receiver_types: Vec::new(),
             name_refs: Vec::new(),
             named_arg_labels: Vec::new(),
+            dangling_ifs: Vec::new(),
         },
         diagnostics,
         type_errors: Vec::new(),
@@ -2480,7 +2506,10 @@ impl<'a> Resolver<'a> {
                         self.narrowed = ambient.clone();
                         ty
                     }
-                    None => Type::Unit,
+                    None => {
+                        self.table.dangling_ifs.push((expr.span, following));
+                        Type::Unit
+                    }
                 };
                 // Carry-forward: when the then-branch always exits the
                 // normal control flow (`return`/`break`/`continue`),
@@ -3095,6 +3124,43 @@ mod tests {
         // reset loop context either -- keep searching past it.
         let result = resolve_src("while (true) {\n    if (true) {\n        break\n    }\n}\n");
         assert!(result.table.inside_a_loop_at(3, 9));
+    }
+
+    #[test]
+    fn else_allowed_at_is_true_right_after_a_dangling_ifs_own_close() {
+        let result = resolve_src("if (true) {\n    1\n}\n");
+        // "}" on line 3 is a single char -- its own span ends at column 2.
+        assert!(result.table.else_allowed_at(3, 2), "right after the closing brace");
+        assert!(result.table.else_allowed_at(3, 3), "a bit further into the gap, still fine");
+    }
+
+    #[test]
+    fn else_allowed_at_is_false_after_an_if_that_already_has_an_else() {
+        let result = resolve_src("if (true) {\n    1\n} else {\n    2\n}\n");
+        for line in 1..6 {
+            for col in 1..10 {
+                assert!(!result.table.else_allowed_at(line, col), "line={line} col={col}");
+            }
+        }
+    }
+
+    #[test]
+    fn else_allowed_at_is_false_once_a_real_next_statement_has_started() {
+        let result = resolve_src("if (true) {\n    1\n}\nprintln(2)\n");
+        assert!(result.table.else_allowed_at(3, 2), "still in the gap");
+        // "println(2)" starts at (4, 1) -- once a real next statement's own
+        // span begins, the gap is over.
+        assert!(!result.table.else_allowed_at(4, 1), "println's own start");
+    }
+
+    #[test]
+    fn else_allowed_at_is_false_after_an_unrelated_blocks_close() {
+        let result = resolve_src("while (true) {\n    1\n}\n");
+        for line in 1..4 {
+            for col in 1..10 {
+                assert!(!result.table.else_allowed_at(line, col), "line={line} col={col}");
+            }
+        }
     }
 
     // ---- static type checking ----
