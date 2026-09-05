@@ -147,6 +147,26 @@ struct ScopeData {
     /// simplification; only a real call site (`Call`/`MethodCall`) needs
     /// the *whole* group, via `resolve_symbols`.
     names: HashMap<String, Vec<usize>>,
+    kind: ScopeKind,
+}
+
+/// What kind of construct a scope belongs to — used by
+/// `SymbolTable::inside_a_loop_at` to answer "would `break`/`continue`
+/// typed here resolve to an enclosing loop", matching
+/// `parser::Parser::loop_depth`'s own rule exactly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    /// A function or lambda body — crossing one *resets* loop context:
+    /// `parse_fun_decl`/`parse_lambda` both save and zero `loop_depth`
+    /// around their own body, so a loop enclosing the function/lambda from
+    /// the *outside* doesn't make `break`/`continue` inside it legal.
+    FunctionBoundary,
+    /// A `while`/`for` loop's own body.
+    Loop,
+    /// Everything else that opens a scope but isn't loop-relevant on its
+    /// own (an `if`/`when` branch, the file's global scope) — keep
+    /// searching further up.
+    Other,
 }
 
 pub struct SymbolTable {
@@ -317,6 +337,30 @@ impl SymbolTable {
             .max_by_key(|(_, s)| s.depth)
             .map(|(i, _)| i)
     }
+
+    /// `true` when a `break`/`continue` typed at `(line, col)` would
+    /// resolve to an enclosing loop — walks outward from the innermost
+    /// scope there, stopping at (and returning `true` for) the first
+    /// `ScopeKind::Loop`, or `false` at the first `ScopeKind::
+    /// FunctionBoundary` or the top without finding either. Matches
+    /// `parser::Parser::loop_depth`'s own rule exactly (see
+    /// `ScopeKind::FunctionBoundary`'s doc comment) — used by `ksl-lsp`'s
+    /// completion to only offer `break`/`continue` where they'd actually
+    /// be legal, rather than everywhere.
+    pub fn inside_a_loop_at(&self, line: u32, col: u32) -> bool {
+        let Some(mut idx) = self.innermost_scope(line, col) else { return false };
+        loop {
+            match self.scopes[idx].kind {
+                ScopeKind::Loop => return true,
+                ScopeKind::FunctionBoundary => return false,
+                ScopeKind::Other => {}
+            }
+            match self.scopes[idx].parent {
+                Some(p) => idx = p,
+                None => return false,
+            }
+        }
+    }
 }
 
 pub struct ResolveResult {
@@ -416,7 +460,7 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
         return_type_stack: Vec::new(),
         narrowed: HashSet::new(),
     };
-    let global = r.push_scope(None, 0, FILE_SPAN);
+    let global = r.push_scope(None, 0, FILE_SPAN, ScopeKind::Other);
     r.walk_stmts(&program.stmts, global, FILE_END);
     let imported_symbols = r.imports.by_name.into_values().flatten().collect();
     ResolveResult {
@@ -663,8 +707,8 @@ fn is_primitive(t: &Type) -> bool {
 }
 
 impl<'a> Resolver<'a> {
-    fn push_scope(&mut self, parent: Option<usize>, depth: u32, bounds: Span) -> usize {
-        self.table.scopes.push(ScopeData { parent, depth, bounds, names: HashMap::new() });
+    fn push_scope(&mut self, parent: Option<usize>, depth: u32, bounds: Span, kind: ScopeKind) -> usize {
+        self.table.scopes.push(ScopeData { parent, depth, bounds, names: HashMap::new(), kind });
         self.table.scopes.len() - 1
     }
 
@@ -691,13 +735,13 @@ impl<'a> Resolver<'a> {
     /// back to `following` only protects against a construct whose own
     /// span end isn't reliable for some as-yet-undiscovered reason, never
     /// making bounds wider than they already were.
-    fn open_scope(&mut self, parent: usize, own_start: Span, following: Span) -> usize {
+    fn open_scope(&mut self, parent: usize, own_start: Span, following: Span, kind: ScopeKind) -> usize {
         let depth = self.table.scopes[parent].depth + 1;
         let own_end = (own_start.end_line, own_start.end_col);
         let following_start = (following.line, following.col);
         let (end_line, end_col) = if own_end <= following_start { own_end } else { following_start };
         let bounds = Span::with_end(own_start.line, own_start.col, end_line, end_col);
-        self.push_scope(Some(parent), depth, bounds)
+        self.push_scope(Some(parent), depth, bounds, kind)
     }
 
     /// Widens `scope`'s bounds to also include `span` — used for content
@@ -1031,8 +1075,8 @@ impl<'a> Resolver<'a> {
     /// `FunDecl`/`For`/`Lambda`, which also bind params/a loop variable
     /// into the new scope before walking its body). Returns the block's
     /// value type, see `walk_stmts`.
-    fn walk_block(&mut self, stmts: &[Stmt], parent: usize, open_at: Span, following: Span) -> Type {
-        let child = self.open_scope(parent, open_at, following);
+    fn walk_block(&mut self, stmts: &[Stmt], parent: usize, open_at: Span, following: Span, kind: ScopeKind) -> Type {
+        let child = self.open_scope(parent, open_at, following, kind);
         self.walk_stmts(stmts, child, following)
     }
 
@@ -1215,7 +1259,7 @@ impl<'a> Resolver<'a> {
                     param_docs,
                     fun_doc,
                 );
-                let fn_scope = self.open_scope(scope, stmt.span, following);
+                let fn_scope = self.open_scope(scope, stmt.span, following, ScopeKind::FunctionBoundary);
                 self.walk_params(params, fn_scope, following, parsed_doc.as_ref());
                 self.return_type_stack.push(if has_return_annotation {
                     ReturnTypeContext::Expected(ret_ty.clone())
@@ -1311,7 +1355,7 @@ impl<'a> Resolver<'a> {
                 let (pos, _neg) = self.narrowing_for_condition(cond, scope);
                 let ambient = self.narrowed.clone();
                 self.narrowed.extend(pos);
-                self.walk_block(body, scope, stmt.span, following);
+                self.walk_block(body, scope, stmt.span, following, ScopeKind::Loop);
                 self.narrowed = ambient;
                 Type::Unit
             }
@@ -1327,7 +1371,7 @@ impl<'a> Resolver<'a> {
                     ExprKind::Range { .. } => Type::Int,
                     _ => Type::Unknown,
                 };
-                let for_scope = self.open_scope(scope, stmt.span, following);
+                let for_scope = self.open_scope(scope, stmt.span, following, ScopeKind::Loop);
                 let sig = match &elem_ty {
                     Type::Unknown => format!("val {var_name} (loop variable)"),
                     t => format!("val {var_name}: {} (loop variable)", t.name()),
@@ -1534,7 +1578,7 @@ impl<'a> Resolver<'a> {
             Some(Type::Function(p, _)) => Some(p.as_slice()),
             _ => None,
         };
-        let lambda_scope = self.open_scope(scope, expr.span, following);
+        let lambda_scope = self.open_scope(scope, expr.span, following, ScopeKind::FunctionBoundary);
         let param_types = self.walk_lambda_params(params, lambda_scope, expr.span, following, expected_params);
 
         self.return_type_stack.push(ReturnTypeContext::Collect(Vec::new()));
@@ -2427,12 +2471,12 @@ impl<'a> Resolver<'a> {
                 let (pos, neg) = self.narrowing_for_condition(cond, scope);
                 let ambient = self.narrowed.clone();
                 self.narrowed.extend(pos);
-                let then_ty = self.walk_block(then_branch, scope, expr.span, following);
+                let then_ty = self.walk_block(then_branch, scope, expr.span, following, ScopeKind::Other);
                 self.narrowed = ambient.clone();
                 let else_ty = match else_branch {
                     Some(eb) => {
                         self.narrowed.extend(neg.iter().copied());
-                        let ty = self.walk_block(eb, scope, expr.span, following);
+                        let ty = self.walk_block(eb, scope, expr.span, following, ScopeKind::Other);
                         self.narrowed = ambient.clone();
                         ty
                     }
@@ -2521,7 +2565,7 @@ impl<'a> Resolver<'a> {
                     if let Some(pos) = arm_narrowing {
                         self.narrowed.extend(pos);
                     }
-                    let arm_ty = self.walk_block(&arm.body, scope, expr.span, following);
+                    let arm_ty = self.walk_block(&arm.body, scope, expr.span, following, ScopeKind::Other);
                     self.narrowed = ambient;
                     acc = Some(match acc {
                         None => arm_ty,
@@ -2556,7 +2600,7 @@ impl<'a> Resolver<'a> {
                 }
                 acc.unwrap_or(Type::Unknown)
             }
-            ExprKind::Block(stmts) => self.walk_block(stmts, scope, expr.span, following),
+            ExprKind::Block(stmts) => self.walk_block(stmts, scope, expr.span, following, ScopeKind::Other),
             ExprKind::NullLit => Type::Null,
             ExprKind::Elvis { lhs, rhs } => {
                 let l = self.walk_expr(lhs, scope, following);
@@ -3004,6 +3048,53 @@ mod tests {
         let inside_body: HashSet<&str> =
             result2.table.symbols_in_scope(2, 13).into_iter().map(|s| s.name.as_str()).collect();
         assert!(inside_body.contains("coolParam"), "{inside_body:?}");
+    }
+
+    #[test]
+    fn inside_a_loop_at_finds_a_while_and_a_for_body() {
+        let result = resolve_src("while (true) {\n    println(1)\n}\n");
+        assert!(result.table.inside_a_loop_at(2, 5));
+
+        let result2 = resolve_src("for (i in 1..3) {\n    println(i)\n}\n");
+        assert!(result2.table.inside_a_loop_at(2, 5));
+    }
+
+    #[test]
+    fn inside_a_loop_at_stays_false_outside_any_loop() {
+        let result = resolve_src("println(1)\n");
+        assert!(!result.table.inside_a_loop_at(1, 5));
+    }
+
+    #[test]
+    fn inside_a_loop_at_stays_false_past_the_loops_own_closing_brace() {
+        // The blank gap right after the loop's own closing `}`, and
+        // anything genuinely past it, must not count as still "inside" it
+        // -- same real-closing-extent fix `symbols_in_scope_does_not_leak_
+        // into_the_blank_gap_after_its_own_closing_brace` covers.
+        let result = resolve_src("while (true) {\n    println(1)\n}\n\nprintln(2)\n");
+        assert!(!result.table.inside_a_loop_at(4, 1), "the blank gap after the loop");
+        assert!(!result.table.inside_a_loop_at(5, 1), "well past the loop");
+    }
+
+    #[test]
+    fn inside_a_loop_at_is_false_inside_a_nested_function_or_lambda() {
+        // Matches `parser::Parser::loop_depth`'s own reset at a fun/lambda
+        // boundary -- a loop enclosing the function/lambda from the
+        // *outside* doesn't make break/continue inside it legal.
+        let result =
+            resolve_src("while (true) {\n    fun f() {\n        println(1)\n    }\n}\n");
+        assert!(!result.table.inside_a_loop_at(3, 9), "{:?}", "inside the nested fun");
+
+        let result2 = resolve_src("while (true) {\n    val f = {\n        1\n    }\n}\n");
+        assert!(!result2.table.inside_a_loop_at(3, 9), "inside the nested lambda");
+    }
+
+    #[test]
+    fn inside_a_loop_at_is_true_inside_an_if_nested_in_a_loop() {
+        // An `if`/`when` branch isn't itself loop-relevant, but doesn't
+        // reset loop context either -- keep searching past it.
+        let result = resolve_src("while (true) {\n    if (true) {\n        break\n    }\n}\n");
+        assert!(result.table.inside_a_loop_at(3, 9));
     }
 
     // ---- static type checking ----

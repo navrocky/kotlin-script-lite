@@ -164,16 +164,118 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     // Derived straight from `ksl_core::token::KEYWORDS` — the lexer's own
     // canonical keyword table — rather than a hand-maintained copy, so a
     // keyword added there (as `package`/`import`/`null` once were, without
-    // a matching update here) always shows up in completion too.
+    // a matching update here) always shows up in completion too. Filtered
+    // by `keyword_allowed` — most keywords are valid anywhere a statement
+    // can start, but a handful have real grammar restrictions of their own
+    // (see its doc comment).
     for (kw, _) in ksl_core::token::KEYWORDS {
-        items.push(CompletionItem {
-            label: kw.to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            ..Default::default()
-        });
+        if keyword_allowed(kw, analysis, text, position, &up_to_cursor, line, col) {
+            items.push(CompletionItem {
+                label: kw.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            });
+        }
     }
 
     items
+}
+
+/// Whether `kw` is grammatically legal to type at `position` at all — most
+/// keywords (`fun`/`val`/`var`/`if`/`when`/`while`/`for`/`return`/`null`/
+/// `true`/`false`) can start a statement or appear in an expression
+/// anywhere, so they're always offered; a handful have a real, narrower
+/// grammar rule of their own:
+/// - `package`: only the very first thing in the file (`parser::Parser::
+///   parse_package_decl`) — before every `import`/`@file:Import` too, and
+///   only if the file doesn't already declare one.
+/// - `import`: only before this file's first non-header statement
+///   (`parser::Parser::parse_imports` — interleaved freely with `package`
+///   and `@file:Import`, but never after "real" code starts).
+/// - `break`/`continue`: only inside an enclosing loop (`resolver::
+///   SymbolTable::inside_a_loop_at`, matching `parser::Parser::
+///   loop_depth`'s own rule, including its reset at a fun/lambda boundary).
+/// - `else`: only right after a closing `}` (a heuristic, not a precise
+///   "does this `}` really close an `if`/`when` with no `else` of its own
+///   yet" check — offering it after some unrelated block's `}` is a rare,
+///   harmless false positive next to "offered literally everywhere",
+///   which is the actual bug this fixes).
+/// - `in`: only inside a `for (...)` header's own loop-variable position,
+///   or somewhere a value could plausibly continue with an infix operator
+///   (approximated the same way: the character right before the cursor
+///   looks like the end of one) — never at a fresh statement-start
+///   position, where `in` can't legally appear at all.
+fn keyword_allowed(
+    kw: &str,
+    analysis: &Analysis,
+    text: &str,
+    position: Position,
+    up_to_cursor: &str,
+    line: u32,
+    col: u32,
+) -> bool {
+    match kw {
+        "package" => {
+            analysis.package.is_none()
+                && at_or_before(line, col, analysis.first_import_span)
+                && at_or_before(line, col, analysis.first_stmt_span)
+        }
+        "import" => at_or_before(line, col, analysis.first_stmt_span),
+        "break" | "continue" => analysis.resolved.table.inside_a_loop_at(line, col),
+        "else" => text_up_to_position(text, position).trim_end().ends_with('}'),
+        "in" => for_loop_var_position(up_to_cursor) || looks_like_after_a_value(up_to_cursor),
+        _ => true,
+    }
+}
+
+/// `true` when `(line, col)` (1-based, `resolver`/`Span` convention) is at
+/// or before `bound`'s own start — or unconditionally `true` when there's
+/// no bound at all (nothing to be "before" yet).
+fn at_or_before(line: u32, col: u32, bound: Option<ksl_core::error::Span>) -> bool {
+    match bound {
+        None => true,
+        Some(b) => (line, col) <= (b.line, b.col),
+    }
+}
+
+/// `true` right after a `for (name` header, with no `in` typed yet — the
+/// one place `in` is *required*, not just a plausible infix operator.
+/// Raw-text, same reasoning as `type_position_before_cursor`: `for (i` has
+/// no complete AST node to read this off of while `in`/the iterable are
+/// still unwritten. Reuses `call_arg_context`'s own paren-tracking (rather
+/// than a plain substring search for `"for"`, which would also wrongly
+/// match inside an unrelated identifier like `format(`) to confirm `for`
+/// is a real standalone word immediately before the currently-open paren,
+/// not part of a longer name.
+fn for_loop_var_position(text_before_cursor: &str) -> bool {
+    let Some((callee, _)) = call_arg_context(text_before_cursor) else { return false };
+    if callee != "for" {
+        return false;
+    }
+    // `call_arg_context` confirms this paren is still the sole open one,
+    // so the last `(` in the text is exactly its own opening paren.
+    let open = text_before_cursor.rfind('(').expect("call_arg_context found an open paren");
+    let inside = text_before_cursor[open + 1..].trim_end();
+    // Exactly one bare identifier so far, nothing else (no comma, no `in`,
+    // no value) — `for (i`, optionally with trailing whitespace.
+    !inside.is_empty() && inside.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// `true` when the last non-whitespace character before the cursor looks
+/// like the end of a complete value (an identifier/number, or a closing
+/// `)`/`]`/`"`) — a coarse stand-in for "an infix operator could
+/// grammatically follow here," since there's no expression-level AST to
+/// consult while an operator itself is what's being typed. Deliberately
+/// permissive (a handful of statement-end positions, like right after a
+/// `val x = 5`, will also match) in favor of ruling out the clearly-wrong
+/// positions `in` was showing up in before this — a fresh line, right
+/// after `{`/`(`/`,`/a keyword, etc.
+fn looks_like_after_a_value(text_before_cursor: &str) -> bool {
+    text_before_cursor
+        .trim_end()
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || matches!(c, ')' | ']' | '"'))
 }
 
 /// Splits the text immediately before the cursor into a dotted-path prefix
@@ -757,13 +859,90 @@ mod tests {
     /// nobody remembered to add them to the separate copy here by hand.
     /// Now that the list is derived directly from `token::KEYWORDS`, this
     /// can't happen again — this test would fail the moment it did.
+    ///
+    /// Every keyword still needs its own valid position, though (see
+    /// `keyword_allowed`) — a handful (`package`/`import`/`break`/
+    /// `continue`/`else`/`in`) aren't legal at the generic "inside a
+    /// function body" position every other keyword is checked at, so each
+    /// gets its own tailored scenario here instead.
     #[test]
-    fn every_real_keyword_is_offered_as_a_completion() {
-        let text = "val outer = 1\nfun f(p: Int): Int {\n    val inner = 2\n    return inner\n}\n";
-        let names = labels(text, Position::new(3, 4));
-        for (kw, _) in ksl_core::token::KEYWORDS {
-            assert!(names.contains(&kw.to_string()), "'{kw}' is a real keyword but wasn't offered as a completion");
+    fn every_real_keyword_is_offered_as_a_completion_somewhere_valid() {
+        let general_text = "val outer = 1\nfun f(p: Int): Int {\n    val inner = 2\n    return inner\n}\n";
+        let general_names = labels(general_text, Position::new(3, 4));
+        let general_kws = [
+            "fun", "val", "var", "if", "when", "while", "for", "return", "null", "true", "false",
+        ];
+        for kw in general_kws {
+            assert!(general_names.contains(&kw.to_string()), "'{kw}' wasn't offered inside a function body");
         }
+
+        let package_names = labels("", Position::new(0, 0));
+        assert!(package_names.contains(&"package".to_string()), "{package_names:?}");
+        assert!(package_names.contains(&"import".to_string()), "{package_names:?}");
+
+        let after_package = "package foo\n";
+        let import_names = labels(after_package, Position::new(1, 0));
+        assert!(import_names.contains(&"import".to_string()), "{import_names:?}");
+        assert!(!import_names.contains(&"package".to_string()), "{import_names:?}");
+
+        let loop_body = "while (true) {\n    \n}\n";
+        // Line 2 (0-based 1), inside the loop's own body.
+        let loop_names = labels(loop_body, Position::new(1, 4));
+        assert!(loop_names.contains(&"break".to_string()), "{loop_names:?}");
+        assert!(loop_names.contains(&"continue".to_string()), "{loop_names:?}");
+
+        let after_brace = "if (true) {\n}\n";
+        // Right after the "}" that closes the `if`, same line.
+        let else_names = labels(after_brace, Position::new(1, 1));
+        assert!(else_names.contains(&"else".to_string()), "{else_names:?}");
+
+        // Fully-typed and parseable (closing paren/body included) -- the
+        // cursor, placed right after "for (i" rather than at the line's
+        // end, exercises the same mid-typing detection an unclosed paren
+        // would (same reasoning as `named_arg_completion_offers_the_calls_
+        // declared_parameter`).
+        let for_header = "for (i in 1..3) {\n}\n";
+        let in_names = labels(for_header, Position::new(0, 6));
+        assert!(in_names.contains(&"in".to_string()), "{in_names:?}");
+
+        for (kw, _) in ksl_core::token::KEYWORDS {
+            assert!(
+                general_kws.contains(&kw)
+                    || ["package", "import", "break", "continue", "else", "in"].contains(&kw),
+                "'{kw}' is a real keyword this test doesn't check a valid position for"
+            );
+        }
+    }
+
+    #[test]
+    fn keyword_completion_does_not_leak_into_the_wrong_context() {
+        // The specific complaint this fixes: these used to be offered
+        // literally everywhere, regardless of whether they were legal.
+        let mid_function = "fun f() {\n    \n}\n";
+        let names = labels(mid_function, Position::new(1, 4));
+        assert!(!names.contains(&"package".to_string()), "{names:?}");
+        assert!(!names.contains(&"import".to_string()), "{names:?}");
+        assert!(!names.contains(&"break".to_string()), "{names:?}");
+        assert!(!names.contains(&"continue".to_string()), "{names:?}");
+        assert!(!names.contains(&"else".to_string()), "{names:?}");
+        assert!(!names.contains(&"in".to_string()), "{names:?}");
+
+        // `package`/`import` after real code has already started.
+        let after_code = "println(1)\n";
+        let names2 = labels(after_code, Position::new(1, 0));
+        assert!(!names2.contains(&"package".to_string()), "{names2:?}");
+        assert!(!names2.contains(&"import".to_string()), "{names2:?}");
+
+        // `break`/`continue` inside a function nested in a loop.
+        let nested_fun_in_loop = "while (true) {\n    fun f() {\n        \n    }\n}\n";
+        let names3 = labels(nested_fun_in_loop, Position::new(2, 8));
+        assert!(!names3.contains(&"break".to_string()), "{names3:?}");
+        assert!(!names3.contains(&"continue".to_string()), "{names3:?}");
+
+        // `else` with no preceding `}` at all.
+        let no_brace = "val x = 1\n";
+        let names4 = labels(no_brace, Position::new(1, 0));
+        assert!(!names4.contains(&"else".to_string()), "{names4:?}");
     }
 
     #[test]

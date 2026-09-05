@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ksl_core::ast::{ImportDecl, Program};
+use ksl_core::ast::{ImportDecl, PackageDecl, Program};
+use ksl_core::error::Span;
 use ksl_core::resolver::{self, ResolveResult};
 
 use crate::package_index::{self, PackageIndex};
@@ -19,6 +20,25 @@ pub struct Analysis {
     /// (matched by `ImportDecl::path_span`), separate from `resolved`
     /// (which is scoped to expressions/statements, not import declarations).
     pub imports: Vec<ImportDecl>,
+    /// This document's own `package a.b` declaration, if any — together
+    /// with `first_import_span`/`first_stmt_span` below, lets completion
+    /// (`completion::keyword_header_context`) offer `package`/`import`/
+    /// `@file:Import` only where the language actually allows them: before
+    /// everything else in the file, matching `parser::Parser::
+    /// parse_package_decl`'s own "very first thing" rule.
+    pub package: Option<PackageDecl>,
+    /// The earliest span among this document's own `@file:Import(...)`/
+    /// `import a.b.c` declarations (whichever comes first in the source),
+    /// or `None` if it has neither. `package` must precede *every* import,
+    /// so this is what bounds how far a still-missing `package` could
+    /// legally be inserted.
+    pub first_import_span: Option<Span>,
+    /// The span of this document's first top-level statement that isn't a
+    /// `package`/import declaration, or `None` if the file is header-only
+    /// so far. This is where the "everything else" region begins —
+    /// `import`/`@file:Import` (and, if not already past it, `package`)
+    /// stop being legal past this point.
+    pub first_stmt_span: Option<Span>,
     /// This document's own path, as given to `analyze` — needed by
     /// completion/goto-definition for anything relative to the file on
     /// disk: resolving `@file:Import("...")` path completion candidates,
@@ -29,6 +49,17 @@ pub struct Analysis {
     /// previously cached tree — see the module doc comment on
     /// `document_store::DocumentState`.
     pub is_current: bool,
+}
+
+/// The earliest span among a document's own `@file:Import(...)`/
+/// `import a.b.c` declarations — see `Analysis::first_import_span`.
+fn first_import_span(program: &Program) -> Option<Span> {
+    program
+        .imports
+        .iter()
+        .map(|i| i.span)
+        .chain(program.imports_use.iter().map(|i| i.span))
+        .min_by_key(|s| (s.line, s.col))
 }
 
 /// Parses `text`; on success, resolves it and returns that (also building
@@ -61,13 +92,37 @@ pub fn analyze(text: &str, last_good: Option<Arc<Program>>, own_file: &Path) -> 
             let packages = package_index::build_package_index(&program, base_dir, Some(own_file));
             let resolved = resolver::resolve_with_imports(&program, &packages);
             let imports = program.imports.clone();
-            Some(Analysis { resolved, packages, imports, own_file: own_file.to_path_buf(), is_current: true })
+            let package = program.package.clone();
+            let first_import_span = first_import_span(&program);
+            let first_stmt_span = program.stmts.first().map(|s| s.span);
+            Some(Analysis {
+                resolved,
+                packages,
+                imports,
+                package,
+                first_import_span,
+                first_stmt_span,
+                own_file: own_file.to_path_buf(),
+                is_current: true,
+            })
         }
         Err(_) => last_good.map(|program| {
             let packages = package_index::build_package_index(&program, base_dir, Some(own_file));
             let resolved = resolver::resolve_with_imports(&program, &packages);
             let imports = program.imports.clone();
-            Analysis { resolved, packages, imports, own_file: own_file.to_path_buf(), is_current: false }
+            let package = program.package.clone();
+            let first_import_span = first_import_span(&program);
+            let first_stmt_span = program.stmts.first().map(|s| s.span);
+            Analysis {
+                resolved,
+                packages,
+                imports,
+                package,
+                first_import_span,
+                first_stmt_span,
+                own_file: own_file.to_path_buf(),
+                is_current: false,
+            }
         }),
     }
 }
