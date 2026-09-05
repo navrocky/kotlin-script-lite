@@ -55,6 +55,18 @@ impl<'a> Parser<'a> {
         self.peek().span
     }
 
+    /// The span of the most recently *consumed* token — the real end of
+    /// whatever was just parsed, as opposed to `self.span()` (which looks
+    /// at the *next*, not-yet-consumed token). Used to widen a statement's
+    /// or expression's own span to cover everything it actually consumed
+    /// (through a block's closing `}`, say) rather than just its first
+    /// token — see `parse_stmt`'s own wrapping, which is what makes this
+    /// accurate all the way down through nested blocks: every statement
+    /// inside one is itself parsed via `parse_stmt`, recursively.
+    fn prev_span(&self) -> Span {
+        self.tokens[self.pos.saturating_sub(1)].span
+    }
+
     fn advance(&mut self) -> Token {
         let t = self.tokens[self.pos].clone();
         if self.pos + 1 < self.tokens.len() {
@@ -372,9 +384,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses one statement and widens its own span to cover everything it
+    /// actually consumed — `start` through the last token this statement
+    /// swallowed (a block-bodied `fun`/`while`/`for`'s own closing `}`,
+    /// say), not just `start`'s single token. This is the one recursive
+    /// entry point every statement anywhere in the program (including
+    /// every statement nested inside a block/lambda/loop/branch body) goes
+    /// through, so the fix applies uniformly, all the way down, rather
+    /// than needing a matching fix in each individual `parse_*` function
+    /// below — see `prev_span`'s doc comment.
+    ///
+    /// This is what `resolver::Resolver::open_scope` relies on to bound a
+    /// scope by its *own* real extent instead of guessing via the next
+    /// sibling statement's start — before this, any block-bodied
+    /// construct's span stopped at its own opening keyword, so a scope's
+    /// upper bound had to fall back to "wherever the next statement
+    /// begins," which incorrectly swallowed the trailing gap (blank
+    /// lines/whitespace) between this statement's closing `}` and that
+    /// next one into *this* statement's own scope.
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
-        let span = self.span();
-        match self.peek_kind() {
+        let start = self.span();
+        let mut stmt = match self.peek_kind() {
             TokenKind::Val | TokenKind::Var => self.parse_val_decl(),
             TokenKind::Fun => self.parse_fun_decl(),
             TokenKind::While => self.parse_while(),
@@ -389,30 +419,33 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(self.parse_expr()?)
                 };
-                Ok(Stmt::new(StmtKind::Return(value), span))
+                Ok(Stmt::new(StmtKind::Return(value), start))
             }
             TokenKind::Break => {
                 self.advance();
                 if self.loop_depth == 0 {
                     return Err(ParseError {
                         message: "'break' is only allowed inside a loop".into(),
-                        span,
+                        span: start,
                     });
                 }
-                Ok(Stmt::new(StmtKind::Break, span))
+                Ok(Stmt::new(StmtKind::Break, start))
             }
             TokenKind::Continue => {
                 self.advance();
                 if self.loop_depth == 0 {
                     return Err(ParseError {
                         message: "'continue' is only allowed inside a loop".into(),
-                        span,
+                        span: start,
                     });
                 }
-                Ok(Stmt::new(StmtKind::Continue, span))
+                Ok(Stmt::new(StmtKind::Continue, start))
             }
             _ => self.parse_expr_or_assign_stmt(),
-        }
+        }?;
+        let end = self.prev_span();
+        stmt.span = Span::with_end(start.line, start.col, end.end_line, end.end_col);
+        Ok(stmt)
     }
 
     fn parse_val_decl(&mut self) -> Result<Stmt, ParseError> {
@@ -935,7 +968,13 @@ impl<'a> Parser<'a> {
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         let body = self.parse_stmts_until_rbrace();
         self.loop_depth = saved_loop_depth;
-        Ok(Expr::new(ExprKind::Lambda { params, body: body? }, span))
+        let body = body?;
+        // Widened to the real closing `}`, matching `parse_stmt`'s own
+        // widening — see its doc comment for why (this is what
+        // `resolver::Resolver::open_scope` uses to bound the lambda's own
+        // scope).
+        let end = self.prev_span();
+        Ok(Expr::new(ExprKind::Lambda { params, body }, Span::with_end(span.line, span.col, end.end_line, end.end_col)))
     }
 
     /// Speculatively parses a `ident (, ident)* ->` parameter list at the
@@ -988,13 +1027,17 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // Widened to whichever branch was consumed last (`else_branch` if
+        // present, `then_branch` otherwise) — same reasoning as
+        // `parse_lambda`'s own widening.
+        let end = self.prev_span();
         Ok(Expr::new(
             ExprKind::If {
                 cond: Box::new(cond),
                 then_branch,
                 else_branch,
             },
-            span,
+            Span::with_end(span.line, span.col, end.end_line, end.end_col),
         ))
     }
 
@@ -1031,7 +1074,10 @@ impl<'a> Parser<'a> {
             self.skip_separators();
         }
         self.expect(TokenKind::RBrace, "'}'")?;
-        Ok(Expr::new(ExprKind::When { subject, arms }, span))
+        // Widened to the real closing `}`, same reasoning as
+        // `parse_lambda`'s own widening.
+        let end = self.prev_span();
+        Ok(Expr::new(ExprKind::When { subject, arms }, Span::with_end(span.line, span.col, end.end_line, end.end_col)))
     }
 
     fn parse_when_arm(&mut self, has_subject: bool) -> Result<WhenArm, ParseError> {
@@ -1718,6 +1764,74 @@ mod tests {
                 }
                 other => panic!("unexpected {other:?}"),
             },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // ---- span widening (see `Parser::prev_span`/`parse_stmt`) ----
+
+    #[test]
+    fn a_block_bodied_funs_span_covers_its_own_closing_brace() {
+        // Regression test: `stmt.span` used to stop at just the `fun`
+        // keyword itself -- `resolver::Resolver::open_scope` relies on the
+        // real end here to bound the function's own scope tightly (see
+        // `resolver`'s `symbols_in_scope_does_not_leak_into_the_blank_gap_
+        // after_its_own_closing_brace`).
+        let stmts = parse_src("fun f(x: Int): Int {\n    return x\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.line, span.col), (1, 1), "should still start at 'fun'");
+        assert_eq!((span.end_line, span.end_col), (3, 2), "should now end right after the closing '}}'");
+    }
+
+    #[test]
+    fn an_expr_bodied_funs_span_covers_its_own_expression() {
+        let stmts = parse_src("fun f(x: Int): Int = x + 1\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (1, 27), "should end right after '1'");
+    }
+
+    #[test]
+    fn a_whiles_span_covers_its_own_closing_brace() {
+        let stmts = parse_src("while (true) {\n    break\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (3, 2));
+    }
+
+    #[test]
+    fn a_fors_span_covers_its_own_closing_brace() {
+        let stmts = parse_src("for (i in 1..3) {\n    println(i)\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (3, 2));
+    }
+
+    #[test]
+    fn an_ifs_span_covers_its_else_branch_when_present() {
+        let stmts = parse_src("if (true) {\n    1\n} else {\n    2\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (5, 2));
+    }
+
+    #[test]
+    fn an_ifs_span_covers_just_its_then_branch_with_no_else() {
+        let stmts = parse_src("if (true) {\n    1\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (3, 2));
+    }
+
+    #[test]
+    fn a_whens_span_covers_its_own_closing_brace() {
+        let stmts = parse_src("when (x) {\n    1 -> \"one\"\n    else -> \"other\"\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (4, 2));
+    }
+
+    #[test]
+    fn a_lambdas_span_covers_its_own_closing_brace() {
+        let stmts = parse_src("val f = { x ->\n    x + 1\n}\n");
+        match &stmts[0].kind {
+            StmtKind::ValDecl { init, .. } => {
+                assert_eq!((init.span.end_line, init.span.end_col), (3, 2));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

@@ -119,19 +119,20 @@ struct ScopeData {
     depth: u32,
     /// This scope's source extent — where a cursor position has to fall
     /// for `symbols_in_scope` to consider this scope active. Set directly
-    /// at scope creation (see `Resolver::open_scope`) as "from this
-    /// construct's own start, up to wherever the next sibling construct
-    /// begins" (or end-of-file, if there is no next sibling) — necessary
-    /// because neither `Stmt::span` nor `Expr::span` cover a whole
-    /// construct (they anchor its *start* only, see AGENTS.md's "Span on
-    /// every Expr/Stmt"), so there's no direct way to read a real
-    /// brace-to-brace extent. Using the next sibling's start as the
-    /// boundary is deliberately generous on the inside edge (e.g. an empty
-    /// `while (true) { }` body's scope technically extends slightly past
-    /// its closing brace, into whatever follows the loop) — safe for
-    /// `symbols_in_scope`, whose worst case is an occasional over-broad
-    /// suggestion, never a missing one. `symbol_at` is unaffected either
-    /// way, since it matches on `occurrences`, not scope bounds.
+    /// at scope creation (see `Resolver::open_scope`) to whichever comes
+    /// first, textually: this construct's own real closing extent (every
+    /// block-bodied `Stmt`/`Expr` kind that opens a scope —
+    /// `FunDecl`/`While`/`For`/`If`/`When`/`Lambda` — has its own span
+    /// widened all the way to its real closing `}` by
+    /// `parser::Parser::parse_stmt`/`parse_lambda`/`parse_if_expr`/
+    /// `parse_when_expr`, not just anchored at its opening keyword), or the
+    /// next sibling construct's start (end-of-file if there is no next
+    /// sibling) — the latter is only ever the tighter bound for a
+    /// construct whose own span end is somehow unavailable/unreliable; see
+    /// `open_scope`'s own doc comment for why the `min` is what makes an
+    /// empty gap (blank lines, trailing whitespace) between this
+    /// construct's closing `}` and the next sibling correctly fall
+    /// *outside* this scope rather than still inside it.
     bounds: Span,
     /// name -> every declared symbol index sharing it, in declaration
     /// order — almost always exactly one entry; more than one only when
@@ -670,12 +671,32 @@ impl<'a> Resolver<'a> {
     /// Creates a child scope for a construct that runs in its own
     /// `env.child()` at runtime (function/lambda bodies, loop/branch/block
     /// bodies — see the module doc comment), with its extent set up front:
-    /// from `own_start` (this construct's own anchor span — the `fun`/
-    /// `while`/`for`/`if` keyword, a lambda's `{`, etc.) to `following`
-    /// (wherever whatever comes next, textually, begins).
+    /// from `own_start` (this construct's own span — the whole `fun (...) {
+    /// ... }`/`while (...) { ... }`/lambda/etc., not just its opening
+    /// keyword or brace: `parser::Parser::parse_stmt` and its `if`/`when`/
+    /// lambda counterparts widen every one of these to their own real
+    /// closing `}` — see `parser::Parser::prev_span`'s doc comment) to
+    /// whichever comes first, textually: `own_start`'s own end, or
+    /// `following`'s start (wherever the next sibling construct begins).
+    ///
+    /// The `min` matters: `following`'s start is *always* a safe upper
+    /// bound (nothing inside this construct can be textually after the
+    /// next sibling begins), but on its own it over-extends this scope
+    /// through the *entire gap* after this construct's own closing `}` —
+    /// blank lines, trailing whitespace — right up to that next sibling,
+    /// incorrectly treating that gap as still "inside" this construct.
+    /// `own_start`'s own end is the tighter, correct bound whenever it's
+    /// available and earlier (the normal case for anything reaching this
+    /// function, all of which now carry a real closing span) — falling
+    /// back to `following` only protects against a construct whose own
+    /// span end isn't reliable for some as-yet-undiscovered reason, never
+    /// making bounds wider than they already were.
     fn open_scope(&mut self, parent: usize, own_start: Span, following: Span) -> usize {
         let depth = self.table.scopes[parent].depth + 1;
-        let bounds = Span::with_end(own_start.line, own_start.col, following.line, following.col);
+        let own_end = (own_start.end_line, own_start.end_col);
+        let following_start = (following.line, following.col);
+        let (end_line, end_col) = if own_end <= following_start { own_end } else { following_start };
+        let bounds = Span::with_end(own_start.line, own_start.col, end_line, end_col);
         self.push_scope(Some(parent), depth, bounds)
     }
 
@@ -2947,16 +2968,42 @@ mod tests {
         // A position genuinely inside function b's body must not see
         // function a's locals — the "next sibling" boundary (function b's
         // own start) has to actually stop function a's scope somewhere.
-        // (The blank/gap line *between* the two functions is a separate,
-        // documented imprecision — see `ScopeData::bounds` — since there's
-        // no real anchor for a's own closing brace to bound against; this
-        // test only asserts the part that's actually guaranteed.)
         let src = "fun a() {\n    val onlyInA = 1\n}\n\nfun b() {\n    val onlyInB = 1\n}\n";
         let result = resolve_src(src);
         let names: HashSet<&str> =
             result.table.symbols_in_scope(6, 5).into_iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains("onlyInB"), "{names:?}");
         assert!(!names.contains("onlyInA"), "{names:?}");
+    }
+
+    #[test]
+    fn symbols_in_scope_does_not_leak_into_the_blank_gap_after_its_own_closing_brace() {
+        // Regression test: `open_scope` used to bound a scope by "up to
+        // wherever the next sibling begins," which swallowed the entire
+        // gap after a construct's own closing `}` (blank lines, trailing
+        // whitespace) into that construct's own scope — invisible until a
+        // cursor actually sits in that gap (e.g. typing a brand new
+        // statement there) and asks what's in scope. Fixed by widening
+        // every block-bodied construct's own span to its real closing `}`
+        // (see `parser::Parser::parse_stmt`) and having `open_scope` prefer
+        // that over the next sibling's start whenever it's tighter.
+        let src = "fun test(coolParam: String) {}\n\ncoo\n";
+        let result = resolve_src(src);
+        // Line 2 is the blank gap between `test`'s closing `}` and `coo`.
+        let on_gap_line: HashSet<&str> =
+            result.table.symbols_in_scope(2, 1).into_iter().map(|s| s.name.as_str()).collect();
+        assert!(!on_gap_line.contains("coolParam"), "{on_gap_line:?}");
+        // Line 3 (`coo`, mid-typing a new statement) must not see it either.
+        let on_next_stmt: HashSet<&str> =
+            result.table.symbols_in_scope(3, 4).into_iter().map(|s| s.name.as_str()).collect();
+        assert!(!on_next_stmt.contains("coolParam"), "{on_next_stmt:?}");
+        // Sanity check: `coolParam` is still visible from genuinely inside
+        // `test`'s own body.
+        let src2 = "fun test(coolParam: String) {\n    println(coolParam)\n}\n";
+        let result2 = resolve_src(src2);
+        let inside_body: HashSet<&str> =
+            result2.table.symbols_in_scope(2, 13).into_iter().map(|s| s.name.as_str()).collect();
+        assert!(inside_body.contains("coolParam"), "{inside_body:?}");
     }
 
     // ---- static type checking ----
