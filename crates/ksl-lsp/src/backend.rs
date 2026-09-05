@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -17,27 +16,16 @@ use tower_lsp::{Client, LanguageServer};
 use crate::analysis::{self, Analysis};
 use crate::diagnostics::static_diagnostics;
 use crate::document_store::DocumentStore;
-use crate::runtime_diagnostics::{run_diagnostics, RuntimeDiagnostics};
 use crate::semantic_tokens::{semantic_tokens, TOKEN_TYPES};
 
 pub struct Backend {
     client: Client,
     docs: RwLock<DocumentStore>,
-    /// Per entry document, the URI (if any, and if different from the entry
-    /// document itself) that the last `didSave` published *runtime*
-    /// diagnostics to — e.g. a file pulled in via `@file:Import`. Needed so
-    /// that fixing the import error clears the diagnostic on that other
-    /// file rather than leaving it stuck.
-    last_runtime_target: RwLock<HashMap<Url, Url>>,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
-        Backend {
-            client,
-            docs: RwLock::new(DocumentStore::default()),
-            last_runtime_target: RwLock::new(HashMap::new()),
-        }
+        Backend { client, docs: RwLock::new(DocumentStore::default()) }
     }
 
     async fn publish(&self, uri: Url, diagnostics: Vec<Diagnostic>) {
@@ -67,67 +55,6 @@ impl Backend {
         analysis::analyze(&doc.text, doc.last_good.clone(), &uri_to_path(uri))
     }
 
-    /// Runs the script for runtime diagnostics, but only if it actually
-    /// parses — a script that doesn't parse fails identically as a parse
-    /// error, which `publish_static_diagnostics` already surfaced.
-    async fn run_and_publish_runtime_diagnostics(&self, uri: Url, text: String) {
-        if ksl_core::parse_only(&text).is_err() {
-            self.clear_stale_runtime_target(&uri, None).await;
-            return;
-        }
-
-        let static_diags = static_diagnostics(&text, &uri_to_path(&uri));
-
-        let entry_uri = uri.clone();
-        // `run_diagnostics` blocks its calling thread on `recv_timeout` (up
-        // to several seconds) while the script runs on a separate OS
-        // thread, so run it off the async runtime's own worker threads.
-        let result = match tokio::task::spawn_blocking(move || run_diagnostics(entry_uri, text)).await {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let RuntimeDiagnostics { uri: target_uri, diagnostics: runtime_diags } = result;
-
-        self.clear_stale_runtime_target(&uri, Some(&target_uri)).await;
-
-        // `publishDiagnostics` replaces a file's full diagnostic set rather
-        // than merging with it, so publishing runtime-only diagnostics here
-        // would wipe out the static ones `did_save` just sent moments ago
-        // (e.g. a script with a static-only error like a missing parameter
-        // type annotation still runs fine, so `runtime_diags` comes back
-        // empty). Merge them back in when the runtime error (if any) lands
-        // on the entry file itself; a runtime error attributed to a
-        // different, imported file has no static diagnostics of its own to
-        // preserve here.
-        let diagnostics: Vec<_> = if target_uri == uri {
-            static_diags.into_iter().chain(runtime_diags).collect()
-        } else {
-            runtime_diags
-        };
-        self.publish(target_uri.clone(), diagnostics).await;
-
-        let mut map = self.last_runtime_target.write().unwrap();
-        if target_uri == uri {
-            map.remove(&uri);
-        } else {
-            map.insert(uri, target_uri);
-        }
-    }
-
-    /// Clears diagnostics left on a previously-targeted file (from an
-    /// earlier `didSave`) when this save's target has moved elsewhere or
-    /// disappeared, so a fixed import error doesn't stay stuck forever.
-    async fn clear_stale_runtime_target(&self, entry_uri: &Url, new_target: Option<&Url>) {
-        let previous = {
-            let map = self.last_runtime_target.read().unwrap();
-            map.get(entry_uri).cloned()
-        };
-        if let Some(prev) = previous {
-            if Some(&prev) != new_target {
-                self.publish(prev, Vec::new()).await;
-            }
-        }
-    }
 }
 
 #[tower_lsp::async_trait]
@@ -193,14 +120,12 @@ impl LanguageServer for Backend {
             Some(doc) => doc.text.clone(),
             None => return,
         };
-        self.publish_static_diagnostics(uri.clone(), &text).await;
-        self.run_and_publish_runtime_diagnostics(uri, text).await;
+        self.publish_static_diagnostics(uri, &text).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.docs.write().unwrap().close(&uri);
-        self.last_runtime_target.write().unwrap().remove(&uri);
         self.publish(uri, Vec::new()).await;
     }
 
