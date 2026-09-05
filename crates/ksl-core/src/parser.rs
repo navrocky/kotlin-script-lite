@@ -795,7 +795,7 @@ impl<'a> Parser<'a> {
         loop {
             if matches!(self.peek_kind(), TokenKind::LParen) {
                 let span = self.span();
-                let args = self.parse_call_args()?;
+                let args = self.parse_call_args().map_err(|e| attach_callee_to_call_argument_error(e, &expr))?;
                 expr = Expr::new(
                     ExprKind::Call {
                         callee: Box::new(expr),
@@ -866,9 +866,29 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// Parses a call's own `(...)` argument list. Every fallible step below
+    /// funnels through `parse_call_args_body`, which enriches any failure
+    /// with `Expected::CallArgument` (`callee` left `None` here — this
+    /// function has no way to know which expression it's the arguments
+    /// *of* — filled in by `parse_postfix`, the only caller that does) so
+    /// a completion caller re-parsing text truncated mid-call (`test(a =
+    /// 1, b`) still gets a useful answer, not just a bare `Expected::
+    /// Token(RParen)`/`Token(Comma)` — there's no `Call`/`MethodCall` AST
+    /// node yet to read the callee/already-used-names off of otherwise,
+    /// since the call itself hasn't finished parsing.
     fn parse_call_args(&mut self) -> Result<Vec<Arg>, ParseError> {
         self.expect(TokenKind::LParen, "'('")?;
         let mut args = Vec::new();
+        if let Err(e) = self.parse_call_args_body(&mut args) {
+            let already_named = args.iter().filter_map(|a| a.name.clone()).collect();
+            let mut e = e;
+            e.expected.push(Expected::CallArgument { callee: None, already_named });
+            return Err(e);
+        }
+        Ok(args)
+    }
+
+    fn parse_call_args_body(&mut self, args: &mut Vec<Arg>) -> Result<(), ParseError> {
         while !matches!(self.peek_kind(), TokenKind::RParen) {
             let (name, name_span) = if matches!(self.peek_kind(), TokenKind::Ident(_))
                 && matches!(self.peek_at(1), TokenKind::Assign)
@@ -886,7 +906,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RParen, "')'")?;
-        Ok(args)
+        Ok(())
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -1109,6 +1129,26 @@ impl<'a> Parser<'a> {
             body,
         })
     }
+}
+
+/// Fills in every `Expected::CallArgument`'s `callee` on `e` from
+/// `callee_expr` — `parse_call_args`/`parse_call_args_body` already know
+/// which names were used so far but not what they're arguments *of*
+/// (they're only ever called after the callee expression has already been
+/// parsed), so `parse_postfix` — the only caller that has both — patches
+/// it in here once `parse_call_args` returns. A non-`Name` callee (`f()()`,
+/// calling the result of another call) leaves `callee` as the `None`
+/// `parse_call_args` already set it to; there's no bare name for a
+/// completion caller to look parameters up by there anyway.
+fn attach_callee_to_call_argument_error(mut e: ParseError, callee_expr: &Expr) -> ParseError {
+    if let ExprKind::Name(name) = &callee_expr.kind {
+        for exp in &mut e.expected {
+            if let Expected::CallArgument { callee, .. } = exp {
+                *callee = Some(name.clone());
+            }
+        }
+    }
+    e
 }
 
 #[cfg(test)]

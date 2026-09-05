@@ -149,8 +149,23 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     // already claimed by an earlier named argument, on top of the usual
     // locals/stdlib/etc. below (a bare identifier here could just as well
     // be a positional argument's value, so this only adds to the list,
-    // never replaces it). See `call_arg_context`.
-    if let Some((callee, used_names)) = call_arg_context(&up_to_cursor) {
+    // never replaces it). `expected`'s own `CallArgument` (see
+    // `parser::Parser::parse_call_args`'s doc comment) is the primary
+    // source now — real parser state, not a guess — falling back to the
+    // raw-text `call_arg_context` only when that comes back empty (no
+    // bare-name callee to work with, e.g. `f()(`, or the tail-position
+    // guard in `expected_at_cursor` tripped on a genuine unrelated error
+    // elsewhere on the line) rather than offering nothing at all.
+    let call_ctx = expected
+        .iter()
+        .find_map(|e| match e {
+            Expected::CallArgument { callee: Some(callee), already_named } => {
+                Some((callee.clone(), already_named.clone()))
+            }
+            _ => None,
+        })
+        .or_else(|| call_arg_context(&up_to_cursor));
+    if let Some((callee, used_names)) = call_ctx {
         items.extend(named_arg_completions(analysis, &callee, &used_names, line, col));
     }
 
@@ -1441,6 +1456,19 @@ mod tests {
         let names = labels(text, Position::new(1, 13)); // right after "test(a = 1, b"
         assert!(names.contains(&"b =".to_string()), "{names:?}");
         assert!(!names.contains(&"a =".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn named_arg_completion_via_expected_at_cursor_excludes_a_nested_calls_own_names() {
+        // End-to-end coverage of the new primary path (`Expected::
+        // CallArgument` from `expected_at_cursor`, not the raw-text
+        // `call_arg_context` fallback): `inner`'s own `x = 1` must not
+        // leak into `outer`'s `already_named`.
+        let text = "fun inner(x: Int): Int = x\nfun outer(y: Int): Int = y\nouter(inner(x = 1), y)\n";
+        // "outer(inner(x = 1), y" is 21 chars -- cursor right after "y".
+        let names = labels(text, Position::new(2, 21));
+        assert!(names.contains(&"y =".to_string()), "{names:?}");
+        assert!(!names.contains(&"x =".to_string()), "{names:?}");
     }
 
     #[test]

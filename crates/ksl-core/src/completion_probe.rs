@@ -77,8 +77,56 @@ mod tests {
     #[test]
     fn stays_empty_for_non_type_positions() {
         assert_eq!(expected_at_cursor("val x = "), Vec::new());
-        assert_eq!(expected_at_cursor("println("), Vec::new());
         assert_eq!(expected_at_cursor(""), Vec::new());
+    }
+
+    #[test]
+    fn reports_call_argument_role_inside_a_bare_calls_own_arg_list() {
+        // "println(" -- not a type position; a bare call's own still-open
+        // argument list instead, with no callee-side info to distinguish
+        // "named arg already used" from anything else yet.
+        assert_eq!(
+            expected_at_cursor("println("),
+            vec![Expected::CallArgument { callee: Some("println".to_string()), already_named: Vec::new() }]
+        );
+    }
+
+    #[test]
+    fn reports_call_argument_role_with_a_positional_arg_already_typed() {
+        // A syntactically-valid bare identifier as a positional argument
+        // (`longParam`) parses fine on its own -- the real failure is the
+        // still-missing closing `)`, which now also carries the
+        // CallArgument enrichment (see `parser::Parser::parse_call_args`'s
+        // doc comment), not just a bare `Token(RParen)`.
+        assert_eq!(
+            expected_at_cursor("test(longParam"),
+            vec![Expected::CallArgument { callee: Some("test".to_string()), already_named: Vec::new() }]
+        );
+    }
+
+    #[test]
+    fn reports_already_named_args_from_the_same_call() {
+        assert_eq!(
+            expected_at_cursor("test(a = 1, b"),
+            vec![Expected::CallArgument { callee: Some("test".to_string()), already_named: vec!["a".to_string()] }]
+        );
+    }
+
+    #[test]
+    fn a_closed_nested_calls_own_names_do_not_leak_into_the_outer_one() {
+        assert_eq!(
+            expected_at_cursor("outer(inner(x = 1), y"),
+            vec![Expected::CallArgument { callee: Some("outer".to_string()), already_named: Vec::new() }],
+            "inner's own 'x' must not appear in outer's already_named"
+        );
+    }
+
+    #[test]
+    fn callee_stays_none_for_a_non_name_callee() {
+        // `f()()` -- calling the result of another call has no bare name
+        // to look parameters up by.
+        let expected = expected_at_cursor("f()(");
+        assert_eq!(expected, vec![Expected::CallArgument { callee: None, already_named: Vec::new() }]);
     }
 
     #[test]
@@ -124,7 +172,12 @@ mod tests {
 
     #[test]
     fn type_name_role_does_not_leak_into_a_default_values_own_call() {
-        assert_eq!(expected_at_cursor("fun f(a: Int = compute("), Vec::new());
+        let expected = expected_at_cursor("fun f(a: Int = compute(");
+        assert!(!expected.contains(&Expected::Identifier(IdentRole::TypeName)), "{expected:?}");
+        assert!(
+            expected.contains(&Expected::CallArgument { callee: Some("compute".to_string()), already_named: Vec::new() }),
+            "{expected:?}"
+        );
     }
 
     #[test]
