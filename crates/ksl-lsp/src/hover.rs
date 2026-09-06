@@ -76,18 +76,32 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
         }
     }
 
-    // Last resort: a bare name with no local declaration of its own at
-    // all — `occurrence_at` above only covers names that resolve to a real
-    // local symbol, so this is what's left for a stdlib function or a name
-    // this file's own `import`/`@file:Import` brought into bare scope
-    // (real or built-in package, wildcard or named, or a package-less flat
+    // A bare name with no local declaration of its own at all —
+    // `occurrence_at` above only covers names that resolve to a real local
+    // symbol, so this is what's left for a stdlib function or a name this
+    // file's own `import`/`@file:Import` brought into bare scope (real or
+    // built-in package, wildcard or named, or a package-less flat
     // namespace member — see `resolver::ResolveResult::imported_symbols`).
-    let name = analysis.resolved.table.name_ref_at(line, col)?;
-    if let Some(sym) = ksl_core::stdlib::default_imported_symbols().find(|s| s.name == name) {
-        return Some(build_stdlib_function_hover(&ksl_core::stdlib::format_signature(sym), sym.doc));
+    if let Some(name) = analysis.resolved.table.name_ref_at(line, col) {
+        if let Some(sym) = ksl_core::stdlib::default_imported_symbols().find(|s| s.name == name) {
+            return Some(build_stdlib_function_hover(&ksl_core::stdlib::format_signature(sym), sym.doc));
+        }
+        if let Some(found) = analysis.resolved.imported_symbols.iter().find(|m| m.symbol.name == name) {
+            return Some(build_hover(&found.symbol, None, analysis.is_current, found.package.as_deref()));
+        }
     }
-    let found = analysis.resolved.imported_symbols.iter().find(|m| m.symbol.name == name)?;
-    Some(build_hover(&found.symbol, None, analysis.is_current, found.package.as_deref()))
+
+    // Genuinely last resort: a `.field`/`.method()` use on a cross-file
+    // class instance — covered by none of the checks above (no local
+    // `Symbol` index for `occurrence_at`; not a dotted-name chain for
+    // `qualified_ref_at`, since the receiver is a real local instance, not
+    // an unresolved path; not a `BUILTIN_METHODS` match; and a field/method
+    // name is never a bare `Name` expression, so `name_ref_at` doesn't see
+    // it either) — but the resolver already recorded exactly which
+    // cross-file symbol it came from (see `ResolveResult::cross_file_ref_at`'s
+    // own doc comment). No package qualifier: a field isn't referenced as
+    // `Point.x` the way a package-qualified function is.
+    analysis.resolved.cross_file_ref_at(line, col).map(|cross_ref| build_hover(&cross_ref.symbol, None, analysis.is_current, None))
 }
 
 /// Inserts `package.` right before `name`'s first occurrence in
@@ -524,6 +538,54 @@ mod tests {
         // "p." is 2 chars, so "bark" starts at column 3.
         let h = hover_at(text, 5, 3).expect("method use should hover");
         assert!(markdown_value(&h).contains("fun bark(): String"), "{}", markdown_value(&h));
+    }
+
+    /// Cross-file counterpart of `hover_on_a_promoted_field_use_shows_its_ctor_params_declaration`
+    /// — a `class` declared in one file, its field used from another via
+    /// `@file:Import`, must still describe the real declaration (see
+    /// `ResolveResult::cross_file_ref_at`'s own doc comment).
+    #[test]
+    fn hover_on_a_cross_file_promoted_field_use_shows_its_ctor_params_declaration() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_hover_cross_field_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("point.ksl"), "class Point(val x: Int, val y: Int)\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"point.ksl\")\nval p = Point(1, 2)\nprintln(p.x)\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        // "println(p." is 10 chars, so "x" starts at column 11, on line 3.
+        let h = hover(&a, Position::new(2, 10)).expect("cross-file field use should hover");
+        assert!(markdown_value(&h).contains("param x: Int"), "{}", markdown_value(&h));
+        assert!(markdown_value(&h).contains("*parameter*"), "{}", markdown_value(&h));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-file counterpart of `hover_on_a_method_use_shows_its_signature`.
+    #[test]
+    fn hover_on_a_cross_file_method_use_shows_its_signature() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ksl_lsp_hover_cross_method_{n}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("point.ksl"), "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"point.ksl\")\nval p = Point(1)\np.bark()\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        // "p." is 2 chars, so "bark" starts at column 3, on line 3.
+        let h = hover(&a, Position::new(2, 2)).expect("cross-file method use should hover");
+        assert!(markdown_value(&h).contains("fun bark(): String"), "{}", markdown_value(&h));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -30,6 +30,19 @@ pub fn goto_definition(analysis: &Analysis, uri: &Url, position: Position) -> Op
         }));
     }
 
+    // A `.field`/`.method()` use on a cross-file class instance (or a
+    // cross-file `val`/`var`'s own reassignment/read) — no local `Symbol`
+    // index exists for `occurrence_at` above to have found, but the
+    // resolver already recorded exactly where it came from (see
+    // `ResolveResult::cross_file_ref_at`'s own doc comment). `file: None`
+    // is a synthetic stdlib member with no source location — falls through
+    // to the checks below instead of dead-ending here.
+    if let Some(cross_ref) = analysis.resolved.cross_file_ref_at(line, col) {
+        if let Some(target_uri) = cross_ref.file.as_deref().and_then(crate::package_index::path_to_url) {
+            return Some(GotoDefinitionResponse::Scalar(Location { uri: target_uri, range: span_to_range(cross_ref.def_span) }));
+        }
+    }
+
     if let Some((_, path)) = analysis.resolved.table.qualified_ref_at(line, col) {
         let (package, member) = path.split_at(path.len() - 1);
         // A built-in package member (e.g. `kotlin.test.assertEquals`) has
@@ -259,6 +272,66 @@ mod tests {
             }
             other => panic!("expected a scalar location, got {other:?}"),
         }
+    }
+
+    /// Cross-file counterpart of `goto_definition_on_a_field_use_jumps_to_its_declaration`
+    /// — a `class` declared in one file, its field used from another via
+    /// `@file:Import`, must still jump to the real declaration (see
+    /// `ResolveResult::cross_file_ref_at`'s own doc comment for why this
+    /// needed its own resolver-side mechanism, not just `qualified_ref_at`).
+    #[test]
+    fn goto_definition_on_a_cross_file_field_use_jumps_to_the_other_files_declaration() {
+        let dir = temp_dir("cross_field");
+        let point_path = dir.join("point.ksl");
+        fs::write(&point_path, "class Point(val x: Int, val y: Int)\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"point.ksl\")\nval p = Point(1, 2)\nprintln(p.x)\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        let uri = uri_for(&main_path);
+        // "println(p." is 10 chars, so "x" is at column 11 (0-based 10).
+        let response = goto_definition(&a, &uri, Position::new(2, 10)).expect("cross-file field use should resolve");
+        match response {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri, uri_for(&point_path));
+                // "class Point(val " is 16 chars, so x's own declaration is
+                // at column 17 (0-based 16) on line 1 (0-based 0).
+                assert_eq!(loc.range.start.line, 0);
+                assert_eq!(loc.range.start.character, 16);
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-file counterpart of `goto_definition_on_a_method_use_jumps_to_its_declaration`.
+    #[test]
+    fn goto_definition_on_a_cross_file_method_use_jumps_to_the_other_files_declaration() {
+        let dir = temp_dir("cross_method");
+        let point_path = dir.join("point.ksl");
+        fs::write(&point_path, "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let text = "@file:Import(\"point.ksl\")\nval p = Point(1)\np.bark()\n";
+        fs::write(&main_path, text).unwrap();
+
+        let a = analysis::analyze(text, None, &main_path).expect("should parse");
+        let uri = uri_for(&main_path);
+        // "p." is 2 chars, so "bark" starts at column 3 (0-based 2), line 3 (0-based 2).
+        let response = goto_definition(&a, &uri, Position::new(2, 2)).expect("cross-file method use should resolve");
+        match response {
+            GotoDefinitionResponse::Scalar(loc) => {
+                assert_eq!(loc.uri, uri_for(&point_path));
+                // "    fun " is 8 chars, so bark's own declaration starts
+                // at column 9 (0-based 8) on line 2 (0-based 1).
+                assert_eq!(loc.range.start.line, 1);
+                assert_eq!(loc.range.start.character, 8);
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A file that was never actually written to disk, but exists for

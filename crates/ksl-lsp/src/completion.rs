@@ -517,12 +517,29 @@ fn package_path_completions(
 /// `walk_class_decl`/`walk_class_method` define each one) plus `Any`'s
 /// three native methods (every class implicitly extends `Any`, see
 /// `stdlib::BUILTIN_METHODS`'s own doc comment) — the `Type::Class`
-/// counterpart of `builtin_method_completions`.
+/// counterpart of `builtin_method_completions`. `class_name` declared in
+/// *this* file is looked up locally first; one only known through a real
+/// `import`/`@file:Import` has no `SymbolTable::class_members` entry of its
+/// own here (that table is single-file — see its own doc comment), so it
+/// falls back to the same cross-file shape `resolver.rs`'s
+/// `class_field_type`/`class_method_signature` already consult (see
+/// `package_index::PackageMember::class_members`'s doc comment).
 fn class_member_completions(analysis: &Analysis, class_name: &str) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = analysis
-        .resolved
-        .table
-        .class_members(class_name)
+    let local: Vec<&ksl_core::resolver::Symbol> = analysis.resolved.table.class_members(class_name).collect();
+    let cross_file_owned;
+    let members: &[&ksl_core::resolver::Symbol] = if !local.is_empty() {
+        &local
+    } else {
+        cross_file_owned = analysis
+            .packages
+            .find_class(class_name)
+            .and_then(|pm| pm.class_members.as_ref())
+            .map(|members| members.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        &cross_file_owned
+    };
+    let mut items: Vec<CompletionItem> = members
+        .iter()
         .map(|s| CompletionItem {
             label: s.name.clone(),
             kind: Some(symbol_completion_kind(s.kind)),
@@ -1399,6 +1416,38 @@ mod tests {
         assert!(names.contains(&"hashCode".to_string()), "{names:?}");
         // No String-specific method leaks in.
         assert!(!names.contains(&"uppercase".to_string()), "{names:?}");
+    }
+
+    /// Cross-file counterpart of `completion_after_a_dot_on_a_user_class_local_offers_its_own_members_plus_any`
+    /// — a `class` declared in one file, its instance's members completed
+    /// from another via `@file:Import`, must offer the same real fields/
+    /// methods (plus `Any`'s), not just `Any`'s alone: `SymbolTable::
+    /// class_members` is single-file, so this exercises `class_member_
+    /// completions`'s cross-file fallback through `PackageIndex::find_class`.
+    #[test]
+    fn completion_after_a_dot_on_a_cross_file_class_instance_offers_its_own_members_plus_any() {
+        let dir = std::env::temp_dir().join(format!(
+            "ksl_completion_test_cross_class_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("point.ksl"), "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let main_text = "@file:Import(\"point.ksl\")\nval p = Point(1)\np.bark()\n";
+        std::fs::write(&main_path, main_text).unwrap();
+
+        let analysis = analysis::analyze(main_text, None, &main_path).expect("should parse");
+        // "p." is 2 chars, cursor right after the dot on line 3 (0-based 2).
+        let names: Vec<String> =
+            completion(&analysis, main_text, Position::new(2, 2)).into_iter().map(|i| i.label).collect();
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"bark".to_string()), "{names:?}");
+        assert!(names.contains(&"toString".to_string()), "{names:?}");
+        assert!(names.contains(&"equals".to_string()), "{names:?}");
+        assert!(names.contains(&"hashCode".to_string()), "{names:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

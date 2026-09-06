@@ -97,6 +97,13 @@ pub struct Symbol {
     /// (which bundles every parameter together, see `doc` below). Empty for
     /// every other kind.
     pub param_docs: Vec<Option<String>>,
+    /// Same order as `param_types`/`param_names`: whether that parameter
+    /// has a `= default` value (`ast::Param::default`), which lets a call
+    /// site legitimately omit it — `check_call_signature`'s "missing
+    /// argument" arity check consults this so a real default doesn't get
+    /// flagged as a missing required argument. Empty for every other kind,
+    /// same convention as `param_types`.
+    pub param_has_default: Vec<bool>,
     /// Doc-comment text for hover/completion, already rendered to a final
     /// display string (mirrors `signature`'s "pre-rendered once" shape,
     /// no separate structured type on `Symbol`). For `Fun`/`Val`/`Var`:
@@ -114,10 +121,26 @@ pub struct Symbol {
 /// `check_call_signature`: return type, one resolved type per declared
 /// parameter, one name per parameter (an empty string where the callee has
 /// no real parameter names of its own — see the `Call`/`MethodCall`
-/// handling in `walk_expr_expected`), and one `@param` description per
+/// handling in `walk_expr_expected`), one `@param` description per
 /// parameter (`None` where there is none, or where the callee has no doc
-/// comments to begin with, e.g. a stdlib function).
-type CallSignature = (Type, Vec<Type>, Vec<String>, Vec<Option<String>>);
+/// comments to begin with, e.g. a stdlib function), and one "has an
+/// `= default`" flag per parameter — `check_call_signature`'s arity check
+/// only ever consults this last element when every parameter name is real
+/// (non-empty); a stdlib/structural-type signature's blank-name
+/// placeholders always carry `false` here regardless, since arity is never
+/// checked for those anyway.
+type CallSignature = (Type, Vec<Type>, Vec<String>, Vec<Option<String>>, Vec<bool>);
+
+/// Adapts `stdlib::builtin_method_signature`'s own 4-element
+/// `MethodSignature` (never a real per-parameter name, so never arity-
+/// checked either — see `CallSignature`'s doc comment) into a `CallSignature`
+/// by tacking on an all-`false` `param_has_default`.
+fn builtin_method_signature_as_call_signature(receiver_type: &str, method: &str) -> Option<CallSignature> {
+    crate::stdlib::builtin_method_signature(receiver_type, method).map(|(ret, pt, pn, pd)| {
+        let has_default = vec![false; pt.len()];
+        (ret, pt, pn, pd, has_default)
+    })
+}
 
 /// A `class` declaration's own static shape — `Resolver::class_info`'s
 /// value, keyed by class name. Built in two passes by `Resolver::
@@ -142,6 +165,9 @@ struct ClassInfo {
     /// class symbol's own bare-reference type) as the call's result.
     ctor_param_types: Vec<Type>,
     ctor_param_names: Vec<String>,
+    /// Same order as `ctor_param_types`/`ctor_param_names` — see
+    /// `Symbol::param_has_default`'s identical doc comment.
+    ctor_param_has_default: Vec<bool>,
 }
 
 struct ClassFieldInfo {
@@ -163,6 +189,9 @@ struct ClassMethodInfo {
     param_types: Vec<Type>,
     param_names: Vec<String>,
     param_docs: Vec<Option<String>>,
+    /// Same order as `param_types`/`param_names` — see
+    /// `Symbol::param_has_default`'s identical doc comment.
+    param_has_default: Vec<bool>,
     /// The method's own declaration-site `Symbol` index
     /// (`define_class_member`) — see `ClassFieldInfo::symbol_idx`'s
     /// identical rationale.
@@ -551,15 +580,37 @@ pub struct ResolveResult {
     pub imported_symbols: Vec<crate::package_index::PackageMember>,
 }
 
+impl ResolveResult {
+    /// The `CrossFileRef` (if any) whose own recorded span covers
+    /// `(line, col)` — the same "at this position" query style every
+    /// `SymbolTable::*_at` method already uses, just against
+    /// `cross_file_refs` instead of one of `table`'s own span lists (this
+    /// map lives on `ResolveResult` itself, not `SymbolTable`, since it's
+    /// keyed by expression/field/method span rather than by declared
+    /// symbol). `ksl-lsp`'s hover/goto-definition consult this once their
+    /// own same-file `occurrence_at` lookup comes up empty, so a `.field`/
+    /// `.method()` use on a cross-file class instance — which has no local
+    /// `Symbol` index of its own to record an occurrence against — still
+    /// resolves to something real.
+    pub fn cross_file_ref_at(&self, line: u32, col: u32) -> Option<&CrossFileRef> {
+        self.cross_file_refs.iter().find(|(span, _)| span.contains_line_col(line, col)).map(|(_, r)| r)
+    }
+}
+
 /// An exact reference to a symbol resolved from outside this file — see
 /// `ResolveResult::cross_file_refs`. `file: None` means a synthetic stdlib
 /// package member (e.g. `kotlin.test.assertEquals`), which has no source
 /// file of its own, matching `package_index::PackageMember::file`'s same
-/// convention.
+/// convention. Carries the full matched `Symbol` (not just its `def_span`)
+/// so a caller needing display info — `ksl-lsp`'s hover, in particular,
+/// which has no other way to describe a cross-file class field/method use
+/// site — doesn't need a second lookup back into a `PackageIndex` it may
+/// not even have a class name to search by.
 #[derive(Debug, Clone)]
 pub struct CrossFileRef {
     pub file: Option<PathBuf>,
     pub def_span: Span,
+    pub symbol: Symbol,
 }
 
 /// Resolves `program` with no cross-file knowledge beyond the stdlib
@@ -971,6 +1022,7 @@ impl<'a> Resolver<'a> {
         param_types: Vec<Type>,
         param_names: Vec<String>,
         param_docs: Vec<Option<String>>,
+        param_has_default: Vec<bool>,
         doc: Option<String>,
     ) -> usize {
         // Real overloading — several `Fun` declarations sharing one name —
@@ -1013,6 +1065,7 @@ impl<'a> Resolver<'a> {
             param_types,
             param_names,
             param_docs,
+            param_has_default,
             doc,
         });
         self.table.scopes[scope].names.entry(name.to_string()).or_default().push(idx);
@@ -1134,7 +1187,7 @@ impl<'a> Resolver<'a> {
             if let Some(found) = candidates.last() {
                 self.cross_file_refs.insert(
                     use_span,
-                    CrossFileRef { file: found.file.clone(), def_span: found.symbol.def_span },
+                    CrossFileRef { file: found.file.clone(), def_span: found.symbol.def_span, symbol: found.symbol.clone() },
                 );
                 return found.symbol.ty.clone();
             }
@@ -1372,7 +1425,7 @@ impl<'a> Resolver<'a> {
                     .map(crate::doc_comment::parse)
                     .map(|d| d.summary)
                     .filter(|s| !s.is_empty());
-                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), doc);
+                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), Vec::new(), doc);
                 Type::Unit
             }
             StmtKind::Assign { name, op, value } => {
@@ -1436,8 +1489,46 @@ impl<'a> Resolver<'a> {
                                     ));
                                 }
                             }
+                            // Not a field either — a real cross-file `val`/
+                            // `var` (`import`/`@file:Import`) gets the same
+                            // mutability/type checking as a local or field
+                            // reassignment above; `resolve_name` itself only
+                            // resolves the *type*, with no such check (its
+                            // callers up to now have all been reads).
                             None => {
-                                self.resolve_name(scope, name, stmt.span);
+                                let cross = self.imports.by_name.get(name).and_then(|c| c.last()).map(|found| {
+                                    (found.symbol.ty.clone(), found.symbol.mutable, found.file.clone(), found.symbol.clone())
+                                });
+                                match cross {
+                                    Some((target_ty, mutable, file, symbol)) => {
+                                        let def_span = symbol.def_span;
+                                        self.touch(scope, stmt.span);
+                                        self.cross_file_refs.insert(stmt.span, CrossFileRef { file, def_span, symbol });
+                                        if !mutable {
+                                            self.type_errors.push(RuntimeError::new(
+                                                format!("cannot reassign val '{name}'"),
+                                                stmt.span,
+                                            ));
+                                        }
+                                        if *op == AssignOp::Set
+                                            && target_ty != Type::Unknown
+                                            && value_ty != Type::Unknown
+                                            && !types::is_assignable(&value_ty, &target_ty)
+                                        {
+                                            self.type_errors.push(RuntimeError::new(
+                                                format!(
+                                                    "cannot assign {} to var '{name}' of type {}",
+                                                    value_ty.name(),
+                                                    target_ty.name()
+                                                ),
+                                                stmt.span,
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        self.resolve_name(scope, name, stmt.span);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1505,6 +1596,7 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .map(|p| parsed_doc.as_ref().and_then(|d| d.param(&p.name)).map(str::to_string))
                     .collect();
+                let param_has_default: Vec<bool> = params.iter().map(|p| p.default.is_some()).collect();
                 // Defined in the *outer* scope (not the function's own
                 // body scope) so both callers and recursive calls from
                 // within the body resolve it — matches how `FunDecl`'s
@@ -1530,6 +1622,7 @@ impl<'a> Resolver<'a> {
                     param_types.clone(),
                     param_names,
                     param_docs,
+                    param_has_default,
                     fun_doc,
                 );
                 let fn_scope = self.open_scope(scope, stmt.span, following, ScopeKind::FunctionBoundary);
@@ -1674,6 +1767,7 @@ impl<'a> Resolver<'a> {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                     None,
                 );
                 self.walk_stmts(body, for_scope, following);
@@ -1718,6 +1812,8 @@ impl<'a> Resolver<'a> {
                         Some((field_ty, mutable)) => {
                             if let Some(idx) = self.class_field_symbol_idx(&recv_ty, field) {
                                 self.table.occurrences.push((*field_span, idx));
+                            } else if let Some(cross_ref) = self.class_field_cross_file_ref(&recv_ty, field) {
+                                self.cross_file_refs.insert(*field_span, cross_ref);
                             }
                             if !mutable {
                                 self.type_errors.push(RuntimeError::new(format!("cannot reassign val '{field}'"), *field_span));
@@ -1785,7 +1881,7 @@ impl<'a> Resolver<'a> {
             // any named this parameter — a param has no doc-comment syntax
             // of its own (see `ast::Param`'s doc comment).
             let doc = fun_doc.and_then(|d| d.param(&p.name)).map(str::to_string);
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), doc);
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), Vec::new(), doc);
         }
     }
 
@@ -1813,6 +1909,7 @@ impl<'a> Resolver<'a> {
         param_types: Vec<Type>,
         param_names: Vec<String>,
         param_docs: Vec<Option<String>>,
+        param_has_default: Vec<bool>,
         doc: Option<String>,
     ) -> usize {
         let idx = self.table.symbols.len();
@@ -1827,6 +1924,7 @@ impl<'a> Resolver<'a> {
             param_types,
             param_names,
             param_docs,
+            param_has_default,
             doc,
         });
         self.table.occurrences.push((def_span, idx));
@@ -1890,6 +1988,7 @@ impl<'a> Resolver<'a> {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             doc,
         );
 
@@ -1938,12 +2037,14 @@ impl<'a> Resolver<'a> {
                         })
                         .collect();
                     let param_names = params.iter().map(|p| p.name.clone()).collect();
+                    let param_has_default: Vec<bool> = params.iter().map(|p| p.default.is_some()).collect();
                     methods.push(ClassMethodInfo {
                         name: mname.clone(),
                         return_type: ret_ty,
                         param_types,
                         param_names,
                         param_docs: vec![None; params.len()],
+                        param_has_default,
                         // Patched in `walk_class_method`, once its real
                         // `define_class_member` call returns a real index.
                         symbol_idx: 0,
@@ -1962,9 +2063,14 @@ impl<'a> Resolver<'a> {
             })
             .collect();
         let ctor_param_names: Vec<String> = ctor_params.iter().map(|cp| cp.param.name.clone()).collect();
+        let ctor_param_has_default: Vec<bool> = ctor_params.iter().map(|cp| cp.param.default.is_some()).collect();
         self.table.symbols[class_idx].param_types = ctor_param_types.clone();
         self.table.symbols[class_idx].param_names = ctor_param_names.clone();
-        self.class_info.insert(Rc::from(name), ClassInfo { fields, methods, ctor_param_types, ctor_param_names });
+        self.table.symbols[class_idx].param_has_default = ctor_param_has_default.clone();
+        self.class_info.insert(
+            Rc::from(name),
+            ClassInfo { fields, methods, ctor_param_types, ctor_param_names, ctor_param_has_default },
+        );
 
         // The constructor's own scope (ctor params, bare — property
         // initializers/`init` blocks see them directly, matching
@@ -1987,6 +2093,7 @@ impl<'a> Resolver<'a> {
             format!("this: {name}"),
             Type::Class(Rc::from(name)),
             Type::Unknown,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2013,6 +2120,7 @@ impl<'a> Resolver<'a> {
                 sig,
                 ty,
                 Type::Unknown,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -2090,6 +2198,7 @@ impl<'a> Resolver<'a> {
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
+                        Vec::new(),
                         member_doc,
                     );
                     if let Some(info) = self.class_info.get_mut(name) {
@@ -2157,6 +2266,7 @@ impl<'a> Resolver<'a> {
         let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
         let param_docs: Vec<Option<String>> =
             params.iter().map(|p| parsed_doc.as_ref().and_then(|d| d.param(&p.name)).map(str::to_string)).collect();
+        let param_has_default: Vec<bool> = params.iter().map(|p| p.default.is_some()).collect();
         let has_return_annotation = return_type.is_some();
 
         let method_idx = self.define_class_member(
@@ -2170,6 +2280,7 @@ impl<'a> Resolver<'a> {
             param_types.clone(),
             param_names.clone(),
             param_docs.clone(),
+            param_has_default,
             fun_doc,
         );
         if let Some(info) = self.class_info.get_mut(class_name) {
@@ -2189,6 +2300,7 @@ impl<'a> Resolver<'a> {
             format!("this: {class_name}"),
             Type::Class(Rc::from(class_name)),
             Type::Unknown,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2260,18 +2372,32 @@ impl<'a> Resolver<'a> {
             Type::Unknown => format!("fun {name}({})", param_list(params)),
             t => format!("fun {name}({}): {}", param_list(params), t.name()),
         };
+        // The method's own `Symbol` (found via `SymbolTable::class_members`,
+        // which — unlike `class_info` — survives past this single resolve
+        // call, e.g. into `PackageIndex`'s cross-file class shapes) needs
+        // this patched too, not just `class_info`'s private copy — an
+        // earlier version of this function only patched the two above,
+        // leaving `class_members()`'s own `Symbol.return_type` stale at
+        // `Type::Unknown` for any method with an inferred (unannotated)
+        // return type.
+        self.table.symbols[method_idx].return_type = final_ret_ty;
     }
 
     /// The full checkable signature of `t.method(...)` for a real value
     /// receiver (a package-qualified path never reaches this — see
     /// `ExprKind::MethodCall`'s own handling) — unifies dispatch for a
-    /// builtin receiver (`Int`, `String`, ...) and a user class
-    /// (`Type::Class(name)`): a user class's own method wins if declared,
-    /// else falls through to `Any`'s native methods (every user class
-    /// implicitly extends `Any`, single hop — see `ClassInfo`'s doc
-    /// comment), exactly mirroring `class::lookup_method`'s runtime rule.
-    /// `None` for an `Unknown` receiver (deferred, not an error) or a
-    /// receiver type with no such method anywhere in its chain.
+    /// builtin receiver (`Int`, `String`, ...), a same-file user class
+    /// (`Type::Class(name)` found in `self.class_info`), and an *imported*
+    /// class (found instead via `self.packages.find_class` — its own
+    /// `PackageMember.class_members`, the cross-file counterpart of
+    /// `class_info` populated once at indexing time, see
+    /// `package_index::PackageMember`'s doc comment): either way, a
+    /// user class's own method wins if declared, else falls through to
+    /// `Any`'s native methods (every user class implicitly extends `Any`,
+    /// single hop — see `ClassInfo`'s doc comment), exactly mirroring
+    /// `class::lookup_method`'s runtime rule. `None` for an `Unknown`
+    /// receiver (deferred, not an error) or a receiver type with no such
+    /// method anywhere in its chain.
     fn class_method_signature(&self, t: &Type, method: &str) -> Option<CallSignature> {
         let t = match t {
             Type::Nullable(inner) => inner.as_ref(),
@@ -2283,24 +2409,88 @@ impl<'a> Resolver<'a> {
         let name = t.name();
         if let Some(info) = self.class_info.get(name.as_str()) {
             if let Some(m) = info.methods.iter().find(|m| m.name == method) {
-                return Some((m.return_type.clone(), m.param_types.clone(), m.param_names.clone(), m.param_docs.clone()));
+                return Some((
+                    m.return_type.clone(),
+                    m.param_types.clone(),
+                    m.param_names.clone(),
+                    m.param_docs.clone(),
+                    m.param_has_default.clone(),
+                ));
             }
-            return crate::stdlib::builtin_method_signature("Any", method);
+            return builtin_method_signature_as_call_signature("Any", method);
         }
-        crate::stdlib::builtin_method_signature(&name, method)
+        if let Some(pm) = self.packages.find_class(&name) {
+            if let Some(m) = pm.class_members.as_ref().and_then(|members| members.iter().find(|m| m.name == method)) {
+                return Some((
+                    m.return_type.clone(),
+                    m.param_types.clone(),
+                    m.param_names.clone(),
+                    m.param_docs.clone(),
+                    m.param_has_default.clone(),
+                ));
+            }
+            return builtin_method_signature_as_call_signature("Any", method);
+        }
+        builtin_method_signature_as_call_signature(&name, method)
     }
 
-    /// `(field's type, mutable)` for `t.field`/`t.field = ...` — a real
-    /// value receiver only (`Type::Class(name)` matching a known
-    /// `ClassInfo`); `Any` has no fields, so a class's own miss here is
-    /// always `None`, never a fallback (unlike `class_method_signature`).
+    /// `(field's type, mutable)` for `t.field`/`t.field = ...` — same-file
+    /// `class_info` first, then an imported class's own shape via
+    /// `self.packages.find_class` (see `class_method_signature`'s
+    /// identical two-tier lookup, just without the `Any` fallback — `Any`
+    /// has no fields, so a class's own miss here is always `None`).
     fn class_field_type(&self, t: &Type, field: &str) -> Option<(Type, bool)> {
         let t = match t {
             Type::Nullable(inner) => inner.as_ref(),
             other => other,
         };
         let name = t.name();
-        self.class_info.get(name.as_str()).and_then(|info| info.fields.iter().find(|f| f.name == field).map(|f| (f.ty.clone(), f.mutable)))
+        if let Some(info) = self.class_info.get(name.as_str()) {
+            return info.fields.iter().find(|f| f.name == field).map(|f| (f.ty.clone(), f.mutable));
+        }
+        self.packages
+            .find_class(&name)?
+            .class_members
+            .as_ref()?
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| (f.ty.clone(), f.mutable))
+    }
+
+    /// The cross-file `CrossFileRef` for `t.field`, when `field` is only
+    /// found through an *imported* class's shape (never the local,
+    /// same-file `class_info` — `class_field_symbol_idx` already covers
+    /// that case with a real, same-file `Symbol` index) — lets a
+    /// `this.field`/`obj.field` use site on an imported instance still get
+    /// real goto-def/hover, exactly like a plain cross-file function call
+    /// already does (see `cross_file_refs`'s own doc comment).
+    fn class_field_cross_file_ref(&self, t: &Type, field: &str) -> Option<CrossFileRef> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        if self.class_info.contains_key(name.as_str()) {
+            return None;
+        }
+        let pm = self.packages.find_class(&name)?;
+        let member = pm.class_members.as_ref()?.iter().find(|m| m.name == field)?;
+        Some(CrossFileRef { file: pm.file.clone(), def_span: member.def_span, symbol: member.clone() })
+    }
+
+    /// Same as `class_field_cross_file_ref`, for a method (`t.method(...)`).
+    fn class_method_cross_file_ref(&self, t: &Type, method: &str) -> Option<CrossFileRef> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        if self.class_info.contains_key(name.as_str()) {
+            return None;
+        }
+        let pm = self.packages.find_class(&name)?;
+        let member = pm.class_members.as_ref()?.iter().find(|m| m.name == method)?;
+        Some(CrossFileRef { file: pm.file.clone(), def_span: member.def_span, symbol: member.clone() })
     }
 
     /// The field's own declaration-site `Symbol` index, for recording a
@@ -2383,6 +2573,7 @@ impl<'a> Resolver<'a> {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 None,
             );
             return vec![inferred];
@@ -2412,7 +2603,7 @@ impl<'a> Resolver<'a> {
                 Type::Unknown => format!("param {}", p.name),
                 t => format!("param {}: {}", p.name, t.name()),
             };
-            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new(), Vec::new(), None);
+            self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, inferred.clone(), Type::Unknown, Vec::new(), Vec::new(), Vec::new(), Vec::new(), None);
             param_types.push(inferred);
         }
         param_types
@@ -2506,9 +2697,10 @@ impl<'a> Resolver<'a> {
     ) -> Vec<(Option<String>, Type)> {
         let mut arg_infos: Vec<(Option<String>, Type)> = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let named_param_idx =
-                a.name.as_ref().and_then(|n| signature.and_then(|(_, _, param_names, _)| param_names.iter().position(|p| p == n)));
-            let expected_param_ty = signature.and_then(|(_, param_types, _, _)| match &a.name {
+            let named_param_idx = a.name.as_ref().and_then(|n| {
+                signature.and_then(|(_, _, param_names, _, _)| param_names.iter().position(|p| p == n))
+            });
+            let expected_param_ty = signature.and_then(|(_, param_types, _, _, _)| match &a.name {
                 Some(_) => named_param_idx.and_then(|i| param_types.get(i)),
                 None => param_types.get(i),
             });
@@ -2520,7 +2712,7 @@ impl<'a> Resolver<'a> {
             // be declared in another file entirely, or be a stdlib/cross-
             // file placeholder with no real name to match at all).
             if let (Some(name), Some(name_span), Some(idx)) = (&a.name, a.name_span, named_param_idx) {
-                if let Some((_, param_types, _, param_docs)) = signature {
+                if let Some((_, param_types, _, param_docs, _)) = signature {
                     if let Some(param_ty) = param_types.get(idx) {
                         let sig = match param_ty {
                             Type::Unknown => format!("param {name}"),
@@ -2540,6 +2732,7 @@ impl<'a> Resolver<'a> {
                                 param_types: Vec::new(),
                                 param_names: Vec::new(),
                                 param_docs: Vec::new(),
+                                param_has_default: Vec::new(),
                                 doc,
                             },
                         ));
@@ -2571,7 +2764,7 @@ impl<'a> Resolver<'a> {
         signature: Option<CallSignature>,
         span: Span,
     ) -> Type {
-        let Some((ret_ty, param_types, param_names, _)) = signature else {
+        let Some((ret_ty, param_types, param_names, _, param_has_default)) = signature else {
             return Type::Unknown;
         };
         let mut claimed = vec![false; param_types.len()];
@@ -2594,18 +2787,49 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
-        let mut remaining = (0..param_types.len()).filter(|&i| !claimed[i]);
+        // Collected up front (rather than filtering `claimed` lazily) so the
+        // loop below can mark each consumed slot `claimed[i] = true` as it
+        // goes — needed by the arity check further down, which must see
+        // every slot a *positional* argument filled, not just a named one.
+        let remaining_indices: Vec<usize> = (0..param_types.len()).filter(|&i| !claimed[i]).collect();
+        let mut remaining = remaining_indices.into_iter();
         for (arg_name, arg_ty) in arg_infos {
             if arg_name.is_some() {
                 continue;
             }
             let Some(i) = remaining.next() else { continue };
+            claimed[i] = true;
             if let Some(param_ty) = param_types.get(i) {
                 if *arg_ty != Type::Unknown && *param_ty != Type::Unknown && !types::is_assignable(arg_ty, param_ty) {
                     self.type_errors.push(RuntimeError::new(
                         format!("argument {} has type {}, expected {}", i + 1, arg_ty.name(), param_ty.name()),
                         span,
                     ));
+                }
+            }
+        }
+        // Arity — every required (no `= default`) parameter must have been
+        // claimed by some argument, and there can't be more arguments than
+        // declared parameters — only checked when `param_names` are real,
+        // per-parameter names (a stdlib call or a `(Int) -> Int`-typed
+        // value's placeholder blank names are deliberately never arity-
+        // checked here, matching `walk_call_args`/the two passes above,
+        // which already treat a blank name as "no real identity to match" —
+        // see `CallSignature`'s own doc comment). Mirrors `bind_params`'s
+        // identical runtime checks (`interpreter.rs`), word for word, so a
+        // call that fails statically here would have failed the same way
+        // at runtime otherwise.
+        let has_real_names = !param_names.is_empty() && param_names.iter().all(|n| !n.is_empty());
+        if has_real_names {
+            if arg_infos.len() > param_types.len() {
+                self.type_errors.push(RuntimeError::new(
+                    format!("too many arguments: expected at most {}, got {}", param_types.len(), arg_infos.len()),
+                    span,
+                ));
+            }
+            for i in 0..param_types.len() {
+                if !claimed[i] && !param_has_default.get(i).copied().unwrap_or(false) {
+                    self.type_errors.push(RuntimeError::new(format!("missing argument '{}'", param_names[i]), span));
                 }
             }
         }
@@ -2746,7 +2970,10 @@ impl<'a> Resolver<'a> {
         match types::resolve_overload(&candidate_param_slices, &arg_types) {
             types::OverloadResolution::Unique(i) => {
                 let m = &candidates[i];
-                self.cross_file_refs.insert(span, CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span });
+                self.cross_file_refs.insert(
+                    span,
+                    CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span, symbol: m.symbol.clone() },
+                );
                 m.symbol.return_type.clone()
             }
             types::OverloadResolution::Ambiguous(is) => {
@@ -2885,6 +3112,8 @@ impl<'a> Resolver<'a> {
                             }
                             if let Some(idx) = self.class_field_symbol_idx(&recv_ty, field) {
                                 self.table.occurrences.push((*field_span, idx));
+                            } else if let Some(cross_ref) = self.class_field_cross_file_ref(&recv_ty, field) {
+                                self.cross_file_refs.insert(*field_span, cross_ref);
                             }
                             self.class_field_type(&recv_ty, field).map(|(ty, _)| ty).unwrap_or(Type::Unknown)
                         } else if recv_ty == Type::Unknown {
@@ -2894,6 +3123,8 @@ impl<'a> Resolver<'a> {
                                 Some((ty, _)) => {
                                     if let Some(idx) = self.class_field_symbol_idx(&recv_ty, field) {
                                         self.table.occurrences.push((*field_span, idx));
+                                    } else if let Some(cross_ref) = self.class_field_cross_file_ref(&recv_ty, field) {
+                                        self.cross_file_refs.insert(*field_span, cross_ref);
                                     }
                                     ty
                                 }
@@ -3005,6 +3236,10 @@ impl<'a> Resolver<'a> {
                 // same way any other declared symbol's use does.
                 if let Some(idx) = recv_ty.as_ref().and_then(|t| self.class_method_symbol_idx(t, method)) {
                     self.table.occurrences.push((*method_span, idx));
+                } else if let Some(cross_ref) =
+                    recv_ty.as_ref().and_then(|t| self.class_method_cross_file_ref(t, method))
+                {
+                    self.cross_file_refs.insert(*method_span, cross_ref);
                 }
                 let signature = if use_overload_resolution {
                     None
@@ -3015,13 +3250,24 @@ impl<'a> Resolver<'a> {
                             crate::stdlib::stdlib_qualified_call_types(path).map(|(param_types, ret_ty)| {
                                 let names = vec![String::new(); param_types.len()];
                                 let docs = vec![None; param_types.len()];
-                                (ret_ty, param_types, names, docs)
+                                let has_default = vec![false; param_types.len()];
+                                (ret_ty, param_types, names, docs, has_default)
                             })
                         })
                         .or_else(|| {
                             user_candidates.first().map(|m| {
-                                let names = vec![String::new(); m.symbol.param_types.len()];
-                                (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names, m.symbol.param_docs.clone())
+                                let ret_ty = if m.symbol.kind == SymbolKind::Class {
+                                    Type::Class(Rc::from(m.symbol.name.as_str()))
+                                } else {
+                                    m.symbol.return_type.clone()
+                                };
+                                (
+                                    ret_ty,
+                                    m.symbol.param_types.clone(),
+                                    m.symbol.param_names.clone(),
+                                    m.symbol.param_docs.clone(),
+                                    m.symbol.param_has_default.clone(),
+                                )
                             })
                         })
                         .or_else(|| class_method_signature.clone())
@@ -3092,7 +3338,7 @@ impl<'a> Resolver<'a> {
                                 if let Some(m) = user_candidates.first() {
                                     self.cross_file_refs.insert(
                                         *method_span,
-                                        CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span },
+                                        CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span, symbol: m.symbol.clone() },
                                     );
                                 }
                                 ty
@@ -3330,7 +3576,13 @@ impl<'a> Resolver<'a> {
                                 // unlike a `fun` declaration, never names its
                                 // parameters).
                                 if s.kind == SymbolKind::Fun {
-                                    Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone(), s.param_docs.clone()))
+                                    Some((
+                                        s.return_type.clone(),
+                                        s.param_types.clone(),
+                                        s.param_names.clone(),
+                                        s.param_docs.clone(),
+                                        s.param_has_default.clone(),
+                                    ))
                                 } else if s.kind == SymbolKind::Class {
                                     // Constructing an instance — `Point(3,
                                     // 4)` — not a bare reference to the
@@ -3347,12 +3599,14 @@ impl<'a> Resolver<'a> {
                                             info.ctor_param_types.clone(),
                                             info.ctor_param_names.clone(),
                                             vec![None; info.ctor_param_types.len()],
+                                            info.ctor_param_has_default.clone(),
                                         )
                                     })
                                 } else if let Type::Function(params, ret) = &s.ty {
                                     let names = vec![String::new(); params.len()];
                                     let docs = vec![None; params.len()];
-                                    Some(((**ret).clone(), params.clone(), names, docs))
+                                    let has_default = vec![false; params.len()];
+                                    Some(((**ret).clone(), params.clone(), names, docs, has_default))
                                 } else {
                                     None
                                 }
@@ -3379,13 +3633,24 @@ impl<'a> Resolver<'a> {
                                     .map(|(param_types, ret_ty)| {
                                         let names = vec![String::new(); param_types.len()];
                                         let docs = vec![None; param_types.len()];
-                                        (ret_ty, param_types, names, docs)
+                                        let has_default = vec![false; param_types.len()];
+                                        (ret_ty, param_types, names, docs, has_default)
                                     })
                             })
                             .or_else(|| {
                                 cross_candidates.first().map(|m| {
-                                    let names = vec![String::new(); m.symbol.param_types.len()];
-                                    (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names, m.symbol.param_docs.clone())
+                                    let ret_ty = if m.symbol.kind == SymbolKind::Class {
+                                        Type::Class(Rc::from(m.symbol.name.as_str()))
+                                    } else {
+                                        m.symbol.return_type.clone()
+                                    };
+                                    (
+                                        ret_ty,
+                                        m.symbol.param_types.clone(),
+                                        m.symbol.param_names.clone(),
+                                        m.symbol.param_docs.clone(),
+                                        m.symbol.param_has_default.clone(),
+                                    )
                                 })
                             }),
                         _ => None,
@@ -3417,7 +3682,10 @@ impl<'a> Resolver<'a> {
 
                 let ty = self.check_call_signature(&arg_infos, signature, expr.span);
                 if let Some(m) = cross_candidates.first() {
-                    self.cross_file_refs.insert(expr.span, CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span });
+                    self.cross_file_refs.insert(
+                        expr.span,
+                        CrossFileRef { file: m.file.clone(), def_span: m.symbol.def_span, symbol: m.symbol.clone() },
+                    );
                 }
                 ty
             }
@@ -3675,8 +3943,10 @@ mod tests {
                 param_types: vec![Type::Int],
                 param_names: vec!["x".to_string()],
                 param_docs: Vec::new(),
+                param_has_default: vec![false],
                 doc: None,
             },
+            None,
             None,
         );
         packages
@@ -3842,8 +4112,10 @@ mod tests {
                 param_types: vec![Type::Int],
                 param_names: vec!["x".to_string()],
                 param_docs: Vec::new(),
+                param_has_default: vec![false],
                 doc: None,
             },
+            None,
             None,
         );
         let tokens = lexer::tokenize("import util.math.*\nval a = square(2)\nval b = cube(2)\nprintln(nope)\n").unwrap();
@@ -4296,6 +4568,72 @@ mod tests {
     }
 
     #[test]
+    fn missing_required_argument_is_flagged_statically() {
+        let result = resolve_src("fun greet(name: String): String {\n    return name\n}\nprintln(greet())\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("missing argument 'name'")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn too_many_positional_arguments_is_flagged_statically() {
+        let result = resolve_src("fun greet(name: String): String {\n    return name\n}\nprintln(greet(\"a\", \"b\"))\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("too many arguments: expected at most 1, got 2")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_default_parameter_left_out_is_not_flagged() {
+        // Proves the default actually suppresses the new arity check, not
+        // just that this particular call happens to slip through some
+        // other way.
+        let result = resolve_src("fun greet(name: String = \"World\"): String {\n    return name\n}\nprintln(greet())\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn class_constructor_missing_a_required_argument_is_flagged_statically() {
+        let result = resolve_src("class Point(val x: Int, val y: Int)\nval p = Point(1)\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("missing argument 'y'")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn class_method_missing_a_required_argument_is_flagged_statically() {
+        // Exact shape of the user-reported bug: a cross-file-class-shaped
+        // method call missing its one required argument used to run all
+        // the way to a runtime "missing argument" error instead of being
+        // caught here, statically, before execution.
+        let result = resolve_src(
+            "class Point(val x: Int, val y: Int) {\n    fun distanceSquared(other: Point): Int {\n        val dx = x - other.x\n        val dy = y - other.y\n        return dx * dx + dy * dy\n    }\n}\nval p = Point(3, 4)\np.distanceSquared()\n",
+        );
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("missing argument 'other'")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn stdlib_call_with_fewer_args_than_its_full_parameter_list_is_never_flagged() {
+        // `assertEquals(actual, expected, message = ...)` — stdlib
+        // signatures always use blank-name placeholders (`stdlib_call_
+        // types` has no real parameter names to offer), so the new arity
+        // check must never fire for one, regardless of how many optional
+        // trailing parameters it actually has.
+        let result = resolve_src("import kotlin.test.*\nassertEquals(1, 1)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
     fn unknown_typed_argument_is_never_flagged() {
         // An unresolved qualified call (`util.math` doesn't exist in this
         // zero-context `PackageIndex`) is its own genuine diagnostic now —
@@ -4530,10 +4868,14 @@ mod tests {
 
     #[test]
     fn unknown_named_argument_is_flagged() {
+        // `c` is unknown *and* `b` never got a real argument (the unknown
+        // named one doesn't count towards it) — both diagnosed, not just
+        // the first one found.
         let src = "fun add(a: Int, b: Int): Int {\n    return a + b\n}\nadd(a = 1, c = 2)\n";
         let result = resolve_src(src);
-        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
-        assert!(result.type_errors[0].message.contains("unknown parameter 'c'"));
+        assert_eq!(result.type_errors.len(), 2, "{:?}", result.type_errors);
+        assert!(result.type_errors.iter().any(|e| e.message.contains("unknown parameter 'c'")), "{:?}", result.type_errors);
+        assert!(result.type_errors.iter().any(|e| e.message.contains("missing argument 'b'")), "{:?}", result.type_errors);
     }
 
     #[test]
@@ -5103,6 +5445,20 @@ mod tests {
 
         let unknown_method = resolve_src("class Point(val x: Int)\nval p = Point(1)\np.bark()\n");
         assert!(unknown_method.type_errors.iter().any(|e| e.message.contains("'Point' has no method 'bark'")), "{:?}", unknown_method.type_errors);
+    }
+
+    #[test]
+    fn class_members_reports_a_methods_real_inferred_return_type_not_unknown() {
+        // Regression test: `walk_class_method` used to patch the inferred
+        // return type onto `class_info`'s own private copy and the
+        // display `signature` string, but not the method's own `Symbol`
+        // (the one `SymbolTable::class_members` — and, via it,
+        // `PackageIndex`'s cross-file class shapes — actually hands out),
+        // leaving it stuck at `Type::Unknown`.
+        let result = resolve_src("class C {\n    fun bark() = \"woof\"\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        let bark = result.table.class_members("C").find(|s| s.name == "bark").expect("bark should be a class member");
+        assert_eq!(bark.return_type, Type::String, "{:?}", bark.return_type);
     }
 
     #[test]

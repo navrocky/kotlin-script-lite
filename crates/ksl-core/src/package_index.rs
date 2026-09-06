@@ -43,6 +43,21 @@ pub struct PackageMember {
     /// (`ksl-lsp`'s hover) show a member's fully qualified name rather than
     /// just its bare one.
     pub package: Option<String>,
+    /// A class's own real shape — its fields'/methods' real `Symbol`s,
+    /// straight from `SymbolTable::class_members` (which, unlike
+    /// `resolver::Resolver`'s private `class_info`, survives past the one
+    /// `resolve()` call that produced it) — `Some(..)` iff `symbol.kind ==
+    /// SymbolKind::Class`, `None` for every other kind. This is the *only*
+    /// way a class's own field/method shape crosses a file boundary at
+    /// all: `symbol` alone (a flat name/type/signature, same shape every
+    /// other kind of declaration gets) has nowhere to carry it. When a
+    /// second kind of declaration needs its own richer shape exported the
+    /// same way (an `interface`'s member list, say), follow this same
+    /// pattern — a new field on `PackageMember`, populated at the same two
+    /// call sites (`add_member`/`add_flat_member`), from the same
+    /// already-in-hand `ResolveResult` — rather than inventing a separate
+    /// mechanism.
+    pub class_members: Option<Vec<Symbol>>,
 }
 
 #[derive(Default)]
@@ -68,21 +83,37 @@ impl PackageIndex {
         let mut index = PackageIndex::default();
         for pkg in crate::stdlib::STDLIB_PACKAGES {
             for sym in pkg.symbols {
-                index.add_member(pkg.name.to_string(), builtin_symbol(sym), None);
+                index.add_member(pkg.name.to_string(), builtin_symbol(sym), None, None);
             }
         }
         index
     }
 
-    pub(crate) fn add_member(&mut self, package: String, symbol: Symbol, file: Option<PathBuf>) {
+    pub(crate) fn add_member(
+        &mut self,
+        package: String,
+        symbol: Symbol,
+        file: Option<PathBuf>,
+        class_members: Option<Vec<Symbol>>,
+    ) {
         self.members
             .entry(package.clone())
             .or_default()
-            .push(PackageMember { symbol, file, package: Some(package) });
+            .push(PackageMember { symbol, file, package: Some(package), class_members });
     }
 
-    pub(crate) fn add_flat_member(&mut self, symbol: Symbol, file: Option<PathBuf>) {
-        self.flat.entry(symbol.name.clone()).or_default().push(PackageMember { symbol, file, package: None });
+    pub(crate) fn add_flat_member(
+        &mut self,
+        symbol: Symbol,
+        file: Option<PathBuf>,
+        class_members: Option<Vec<Symbol>>,
+    ) {
+        self.flat.entry(symbol.name.clone()).or_default().push(PackageMember {
+            symbol,
+            file,
+            package: None,
+            class_members,
+        });
     }
 
     pub fn members_of(&self, package: &str) -> &[PackageMember] {
@@ -113,6 +144,22 @@ impl PackageIndex {
     pub fn flat_members(&self) -> impl Iterator<Item = &PackageMember> {
         self.flat.values().flat_map(|v| v.iter())
     }
+
+    /// The `PackageMember` for a class named `class_name`, wherever it was
+    /// indexed (a real package or the flat namespace) — the cross-file
+    /// counterpart of `resolver::Resolver`'s own (single-file) `class_info`
+    /// lookup. First match wins if two different imported packages somehow
+    /// declare a same-named class (rare, and `Type::Class(Rc<str>)` itself
+    /// carries no package qualifier to disambiguate with today — the same
+    /// kind of accepted simplification `is_assignable`'s `Class`-by-name
+    /// comparison already documents).
+    pub fn find_class(&self, class_name: &str) -> Option<&PackageMember> {
+        self.members
+            .values()
+            .flatten()
+            .chain(self.flat.values().flatten())
+            .find(|m| m.symbol.kind == crate::resolver::SymbolKind::Class && m.symbol.name == class_name)
+    }
 }
 
 /// A `Symbol` for a built-in package member, with no real declaration site
@@ -131,8 +178,21 @@ fn builtin_symbol(sym: &crate::stdlib::BuiltinSymbol) -> Symbol {
         param_types: Vec::new(),
         param_names: Vec::new(),
         param_docs: Vec::new(),
+        param_has_default: Vec::new(),
         doc: Some(sym.doc.to_string()),
     }
+}
+
+/// `Some(real field/method Symbols)` when `symbol` is a class, `None`
+/// otherwise — shared by both indexing sites in `index_program` (and
+/// `importer::add_module_to_index`'s identical runtime counterpart) so
+/// there's one place that decides "is this symbol a class, and if so what's
+/// its exported shape."
+pub(crate) fn class_members_of(resolved: &resolver::ResolveResult, symbol: &Symbol) -> Option<Vec<Symbol>> {
+    if symbol.kind != resolver::SymbolKind::Class {
+        return None;
+    }
+    Some(resolved.table.class_members(&symbol.name).cloned().collect())
 }
 
 /// Indexes every `package`-declaring file reachable from `program` — both
@@ -168,7 +228,8 @@ fn index_program(
             if let Some(file) = own_file {
                 let resolved = resolver::resolve(program);
                 for symbol in resolved.table.top_level_symbols() {
-                    index.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()));
+                    let class_members = class_members_of(&resolved, symbol);
+                    index.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()), class_members);
                 }
             }
         }
@@ -180,7 +241,8 @@ fn index_program(
             if let Some(file) = own_file {
                 let resolved = resolver::resolve(program);
                 for symbol in resolved.table.top_level_symbols() {
-                    index.add_flat_member(symbol.clone(), Some(file.to_path_buf()));
+                    let class_members = class_members_of(&resolved, symbol);
+                    index.add_flat_member(symbol.clone(), Some(file.to_path_buf()), class_members);
                 }
             }
         }

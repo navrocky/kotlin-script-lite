@@ -213,12 +213,14 @@ fn add_module_to_index(packages: &mut PackageIndex, program: &Program, resolved:
         Some(pkg) => {
             let package_name = pkg.path.join(".");
             for symbol in resolved.table.top_level_symbols() {
-                packages.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()));
+                let class_members = crate::package_index::class_members_of(resolved, symbol);
+                packages.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()), class_members);
             }
         }
         None => {
             for symbol in resolved.table.top_level_symbols() {
-                packages.add_flat_member(symbol.clone(), Some(file.to_path_buf()));
+                let class_members = crate::package_index::class_members_of(resolved, symbol);
+                packages.add_flat_member(symbol.clone(), Some(file.to_path_buf()), class_members);
             }
         }
     }
@@ -597,5 +599,190 @@ mod tests {
         assert!(lines[1].trim_start().starts_with("at assertTrue ("), "{err}");
         assert!(lines[2].trim_start().contains("at failing() (") && lines[2].contains("lib.ksl:3"), "{err}");
         assert!(lines[3].trim_start().contains("at caller() (") && lines[3].contains("main.ksl:3"), "{err}");
+    }
+
+    /// A `class` declared in one file and imported via `@file:Import` must
+    /// resolve `.field`/`.method()` on an instance with real types — the
+    /// original bug this cross-file-classes phase fixes (`PackageMember`
+    /// never carried a class's shape before, so this used to fail with
+    /// "has no field/method" diagnostics even though construction worked).
+    #[test]
+    fn cross_file_class_field_and_method_resolve_with_real_types() {
+        let dir = TempDir::new("cross_class_flat");
+        dir.write(
+            "point.ksl",
+            "class Point(val x: Int, val y: Int) {\n    fun distanceSquared(other: Point): Int {\n        val dx = x - other.x\n        val dy = y - other.y\n        return dx * dx + dy * dy\n    }\n}\n",
+        );
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"point.ksl\")\nval p = Point(3, 4)\nprintln(p.x)\nprintln(p.y)\nprintln(p.distanceSquared(Point(0, 0)))\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "3\n4\n25\n");
+    }
+
+    /// Same as above, but through a real `package`-declaring file plus
+    /// `import` (not a bare `@file:Import`) — both cross-file paths already
+    /// behaved identically for plain functions, so a class must not regress
+    /// that parity.
+    #[test]
+    fn cross_file_class_field_and_method_resolve_via_package_import() {
+        let dir = TempDir::new("cross_class_package");
+        dir.write(
+            "point.ksl",
+            "package geo\nclass Point(val x: Int, val y: Int) {\n    fun sum(): Int = x + y\n}\n",
+        );
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"point.ksl\")\nimport geo.Point\nval p = Point(3, 4)\nprintln(p.x)\nprintln(p.sum())\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "3\n7\n");
+    }
+
+    /// Named arguments to an imported class's primary constructor must be
+    /// checked by real parameter name, not silently flattened to
+    /// positional order.
+    #[test]
+    fn named_arguments_to_a_cross_file_class_constructor_are_checked_by_name() {
+        let dir = TempDir::new("cross_class_named_args");
+        dir.write("point.ksl", "class Point(val x: Int, val y: Int)\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"point.ksl\")\nval p = Point(y = 10, x = 5)\nprintln(p.x)\nprintln(p.y)\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "5\n10\n");
+    }
+
+    /// The same named-argument fix is not class-specific — an ordinary
+    /// cross-file function's real parameter names must be honored too.
+    #[test]
+    fn named_arguments_to_an_ordinary_cross_file_function_are_checked_by_name() {
+        let dir = TempDir::new("cross_fun_named_args");
+        dir.write("greeter.ksl", "fun greet(greeting: String, name: String): String = \"$greeting, $name!\"\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"greeter.ksl\")\nprintln(greet(name = \"World\", greeting = \"Hi\"))\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "Hi, World!\n");
+    }
+
+    /// A cross-file class method missing a required argument must be
+    /// caught statically, before any of the calling file's own statements
+    /// run — not just at runtime, after everything up to the bad call has
+    /// already executed. The exact shape of a real user-reported bug: the
+    /// resolver's `check_call_signature` never validated arity at all
+    /// (locally or cross-file) until this fix. `err` starting with
+    /// `"error:"` (a static `TypeErrors`) rather than `"runtime error:"`
+    /// (a `RuntimeError` reached by actually executing `bind_params`) is
+    /// what proves this ran statically — see `error::InterpError`'s
+    /// `Display` impl for the two distinct prefixes.
+    #[test]
+    fn cross_file_class_method_missing_a_required_argument_is_caught_statically() {
+        let dir = TempDir::new("cross_class_missing_arg");
+        dir.write(
+            "point.ksl",
+            "class Point(val x: Int, val y: Int) {\n    fun distanceSquared(other: Point): Int {\n        val dx = x - other.x\n        val dy = y - other.y\n        return dx * dx + dy * dy\n    }\n}\n",
+        );
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"point.ksl\")\nval p = Point(3, 4)\np.distanceSquared()\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.starts_with("error:"), "{err}");
+        assert!(err.contains("missing argument 'other'"), "{err}");
+    }
+
+    /// Same as above, for an ordinary (non-class) cross-file function.
+    #[test]
+    fn cross_file_function_missing_a_required_argument_is_caught_statically() {
+        let dir = TempDir::new("cross_fun_missing_arg");
+        dir.write("greeter.ksl", "fun greet(name: String): String = \"Hi, $name\"\n");
+        dir.write("main.ksl", "@file:Import(\"greeter.ksl\")\nprintln(greet())\n");
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.starts_with("error:"), "{err}");
+        assert!(err.contains("missing argument 'name'"), "{err}");
+    }
+
+    /// A class method with no explicit return-type annotation must keep its
+    /// real, inferred return type once exported across a file boundary —
+    /// the prerequisite fix for this phase (`walk_class_method` used to
+    /// patch only `class_info`, not the method's own `Symbol`, leaving
+    /// `class_members()` reporting `Unknown` for this exact case).
+    #[test]
+    fn cross_file_classs_inferred_method_return_type_survives_export() {
+        let dir = TempDir::new("cross_class_inferred_return");
+        dir.write("dog.ksl", "class Dog {\n    fun bark() = \"woof\"\n}\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"dog.ksl\")\nval sound: String = Dog().bark()\nprintln(sound)\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "woof\n");
+    }
+
+    /// Assigning the wrong type to an imported class's field is a real
+    /// static error, not a silent no-op.
+    #[test]
+    fn wrong_type_assigned_to_a_cross_file_class_field_is_rejected() {
+        let dir = TempDir::new("cross_class_field_wrong_type");
+        dir.write("point.ksl", "class Point(var x: Int, val y: Int)\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"point.ksl\")\nval p = Point(3, 4)\np.x = \"nope\"\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("cannot assign String to field 'x' of type Int"), "{err}");
+    }
+
+    /// Reassigning an imported class's `val` field is rejected, not
+    /// silently accepted.
+    #[test]
+    fn reassigning_a_cross_file_class_val_field_is_rejected() {
+        let dir = TempDir::new("cross_class_val_field_reassign");
+        dir.write("point.ksl", "class Point(val x: Int, val y: Int)\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"point.ksl\")\nval p = Point(3, 4)\np.y = 9\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("cannot reassign val 'y'"), "{err}");
+    }
+
+    /// Reassigning a cross-file `val` (a bare name, not a field) must also
+    /// be rejected — `StmtKind::Assign`'s cross-file fallback used to skip
+    /// mutability/type checking entirely for this case.
+    #[test]
+    fn reassigning_a_cross_file_val_bare_name_is_rejected() {
+        let dir = TempDir::new("cross_val_bare_name_reassign");
+        dir.write("consts.ksl", "val greeting = \"Hi\"\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"consts.ksl\")\ngreeting = \"Bye\"\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("cannot reassign val 'greeting'"), "{err}");
+    }
+
+    /// Assigning an incompatible type to a cross-file `var` (a bare name)
+    /// must also be rejected, same fallback as the previous test.
+    #[test]
+    fn wrong_type_assigned_to_a_cross_file_var_bare_name_is_rejected() {
+        let dir = TempDir::new("cross_var_bare_name_wrong_type");
+        dir.write("consts.ksl", "var count = 0\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"consts.ksl\")\ncount = \"nope\"\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("cannot assign String to var 'count' of type Int"), "{err}");
     }
 }
