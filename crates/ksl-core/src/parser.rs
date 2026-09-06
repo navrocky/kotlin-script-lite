@@ -1303,7 +1303,19 @@ impl<'a> Parser<'a> {
 fn attach_callee_to_call_argument_error(mut e: ParseError, callee_expr: &Expr) -> ParseError {
     if let ExprKind::Name(name) = &callee_expr.kind {
         for exp in &mut e.expected {
-            if let Expected::CallArgument { callee, .. } = exp {
+            // Only ever fills in a still-`None` entry — for two nested,
+            // both-still-open calls (`outer(inner(x`), the same
+            // `ParseError.expected` Vec is shared and mutated on the way
+            // back up through every enclosing `parse_postfix` call site:
+            // the innermost call's own site runs first and correctly
+            // attaches its callee, but the *outer* call's site runs next
+            // (on the way further up the stack) over that same Vec — an
+            // unconditional overwrite here would clobber the inner
+            // callee with the outer one's name, exactly the reported bug
+            // (`println(greet(gre` completing `println`'s own parameter
+            // instead of `greet`'s). Only the outer call's own entry
+            // (still `None` at this point) should ever be touched here.
+            if let Expected::CallArgument { callee: callee @ None, .. } = exp {
                 *callee = Some(name.clone());
             }
         }

@@ -1740,6 +1740,42 @@ mod tests {
     }
 
     #[test]
+    fn named_arg_completion_inside_a_nested_still_open_call_offers_the_inner_calls_parameter() {
+        // The exact reported bug: `println(greet(<cursor>` — both calls
+        // still open (unlike a closed-inner-call shape) — must offer
+        // `greet`'s own parameters (`name =`/`greeting =`), not
+        // `println`'s (`value =`), which `attach_callee_to_call_argument_
+        // error`'s old unconditional overwrite (`parser.rs`) used to
+        // report instead. The line is fully parseable — only the cursor
+        // sits mid-call — so `expected_at_cursor` re-parses just the
+        // truncated-at-cursor text and hits the same still-open-parens
+        // shape a genuinely incomplete document would.
+        let text = "fun greet(name: String, greeting: String = \"Hello\"): String {\n    return \"$greeting, $name!\"\n}\nprintln(greet(name = \"x\", greeting = \"y\"))\n";
+        // "println(greet(" is 14 characters, cursor right after that
+        // inner "(" on line 4 (0-based 3).
+        let names = labels(text, Position::new(3, 14));
+        assert!(names.contains(&"name =".to_string()), "{names:?}");
+        assert!(names.contains(&"greeting =".to_string()), "{names:?}");
+        assert!(!names.contains(&"value =".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn named_arg_completion_inside_a_nested_still_open_call_reverse_nesting_too() {
+        // Same shape, nesting reversed — `greet(println(<cursor>` must
+        // offer `println`'s own `value =`, not `greet`'s parameters,
+        // proving the fix isn't just "always prefer the textually second
+        // call" but genuinely "always prefer the innermost still-open
+        // one."
+        let text = "fun greet(name: String, greeting: String = \"Hello\"): String {\n    return \"$greeting, $name!\"\n}\ngreet(name = println(\"x\"), greeting = \"y\")\n";
+        // "greet(name = println(" is 22 characters, cursor right after
+        // that inner "(" on line 4 (0-based 3).
+        let names = labels(text, Position::new(3, 22));
+        assert!(names.contains(&"value =".to_string()), "{names:?}");
+        assert!(!names.contains(&"name =".to_string()), "{names:?}");
+        assert!(!names.contains(&"greeting =".to_string()), "{names:?}");
+    }
+
+    #[test]
     fn named_arg_completion_offers_the_calls_declared_parameter() {
         // The exact reported bug: `Ctrl+Space` right after typing a partial
         // prefix of a declared parameter's name inside a call must offer

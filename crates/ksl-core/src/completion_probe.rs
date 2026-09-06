@@ -122,6 +122,26 @@ mod tests {
     }
 
     #[test]
+    fn two_still_open_nested_calls_each_keep_their_own_callee() {
+        // Regression test for a real reported bug: `attach_callee_to_
+        // call_argument_error` used to overwrite *every* `CallArgument`
+        // entry in the shared `ParseError.expected` Vec on each ascent
+        // through nested `parse_postfix` calls — so `println(greet(` (both
+        // calls still open, unlike the already-closed-inner-call case
+        // above) ended up reporting `greet`'s own entry as `callee:
+        // Some("println")` too, clobbering the correct `"greet"`.
+        // `completion.rs` takes the *first* `Some` callee, so this must
+        // be `"greet"` (the innermost, still-open call), not `"println"`.
+        assert_eq!(
+            expected_at_cursor("println(greet("),
+            vec![
+                Expected::CallArgument { callee: Some("greet".to_string()), already_named: Vec::new() },
+                Expected::CallArgument { callee: Some("println".to_string()), already_named: Vec::new() },
+            ]
+        );
+    }
+
+    #[test]
     fn callee_stays_none_for_a_non_name_callee() {
         // `f()()` -- calling the result of another call has no bare name
         // to look parameters up by.
