@@ -111,8 +111,11 @@ impl Type {
     /// signature is represented by the empty/`Unknown` sentinel shape
     /// `Function(vec![], Unknown)`, which `is_assignable` treats as
     /// compatible with any function type rather than checking arity against
-    /// it, since there's genuinely nothing to check. No `Value` variant
-    /// produces `Class`/`Generic` today (there is no object system yet).
+    /// it, since there's genuinely nothing to check. `Value::Object`
+    /// reports its real, dynamic class name via `Type::Class`; a class
+    /// *value itself* (`Value::Class`, e.g. `val c = Foo` naming the class,
+    /// not calling it) has no single fixed `Type` of its own worth
+    /// reporting here — `Unknown`, same rationale as `Overload` below.
     pub fn from_value(v: &Value) -> Type {
         match v {
             Value::Int(_) => Type::Int,
@@ -122,6 +125,8 @@ impl Type {
             Value::Unit => Type::Unit,
             Value::Null => Type::Null,
             Value::List(_) => Type::List,
+            Value::Object(o) => Type::Class(o.borrow().class.name.clone()),
+            Value::Class(_) => Type::Unknown,
             Value::Function(f) => {
                 let (param_types, ret_ty) = function_signature_types(f);
                 Type::Function(param_types, Box::new(ret_ty))
@@ -201,6 +206,17 @@ pub const PRIMITIVE_TYPES: &[(&str, Type)] = &[
 ];
 
 fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
+    // `Number` sits between `Any` and `Int`/`Double` in the real builtin
+    // class hierarchy (`class::builtin_classes`) but, unlike the rest of
+    // `PRIMITIVE_TYPES`, has no dedicated `Type` variant of its own — it's
+    // just a named `Class`, and `Type::Class` wraps a heap-allocated
+    // `Rc<str>` that can't be built in `PRIMITIVE_TYPES`'s `const`
+    // context, so it's special-cased here instead (see `is_assignable`'s
+    // matching `(Int | Double, Class(n))` rule for the one place this
+    // distinction actually matters for assignability).
+    if hint == "Number" {
+        return Type::Class(Rc::from("Number"));
+    }
     if let Some((_, ty)) = PRIMITIVE_TYPES.iter().find(|(name, _)| *name == hint) {
         return ty.clone();
     }
@@ -267,6 +283,12 @@ pub fn is_assignable(from: &Type, to: &Type) -> bool {
         (Type::Nullable(a), Type::Nullable(b)) => is_assignable(a, b),
         (a, Type::Nullable(b)) => is_assignable(a, b),
         (Type::Class(a), Type::Class(b)) => a == b,
+        // `Int`/`Double` are real `Number`s in the builtin hierarchy
+        // (`class::builtin_classes`'s `Int`/`Double` -> `Number` ->
+        // `Any` chain) even though they have their own dedicated `Type`
+        // variants rather than being `Type::Class("Int")`/`"Double"` —
+        // this is the one place that gap needs a manual bridge.
+        (Type::Int | Type::Double, Type::Class(n)) if n.as_ref() == "Number" => true,
         (Type::Function(fp, fr), Type::Function(tp, tr)) => {
             if fp.is_empty() && **fr == Type::Unknown {
                 true

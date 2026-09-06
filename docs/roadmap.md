@@ -121,7 +121,7 @@ Phase 4.5: Any & Nothing (top/bottom types) [DONE]  <-- needs only Phase 2 (type
 Phase 5: try/catch (Flow::Throw, minimal Value::Error)  <-- Throw's type is Phase 4.5's Type::Nothing
    |
    v
-Phase 6: classes/objects  <-- needs Phase 1 (+ Phase 2 reserves Type::Class for it)
+Phase 6: classes/objects [DONE]  <-- needs Phase 1 (+ Phase 2 reserves Type::Class for it)
    |
    v
 Phase 6.5: interfaces  <-- needs Phase 6 (classes to implement them, class.rs to extend)
@@ -1641,7 +1641,7 @@ New `tests/examples/exceptions.ksl`.
 
 ---
 
-## Phase 6 — Classes/objects
+## Phase 6 — Classes/objects [DONE]
 
 The largest phase. Requires Phase 1.
 
@@ -1649,10 +1649,20 @@ The largest phase. Requires Phase 1.
 to warrant its own file rather than growing `value.rs`/`interpreter.rs`
 further, matching the existing one-concern-per-file layout).
 
-- `Value::Object(Rc<ObjectValue>)`, `ObjectValue { class: Rc<ClassValue>,
-  fields: RefCell<HashMap<String, Value>> }` — mirrors the existing
-  `Rc`-wrapped-struct pattern (`FunctionValue`) and interior-mutability
-  pattern (`List`'s `Rc<RefCell<Vec<Value>>>`).
+- **As actually shipped** (this sketch predates the generic `GcRef<T:
+  Trace>` cycle-collector built just before this phase, and is kept below
+  as historical planning context, not the real shape): `Value::Object(
+  GcRef<ObjectData>)`, `ObjectData { class: Rc<ClassValue>, fields:
+  HashMap<String, Value> }` — a single `GcRef`-tracked node (mirroring
+  `Value::List(GcRef<Vec<Value>>)`) rather than a plain `Rc` wrapping a
+  separately-`RefCell`'d field map; see `class.rs`'s own doc comments for
+  why a bare `RefCell<HashMap<...>>` here would silently leak (no `GcRef`
+  tracking, so a genuine object reference cycle would never be found by
+  `Interpreter::collect_cycles`'s trial-deletion). Original sketch, for
+  reference: ~~`Value::Object(Rc<ObjectValue>)`, `ObjectValue { class:
+  Rc<ClassValue>, fields: RefCell<HashMap<String, Value>> }` — mirrors the
+  existing `Rc`-wrapped-struct pattern (`FunctionValue`) and
+  interior-mutability pattern (`List`'s `Rc<RefCell<Vec<Value>>>`)~~.
 - `Value::Class(Rc<ClassValue>)` — the class itself as a callable value;
   `ClassValue { name, fields: Vec<FieldDecl>, methods:
   HashMap<String, Rc<FunctionValue>>, constructor_params: Vec<ClassParam>,

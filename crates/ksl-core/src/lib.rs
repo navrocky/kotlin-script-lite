@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod class;
 pub mod completion_probe;
 pub mod doc_comment;
 pub mod environment;

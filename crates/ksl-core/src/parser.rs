@@ -13,7 +13,7 @@ pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
 /// immediately precede — `doc_comments` is keyed by source line number,
 /// exactly as the lexer produces it.
 pub fn parse_with_docs(tokens: &[Token], doc_comments: HashMap<u32, String>) -> Result<Program, ParseError> {
-    let mut p = Parser { tokens, pos: 0, loop_depth: 0, doc_comments };
+    let mut p = Parser { tokens, pos: 0, loop_depth: 0, class_member_depth: 0, doc_comments };
     p.parse_program()
 }
 
@@ -28,6 +28,15 @@ struct Parser<'a> {
     /// rejection (this interpreter has no type/scope checking otherwise,
     /// so this is done at parse time instead).
     loop_depth: u32,
+    /// Number of enclosing class-member bodies (a method body, an `init`
+    /// block, or a property initializer) at the current parse position —
+    /// saved and reset to 0 around a constructor parameter's own default
+    /// value (evaluated before the object exists, so `this` can't be legal
+    /// there even though it's textually inside the class body), exactly
+    /// mirroring `loop_depth`'s save/reset around a nested `fun`/lambda
+    /// body. Checked when parsing `this` to reject it outside any class
+    /// member, at parse time (same rationale as `loop_depth`).
+    class_member_depth: u32,
     /// Doc-comment text (see `lexer::Lexer::doc_comments`), keyed by the
     /// line a comment immediately precedes. Consulted only in
     /// `parse_val_decl`/`parse_fun_decl` — the only two constructs KDoc
@@ -410,6 +419,7 @@ impl<'a> Parser<'a> {
             TokenKind::While => self.parse_while(),
             TokenKind::Do => self.parse_do_while(),
             TokenKind::For => self.parse_for(),
+            TokenKind::Class => self.parse_class_decl(),
             TokenKind::Return => {
                 self.advance();
                 let value = if matches!(
@@ -531,6 +541,94 @@ impl<'a> Parser<'a> {
         Ok(Stmt::new(StmtKind::While { cond, body: body? }, span))
     }
 
+    /// `class Name(ctor params) { members }` — the body is optional, same
+    /// as real Kotlin (`class Foo(val x: Int)` needs no braces at all).
+    fn parse_class_decl(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.span();
+        let doc_comment = self.doc_comments.remove(&span.line);
+        self.advance(); // class
+        let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
+        // The constructor's own `(...)` is optional too — real Kotlin:
+        // `class Foo { ... }` (no parameter list at all) is legal.
+        let ctor_params =
+            if matches!(self.peek_kind(), TokenKind::LParen) { self.parse_class_ctor_params()? } else { Vec::new() };
+        self.skip_newlines();
+        let members = if matches!(self.peek_kind(), TokenKind::LBrace) {
+            self.class_member_depth += 1;
+            let result = self.parse_class_body();
+            self.class_member_depth -= 1;
+            result?
+        } else {
+            Vec::new()
+        };
+        Ok(Stmt::new(StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment }, span))
+    }
+
+    /// Same shape as `parse_params`, plus an optional leading `val`/`var`
+    /// promoting the parameter to a field.
+    fn parse_class_ctor_params(&mut self) -> Result<Vec<ClassParam>, ParseError> {
+        let mut params = Vec::new();
+        self.expect(TokenKind::LParen, "'('")?;
+        while !matches!(self.peek_kind(), TokenKind::RParen) {
+            let field = if self.matches(&TokenKind::Var) {
+                Some(true)
+            } else if self.matches(&TokenKind::Val) {
+                Some(false)
+            } else {
+                None
+            };
+            let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
+            let type_annotation =
+                if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
+            let default = if self.matches(&TokenKind::Assign) { Some(self.parse_expr()?) } else { None };
+            params.push(ClassParam { param: Param { name, name_span, type_annotation, default }, field });
+            if !self.matches(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "')'")?;
+        Ok(params)
+    }
+
+    fn parse_class_body(&mut self) -> Result<Vec<ClassMember>, ParseError> {
+        self.expect(TokenKind::LBrace, "'{'")?;
+        self.skip_separators();
+        let mut members = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace) {
+            members.push(self.parse_class_member()?);
+            self.skip_separators();
+        }
+        self.expect(TokenKind::RBrace, "'}'")?;
+        Ok(members)
+    }
+
+    fn parse_class_member(&mut self) -> Result<ClassMember, ParseError> {
+        match self.peek_kind() {
+            TokenKind::Val | TokenKind::Var => {
+                let span = self.span();
+                let doc_comment = self.doc_comments.remove(&span.line);
+                let mutable = matches!(self.peek_kind(), TokenKind::Var);
+                self.advance(); // val/var
+                let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
+                let type_annotation =
+                    if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
+                self.expect(TokenKind::Assign, "'='")?;
+                let init = self.parse_expr()?;
+                Ok(ClassMember::Property { name, name_span, type_annotation, mutable, init, doc_comment })
+            }
+            TokenKind::Fun => Ok(ClassMember::Method(Box::new(self.parse_fun_decl()?))),
+            // `init` is a contextual (soft) keyword: a plain `Ident("init")`
+            // immediately followed by `{` — anywhere else it's still a
+            // perfectly ordinary name (a property/method/local called
+            // `init`), matching real Kotlin.
+            TokenKind::Ident(s) if s.as_str() == "init" && matches!(self.peek_at(1), TokenKind::LBrace) => {
+                self.advance(); // init
+                Ok(ClassMember::Init(self.parse_block_stmts()?))
+            }
+            _ => Err(self.err("expected a property ('val'/'var'), a method ('fun'), or an 'init' block")),
+        }
+    }
+
     /// `do <body> while (<cond>)` — `body` first (a `{ ... }` block or a
     /// single statement, same as `while`/`if`), then `while (<cond>)`.
     /// Unlike `if`/`else`, a newline right after the body's own closing `}`
@@ -595,12 +693,22 @@ impl<'a> Parser<'a> {
         };
         if let Some(op) = op {
             self.advance();
-            let name = match expr.kind {
-                ExprKind::Name(name) => name,
-                _ => return Err(self.err("invalid assignment target")),
-            };
-            let value = self.parse_expr()?;
-            Ok(Stmt::new(StmtKind::Assign { name, op, value }, span))
+            match expr.kind {
+                ExprKind::Name(name) => {
+                    let value = self.parse_expr()?;
+                    Ok(Stmt::new(StmtKind::Assign { name, op, value }, span))
+                }
+                ExprKind::FieldAccess { receiver, field, field_span, safe: false } => {
+                    let value = self.parse_expr()?;
+                    Ok(Stmt::new(StmtKind::FieldAssign { receiver, field, field_span, op, value }, span))
+                }
+                // `a?.b = c` — not a valid assignment target, same as real
+                // Kotlin (a safe-call result isn't an lvalue).
+                ExprKind::FieldAccess { safe: true, .. } => {
+                    Err(self.err("cannot assign through a safe call ('?.') target"))
+                }
+                _ => Err(self.err("invalid assignment target")),
+            }
         } else {
             Ok(Stmt::new(StmtKind::ExprStmt(expr), span))
         }
@@ -821,8 +929,20 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         loop {
             if matches!(self.peek_kind(), TokenKind::LParen) {
-                let span = self.span();
+                // Widened to the call's own real closing `)` (via
+                // `prev_span()`, the just-consumed token right after
+                // `parse_call_args()` returns) rather than left pinned to
+                // just the opening `(` — matches the same "span reflects
+                // the construct's true extent" convention every other
+                // widened construct (`FunDecl`/`If`/`When`/blocks) already
+                // follows, and is what lets a consumer (e.g. `ksl-lsp`'s
+                // completion, via `resolver.rs`'s `expr_types` table) find
+                // this `Call`'s own static type by the position right
+                // after it — a position `(`'s own single-character span
+                // could never reach.
+                let callee_span = expr.span;
                 let args = self.parse_call_args().map_err(|e| attach_callee_to_call_argument_error(e, &expr))?;
+                let span = callee_span.merge(&self.prev_span());
                 expr = Expr::new(
                     ExprKind::Call {
                         callee: Box::new(expr),
@@ -834,9 +954,14 @@ impl<'a> Parser<'a> {
                 let safe = matches!(self.peek_kind(), TokenKind::QuestionDot);
                 self.advance(); // '.' or '?.'
                 let (member, member_span) = self.expect_ident_spanned(IdentRole::Other)?;
-                let full_span = expr.span.merge(&member_span);
                 expr = if matches!(self.peek_kind(), TokenKind::LParen) {
                     let args = self.parse_call_args()?;
+                    // Same reasoning as `Call` above: widened to the real
+                    // closing `)`, computed only now that `args` has
+                    // actually been consumed — not before, the way
+                    // `FieldAccess`'s own (parenthesis-less) span below
+                    // still correctly is.
+                    let full_span = expr.span.merge(&self.prev_span());
                     Expr::new(
                         ExprKind::MethodCall {
                             receiver: Box::new(expr),
@@ -848,6 +973,7 @@ impl<'a> Parser<'a> {
                         full_span,
                     )
                 } else {
+                    let full_span = expr.span.merge(&member_span);
                     Expr::new(
                         ExprKind::FieldAccess {
                             receiver: Box::new(expr),
@@ -954,6 +1080,13 @@ impl<'a> Parser<'a> {
             TokenKind::Null => {
                 self.advance();
                 Ok(Expr::new(ExprKind::NullLit, span))
+            }
+            TokenKind::This => {
+                self.advance();
+                if self.class_member_depth == 0 {
+                    return Err(ParseError::new("'this' is only allowed inside a class member", span));
+                }
+                Ok(Expr::new(ExprKind::This, span))
             }
             TokenKind::Ident(name) => {
                 self.advance();
@@ -1504,6 +1637,91 @@ mod tests {
         // — this would be a parse error ("only allowed inside a loop") if
         // `parse_do_while` forgot to do that.
         parse_src("do {\n    if (x) break\n    if (y) continue\n} while (x < 10)");
+    }
+
+    #[test]
+    fn class_decl_parses_ctor_params_val_var_and_plain() {
+        let stmts = parse_src("class Point(val x: Int, var y: Int, label: String)");
+        match &stmts[0].kind {
+            StmtKind::ClassDecl { name, ctor_params, members, .. } => {
+                assert_eq!(name, "Point");
+                assert!(members.is_empty());
+                assert_eq!(ctor_params.len(), 3);
+                assert_eq!(ctor_params[0].field, Some(false)); // val
+                assert_eq!(ctor_params[0].param.name, "x");
+                assert_eq!(ctor_params[1].field, Some(true)); // var
+                assert_eq!(ctor_params[2].field, None); // plain, not a field
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_decl_with_no_body_needs_no_braces() {
+        // Real Kotlin: `class Foo(val x: Int)` alone is a complete class.
+        parse_src("class Foo(val x: Int)\nprintln(1)");
+    }
+
+    #[test]
+    fn class_body_parses_property_init_and_method_members() {
+        let stmts = parse_src(
+            "class Counter(start: Int) {\n    var count = start\n    init {\n        count = count + 1\n    }\n    fun get(): Int = count\n}",
+        );
+        match &stmts[0].kind {
+            StmtKind::ClassDecl { members, .. } => {
+                assert_eq!(members.len(), 3);
+                assert!(matches!(&members[0], ClassMember::Property { name, mutable: true, .. } if name == "count"));
+                assert!(matches!(&members[1], ClassMember::Init(body) if body.len() == 1));
+                assert!(matches!(&members[2], ClassMember::Method(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_is_a_contextual_keyword_not_reserved_everywhere() {
+        // A bare `init` with no following `{` is just an ordinary name —
+        // legal as a property/local/method name outside a class body too.
+        parse_src("val init = 5\nprintln(init)");
+        let stmts = parse_src("class Foo {\n    fun init() = 1\n}");
+        match &stmts[0].kind {
+            StmtKind::ClassDecl { members, .. } => {
+                assert!(matches!(&members[0], ClassMember::Method(_)), "'fun init()' is a method, not an init block");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn this_is_rejected_outside_a_class_member() {
+        let err = parse_err("println(this)");
+        assert!(err.message.contains("only allowed inside a class member"), "{}", err.message);
+    }
+
+    #[test]
+    fn this_is_allowed_inside_a_method_body_but_not_a_ctor_default() {
+        parse_src("class Foo {\n    fun bar(): Foo = this\n}");
+        let err = parse_err("class Foo(x: Int = this) {\n}");
+        assert!(err.message.contains("only allowed inside a class member"), "{}", err.message);
+    }
+
+    #[test]
+    fn field_assign_parses_from_a_field_access_target() {
+        let stmts = parse_src("a.b = 1\na.b += 2");
+        match &stmts[0].kind {
+            StmtKind::FieldAssign { field, op: AssignOp::Set, .. } => assert_eq!(field, "b"),
+            other => panic!("unexpected {other:?}"),
+        }
+        match &stmts[1].kind {
+            StmtKind::FieldAssign { op: AssignOp::Add, .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_assign_rejects_a_safe_call_target() {
+        let err = parse_err("a?.b = 1");
+        assert!(err.message.contains("safe call"), "{}", err.message);
     }
 
     #[test]

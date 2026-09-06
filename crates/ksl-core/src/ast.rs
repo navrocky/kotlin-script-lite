@@ -170,6 +170,12 @@ pub enum ExprKind {
     },
     Block(Vec<Stmt>),
     NullLit,
+    /// `this` — only legal inside a class member (a method body, an `init`
+    /// block, or a property initializer; *not* a constructor parameter's
+    /// own default value, since that's evaluated before the object exists)
+    /// — enforced at parse time by `Parser::class_member_depth`, the same
+    /// way `break`/`continue` are gated by `loop_depth`.
+    This,
     /// `++x`/`--x` (`prefix: true`) or `x++`/`x--` (`prefix: false`) —
     /// restricted to a bare variable target, same as `StmtKind::Assign`'s
     /// `name` (no `.field`/`[i]` target exists to increment yet). Mutates
@@ -243,6 +249,41 @@ pub struct Param {
     pub name_span: Span,
     pub type_annotation: Option<TypeAnnotation>,
     pub default: Option<Expr>,
+}
+
+/// One entry of a class's own constructor parameter list — reuses `Param`
+/// as-is for the name/type/default, adding only whether (and how) this
+/// parameter also becomes a field.
+#[derive(Debug, Clone)]
+pub struct ClassParam {
+    pub param: Param,
+    /// `Some(false)` for a `val` constructor parameter (promoted to an
+    /// immutable field), `Some(true)` for `var` (mutable field), `None` for
+    /// a plain constructor-only parameter that never becomes a field.
+    pub field: Option<bool>,
+}
+
+/// One member of a class body — a property, an `init` block, or a method.
+#[derive(Debug, Clone)]
+pub enum ClassMember {
+    Property {
+        name: String,
+        /// Span of just the property name, used for hover/goto-definition.
+        name_span: Span,
+        type_annotation: Option<TypeAnnotation>,
+        mutable: bool,
+        init: Expr,
+        /// Raw text of an immediately-preceding `/** ... */` doc comment,
+        /// if any — see `StmtKind::ValDecl::doc_comment`.
+        doc_comment: Option<String>,
+    },
+    /// An `init { ... }` block — run, in source order relative to the
+    /// property initializers around it, as part of constructing an
+    /// instance.
+    Init(Vec<Stmt>),
+    /// Always a `StmtKind::FunDecl` — reused as-is, same as a top-level
+    /// function.
+    Method(Box<Stmt>),
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +370,30 @@ pub enum StmtKind {
     Return(Option<Expr>),
     Break,
     Continue,
+    /// `class Name(ctor params) { members }` — see `docs/syntax.md`'s
+    /// "Classes" section for exactly what's (and isn't) supported yet.
+    ClassDecl {
+        name: String,
+        /// Span of just the class name, used for hover/goto-definition.
+        name_span: Span,
+        ctor_params: Vec<ClassParam>,
+        members: Vec<ClassMember>,
+        /// Raw text of an immediately-preceding `/** ... */` doc comment,
+        /// if any — see `ValDecl::doc_comment`.
+        doc_comment: Option<String>,
+    },
+    /// `receiver.field = value` (or `+=`/`-=`/etc.) — the dot-assignment
+    /// counterpart of `Assign`'s bare-name form. Only ever produced for a
+    /// `FieldAccess { safe: false, .. }` target — `obj?.field = value` is a
+    /// parse error, same as it is in real Kotlin (a safe-call result isn't
+    /// a valid assignment target).
+    FieldAssign {
+        receiver: Box<Expr>,
+        field: String,
+        field_span: Span,
+        op: AssignOp,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

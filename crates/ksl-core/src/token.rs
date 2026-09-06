@@ -33,6 +33,8 @@ pub enum TokenKind {
     Package,
     Import,
     Null,
+    Class,
+    This,
 
     // Punctuation
     LParen,
@@ -105,6 +107,8 @@ pub const KEYWORDS: &[(&str, TokenKind)] = &[
     ("package", TokenKind::Package),
     ("import", TokenKind::Import),
     ("null", TokenKind::Null),
+    ("class", TokenKind::Class),
+    ("this", TokenKind::This),
     ("true", TokenKind::Bool(true)),
     ("false", TokenKind::Bool(false)),
 ];

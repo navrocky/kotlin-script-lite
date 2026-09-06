@@ -37,6 +37,15 @@ pub enum Value {
     // directly beyond what `Value`'s own API exposes.
     #[allow(private_interfaces)]
     List(GcRef<Vec<Value>>),
+    /// A class instance. See `class.rs`'s module doc comment for why this
+    /// is a `GcRef` wrapping the whole payload (class pointer + field map
+    /// together), mirroring `List` exactly, rather than a separately-
+    /// `GcRef`-wrapped field map behind a plain `Rc`.
+    #[allow(private_interfaces)]
+    Object(GcRef<crate::class::ObjectData>),
+    /// A class itself, as a callable value (`Foo(1, 2)` constructs an
+    /// instance) — see `Interpreter::call_value`'s `Value::Class` arm.
+    Class(Rc<crate::class::ClassValue>),
     Function(Rc<FunctionValue>),
     Native(Rc<NativeValue>),
     /// Real user-defined function overloading: a second (or later) `fun`
@@ -86,6 +95,29 @@ pub(crate) fn value_refs(v: &Value, out: &mut Vec<GcHandle>) {
         Value::Function(f) => out.push(f.closure.handle()),
         Value::Overload(group) => out.extend(group.iter().map(|f| f.closure.handle())),
         Value::List(l) => out.push(l.handle()),
+        Value::Object(o) => out.push(o.handle()),
+        // NOT a no-op: `StmtKind::ClassDecl` execution sets every method's
+        // `closure` to the *same* `Env` as `ClassValue.closure` (see
+        // `class.rs`'s doc comment on that field) — the same self-cycle
+        // shape `StmtKind::FunDecl` already has (`closure: env.clone()`,
+        // then stored back into that same `env`). A purely local class
+        // (`fun f() { class Local { ... } }`, nothing escaping) has no
+        // *real* external anchor at all besides this self-reference —
+        // real `Rc::strong_count` accounting alone can't tell that apart
+        // from "held by something we don't trace" without this edge to
+        // actually subtract it, so `collect_cycles` would never bring its
+        // count down to zero and the registry would grow without bound
+        // across repeated calls (see `interpreter.rs`'s
+        // `collect_cycles_reclaims_a_purely_self_referential_local_class`
+        // — deliberately verified by disabling this exact line and
+        // confirming that test fails). A `Value::Class` that instead
+        // escapes to somewhere genuinely reachable (no instance ever
+        // constructed) doesn't strictly need this edge either way — its
+        // `closure`'s hold is a real, untraced-but-real `Rc` reference
+        // `collect_cycles` already sees correctly via strong-count alone
+        // — but the edge is what makes purely-local, self-referential
+        // classes collectible at all, not just externally-anchored ones.
+        Value::Class(c) => out.push(c.closure.handle()),
         Value::Int(_)
         | Value::Double(_)
         | Value::Bool(_)
@@ -170,6 +202,12 @@ impl Value {
         Value::Str(s.into())
     }
 
+    /// A `'static` type-name label — genuinely can't carry a dynamic class
+    /// name (`Rc<str>`), so `Object`/`Class` return generic placeholders.
+    /// Anywhere the *real* class name matters for user-facing text (e.g.
+    /// "'Dog' has no method 'bark'", not "'Object' has no method 'bark'"),
+    /// read it directly off `o.borrow().class.name`/`c.name` instead of
+    /// calling this.
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "Int",
@@ -179,6 +217,8 @@ impl Value {
             Value::Unit => "Unit",
             Value::Null => "Null",
             Value::List(_) => "List",
+            Value::Object(_) => "Object",
+            Value::Class(_) => "Class",
             Value::Function(_) | Value::Native(_) | Value::Overload(_) => "Function",
         }
     }
@@ -205,6 +245,15 @@ impl Value {
                         && xb.iter().zip(yb.iter()).all(|(a, b)| Value::values_equal(a, b))
                 }
             }
+            // Identity only, no structural fallback and no dispatch to a
+            // user-overridden `.equals()` — matches Kotlin's default `==`
+            // for a class with no `equals()` of its own. An explicit
+            // `.equals(other)` *call* goes through real method dispatch
+            // (`Interpreter::call_method`) instead of this function; `==`
+            // itself stays a purely structural/identity operator in this
+            // phase, deliberately not reworked into a virtual call.
+            (Value::Object(x), Value::Object(y)) => GcRef::ptr_eq(x, y),
+            (Value::Class(x), Value::Class(y)) => Rc::ptr_eq(x, y),
             _ => false,
         }
     }
@@ -229,6 +278,19 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            // Identity-based default, matching real Kotlin's own `Any.
+            // toString()` shape (`ClassName@<hex address>`) — the same
+            // format the native, identity-based `toString` (added once the
+            // Any/Number hierarchy lands) produces, so the two paths never
+            // visibly disagree for a class that hasn't overridden
+            // `toString()`. A class *with* its own `toString()` never
+            // reaches this: `println`/string-interpolation call the real
+            // method instead (see `Interpreter`'s `Value::Object` special
+            // case), this `Display` impl is the fallback for anywhere that
+            // still formats a `Value` directly (this exhaustive match
+            // itself requiring one, internal debug-adjacent tooling, ...).
+            Value::Object(o) => write!(f, "{}@{:x}", o.borrow().class.name, o.addr()),
+            Value::Class(c) => write!(f, "class {}", c.name),
             Value::Function(func) => {
                 write!(f, "<function {}>", func.name.as_deref().unwrap_or("lambda"))
             }

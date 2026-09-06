@@ -1,6 +1,6 @@
 use ksl_core::error::Span;
 use ksl_core::resolver::{Symbol, SymbolKind};
-use ksl_core::stdlib::BUILTIN_METHOD_SIGNATURES;
+use ksl_core::stdlib::{format_signature, BUILTIN_METHODS};
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::analysis::Analysis;
@@ -60,10 +60,19 @@ pub fn hover(analysis: &Analysis, position: Position) -> Option<Hover> {
             ksl_core::types::Type::Nullable(inner) => inner.name(),
             other => other.name(),
         });
-        if let Some((_, _, signature, doc)) = BUILTIN_METHOD_SIGNATURES.iter().find(|(recv_ty, name, ..)| {
-            *name == method && dispatch_name.as_deref().map(|n| n == *recv_ty).unwrap_or(true)
+        // Same chain-walk as `completion.rs`'s `builtin_method_completions`
+        // — a concretely known receiver must match somewhere in its own
+        // builtin-class chain (so `5.toString()` finds `Any`'s entry, not
+        // just an exact `Int` one), an unknown one still matches by method
+        // name alone (the "over-suggest" hedge).
+        if let Some(m) = BUILTIN_METHODS.iter().find(|m| {
+            m.symbol.name == method
+                && match &dispatch_name {
+                    Some(name) => ksl_core::stdlib::builtin_type_chain(name).contains(&m.receiver),
+                    None => true,
+                }
         }) {
-            return Some(build_builtin_method_hover(signature, doc));
+            return Some(build_builtin_method_hover(&format_signature(&m.symbol), m.symbol.doc));
         }
     }
 
@@ -129,6 +138,9 @@ fn build_hover(symbol: &Symbol, range_span: Option<Span>, is_current: bool, pack
         SymbolKind::Var => "var",
         SymbolKind::Fun => "function",
         SymbolKind::Param => "parameter",
+        SymbolKind::Class => "class",
+        SymbolKind::Field => "field",
+        SymbolKind::Method => "method",
     };
     let signature = match package {
         Some(pkg) if !pkg.is_empty() => qualify_signature(&symbol.signature, &symbol.name, pkg),
@@ -481,6 +493,45 @@ mod tests {
         // "println(add(" is 12 chars, so "1" starts at column 13.
         let h = hover_at(text, 4, 13);
         assert!(h.is_none(), "{h:?}");
+    }
+
+    #[test]
+    fn hover_on_a_promoted_field_use_shows_its_ctor_params_declaration() {
+        // A promoted `val`/`var` ctor param has no separate field
+        // declaration of its own — `p.x` points back at the *constructor
+        // parameter's* own symbol (see `resolver::ClassFieldInfo::
+        // symbol_idx`'s doc comment), so this shows "parameter", not
+        // "field".
+        let text = "class Point(val x: Int, val y: Int)\nval p = Point(1, 2)\nprintln(p.x)\n";
+        // "println(p." is 10 chars, so "x" starts at column 11.
+        let h = hover_at(text, 3, 11).expect("field use should hover");
+        assert!(markdown_value(&h).contains("param x: Int"), "{}", markdown_value(&h));
+        assert!(markdown_value(&h).contains("*parameter*"), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_a_body_property_use_shows_a_real_field_declaration() {
+        let text = "class Counter {\n    var count: Int = 0\n}\nval c = Counter()\nprintln(c.count)\n";
+        // "println(c." is 10 chars, so "count" starts at column 11.
+        let h = hover_at(text, 5, 11).expect("field use should hover");
+        assert!(markdown_value(&h).contains("var count: Int"), "{}", markdown_value(&h));
+        assert!(markdown_value(&h).contains("*field*"), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_a_method_use_shows_its_signature() {
+        let text = "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\nval p = Point(1)\np.bark()\n";
+        // "p." is 2 chars, so "bark" starts at column 3.
+        let h = hover_at(text, 5, 3).expect("method use should hover");
+        assert!(markdown_value(&h).contains("fun bark(): String"), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_this_shows_the_enclosing_classs_instance_type() {
+        let text = "class Point(val x: Int) {\n    fun getX(): Int = this.x\n}\n";
+        // "    fun getX(): Int = " is 22 chars, so "this" starts at column 23.
+        let h = hover_at(text, 2, 23).expect("this should hover");
+        assert!(markdown_value(&h).contains("this: Point"), "{}", markdown_value(&h));
     }
 }
 

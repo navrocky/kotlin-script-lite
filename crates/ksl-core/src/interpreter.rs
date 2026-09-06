@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -56,6 +56,30 @@ pub struct Interpreter<'a> {
     /// because `Env`/`List`/etc. each carry a handle to it too — see
     /// `gc.rs`'s module doc comment.
     pub(crate) gc: Rc<GcRegistry>,
+    /// The real `Any`/`Number`/`Int`/`Double`/`Boolean`/`String`/`List`/
+    /// `Unit` hierarchy, built once by `class::builtin_classes` — every
+    /// user class's implicit superclass is `builtin_classes["Any"]`
+    /// (`exec_class_decl`), and `stdlib::call_builtin_method` walks this
+    /// same map's chain via `class::lookup_method` for a primitive's own
+    /// `.`-method calls. Never mutated after construction.
+    pub(crate) builtin_classes: HashMap<&'static str, Rc<crate::class::ClassValue>>,
+    /// Every user `class` name whose `ClassDecl` has actually executed so
+    /// far, accumulated as they run (`exec_class_decl`) — the
+    /// interpreter's own, necessarily sequential counterpart of
+    /// `resolver::Resolver`'s same-named field, which instead fills it
+    /// with every top-level class name in one predpass *before* walking
+    /// anything (the resolver can afford a whole extra pass over the AST;
+    /// the interpreter only ever sees statements as it executes them).
+    /// Read by `check_type`, so a type annotation naming a real, already-
+    /// declared class (`fun make(): Node = Node(null)`, called only after
+    /// `class Node(...)` has run) resolves correctly instead of always
+    /// reporting "unknown type" — a real, previously-flagged gap from
+    /// before classes existed at all (see `check_type`'s own doc comment).
+    /// A class referenced before its own `ClassDecl` has executed (a
+    /// narrower case than the resolver's own predpass covers) still
+    /// reports "unknown type" here — an accepted limitation, not fixed
+    /// this phase.
+    pub(crate) known_classes: HashSet<Rc<str>>,
     /// Test-only instrumentation: counts calls that fell through to
     /// `call_overload`'s by-runtime-value search, as opposed to the
     /// `ExprKind::Call` fast path that uses the resolver's own
@@ -115,6 +139,8 @@ impl<'a> Interpreter<'a> {
             current_resolved: Rc::new(HashMap::new()),
             call_stack: Vec::new(),
             gc,
+            builtin_classes: crate::class::builtin_classes(),
+            known_classes: HashSet::new(),
             #[cfg(test)]
             overload_search_count: 0,
         }
@@ -366,7 +392,7 @@ impl<'a> Interpreter<'a> {
             } => {
                 let v = self.eval_expr(init, env)?;
                 let declared_type = match type_annotation {
-                    Some(ann) => check_type(ann, &v, ann.span())?,
+                    Some(ann) => self.check_type(ann, &v, ann.span())?,
                     // No annotation — infer from the value itself, matching
                     // Kotlin: `var x = 5` infers `Int` just as surely as
                     // `var x: Int = 5` does, so `Env::assign` can enforce
@@ -378,11 +404,23 @@ impl<'a> Interpreter<'a> {
                 Ok(())
             }
             StmtKind::Assign { name, op, value } => {
+                let local_current = env.get(name);
+                // A local of this name always wins (real Kotlin's own
+                // shadowing rule — see `implicit_this_field`'s doc
+                // comment); only when there's genuinely no local at all
+                // does a bare assignment target implicitly resolve
+                // against the enclosing instance's own field.
+                if local_current.is_none() {
+                    if let Some(Value::Object(o)) = env.get("this") {
+                        if o.borrow().class.fields.iter().any(|f| f.name == *name) {
+                            return self.assign_object_field(&o, name, *op, value, env, stmt.span);
+                        }
+                    }
+                }
                 let new_val = if *op == AssignOp::Set {
                     self.eval_expr(value, env)?
                 } else {
-                    let cur = env
-                        .get(name)
+                    let cur = local_current
                         .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), stmt.span))?;
                     let rhs = self.eval_expr(value, env)?;
                     let bop = match op {
@@ -505,7 +543,195 @@ impl<'a> Interpreter<'a> {
             }
             StmtKind::Break => Err(Flow::Break),
             StmtKind::Continue => Err(Flow::Continue),
+            StmtKind::ClassDecl { name, name_span, ctor_params, members, .. } => {
+                self.exec_class_decl(name, *name_span, ctor_params, members, env)
+            }
+            StmtKind::FieldAssign { receiver, field, op, value, .. } => {
+                let recv = self.eval_expr(receiver, env)?;
+                let Value::Object(o) = &recv else {
+                    return Err(RuntimeError::new(
+                        format!("'{}' has no field '{field}'", recv.type_name()),
+                        stmt.span,
+                    )
+                    .into());
+                };
+                self.assign_object_field(o, field, *op, value, env, stmt.span)
+            }
         }
+    }
+
+    /// Builds a `Rc<ClassValue>` from a `ClassDecl`'s own AST and defines
+    /// it into `env` — no `Any`/`Number` hierarchy yet (`superclass` is
+    /// always `None` here; that lands in a later step of this phase).
+    fn exec_class_decl(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        ctor_params: &[ClassParam],
+        members: &[ClassMember],
+        env: &Env,
+    ) -> Result<(), Flow> {
+        let resolve_ty = |ann: &TypeAnnotation| {
+            crate::types::resolve_type_annotation(ann, &[], &std::collections::HashSet::new())
+        };
+
+        let mut fields = Vec::new();
+        for cp in ctor_params {
+            if let Some(mutable) = cp.field {
+                let ty = cp.param.type_annotation.as_ref().map(resolve_ty).unwrap_or(crate::types::Type::Unknown);
+                fields.push(crate::class::FieldDecl { name: cp.param.name.clone(), ty, mutable });
+            }
+        }
+
+        let mut methods = HashMap::new();
+        let mut constructor_body = Vec::new();
+        for member in members {
+            match member {
+                ClassMember::Property { name, type_annotation, mutable, init, .. } => {
+                    let ty = type_annotation.as_ref().map(resolve_ty).unwrap_or(crate::types::Type::Unknown);
+                    fields.push(crate::class::FieldDecl { name: name.clone(), ty: ty.clone(), mutable: *mutable });
+                    constructor_body.push(crate::class::ConstructorStep::Property {
+                        name: name.clone(),
+                        mutable: *mutable,
+                        ty,
+                        init: init.clone(),
+                    });
+                }
+                ClassMember::Init(stmts) => constructor_body.push(crate::class::ConstructorStep::Init(stmts.clone())),
+                ClassMember::Method(stmt) => {
+                    if let StmtKind::FunDecl { name: mname, name_span: mspan, params, return_type, body, .. } =
+                        &stmt.kind
+                    {
+                        let f = Rc::new(FunctionValue {
+                            name: Some(mname.clone()),
+                            params: params.clone(),
+                            return_type: return_type.clone(),
+                            body: body.clone(),
+                            // The *same* `Env` as the class's own `closure`
+                            // below, not a `child()` of it — see
+                            // `class.rs`'s doc comment on
+                            // `ClassValue::closure` for why this is a
+                            // load-bearing invariant for cycle collection,
+                            // not a stylistic choice.
+                            closure: env.clone(),
+                            file: self.current_file.clone(),
+                            decl_span: *mspan,
+                            resolved_calls: self.current_resolved.clone(),
+                        });
+                        methods.insert(mname.clone(), crate::class::MethodImpl::UserDefined(f));
+                    }
+                }
+            }
+        }
+
+        let class = Rc::new(crate::class::ClassValue {
+            name: Rc::from(name),
+            fields,
+            methods,
+            constructor_params: ctor_params.to_vec(),
+            constructor_body,
+            // Every user class implicitly extends `Any` — real Kotlin
+            // semantics, and what lets `lookup_method` fall through to
+            // `Any`'s native `toString`/`hashCode`/`equals` for a class
+            // that doesn't override them (see `stdlib::BUILTIN_METHODS`'s
+            // doc comment).
+            superclass: Some(self.builtin_classes["Any"].clone()),
+            interfaces: Vec::new(),
+            closure: env.clone(),
+            file: self.current_file.clone(),
+            decl_span: name_span,
+        });
+        self.known_classes.insert(class.name.clone());
+        env.define(name, Value::Class(class), false, crate::types::Type::Unknown);
+        Ok(())
+    }
+
+    /// A bare name's value via the implicit-`this` fallback — real Kotlin
+    /// semantics: inside a class member, a name that isn't a local
+    /// resolves to the enclosing instance's own field of that name, with
+    /// no explicit `this.` needed (`resolver.rs`'s `Resolver::resolve_name`
+    /// mirrors this rule statically). Only ever consulted *after* an
+    /// ordinary local lookup already failed — a local of the same name
+    /// always shadows a field, exactly like Kotlin. `None` both when
+    /// there's no enclosing `this` at all (not inside a class member) and
+    /// when there's no field by this name — the caller can't tell these
+    /// apart and doesn't need to; either way, the name is genuinely
+    /// undefined.
+    fn implicit_this_field(&self, env: &Env, name: &str) -> Option<Value> {
+        match env.get("this") {
+            Some(Value::Object(o)) => o.borrow().fields.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Field mutability + type check + write, given an already-computed
+    /// new value — the common tail shared by `assign_object_field` (once
+    /// it's evaluated the RHS/compound-op) and `ExprKind::IncDec`'s own
+    /// implicit-`this` fallback (which computes its `+1`/`-1` result
+    /// directly, with no separate value expression to evaluate).
+    fn write_object_field(
+        &self,
+        o: &crate::gc::GcRef<crate::class::ObjectData>,
+        field: &str,
+        new_val: Value,
+        span: Span,
+    ) -> Result<(), Flow> {
+        let class = o.borrow().class.clone();
+        let Some(decl) = class.fields.iter().find(|f| f.name == field) else {
+            return Err(RuntimeError::new(format!("'{}' has no field '{field}'", class.name), span).into());
+        };
+        if !decl.mutable {
+            return Err(RuntimeError::new(format!("cannot reassign val '{field}'"), span).into());
+        }
+        let actual = crate::types::Type::from_value(&new_val);
+        if decl.ty != crate::types::Type::Unknown && !crate::types::is_assignable(&actual, &decl.ty) {
+            return Err(RuntimeError::new(
+                format!("type mismatch: expected {}, got {}", decl.ty.name(), actual.name()),
+                span,
+            )
+            .into());
+        }
+        o.borrow_mut().fields.insert(field.to_string(), new_val);
+        Ok(())
+    }
+
+    /// `receiver.field op= value` (or plain `=`) once `receiver` has
+    /// already evaluated to a real object — shared by `StmtKind::
+    /// FieldAssign` (a real, explicit `receiver` expression) and
+    /// `StmtKind::Assign`'s implicit-`this` fallback (`receiver` is always
+    /// `this` there, found via `implicit_this_field`'s identical
+    /// local-shadows-field rule).
+    fn assign_object_field(
+        &mut self,
+        o: &crate::gc::GcRef<crate::class::ObjectData>,
+        field: &str,
+        op: AssignOp,
+        value: &Expr,
+        env: &Env,
+        span: Span,
+    ) -> Result<(), Flow> {
+        let new_val = if op == AssignOp::Set {
+            self.eval_expr(value, env)?
+        } else {
+            let class = o.borrow().class.clone();
+            let cur = o
+                .borrow()
+                .fields
+                .get(field)
+                .cloned()
+                .ok_or_else(|| RuntimeError::new(format!("'{}' has no field '{field}'", class.name), span))?;
+            let rhs = self.eval_expr(value, env)?;
+            let bop = match op {
+                AssignOp::Add => BinaryOp::Add,
+                AssignOp::Sub => BinaryOp::Sub,
+                AssignOp::Mul => BinaryOp::Mul,
+                AssignOp::Div => BinaryOp::Div,
+                AssignOp::Rem => BinaryOp::Rem,
+                AssignOp::Set => unreachable!(),
+            };
+            apply_binary(&self.gc, bop, cur, rhs, span)?
+        };
+        self.write_object_field(o, field, new_val, span)
     }
 
     fn eval_expr(&mut self, expr: &Expr, env: &Env) -> Result<Value, Flow> {
@@ -520,15 +746,18 @@ impl<'a> Interpreter<'a> {
                         StringPart::Text(t) => s.push_str(t),
                         StringPart::Expr(e) => {
                             let v = self.eval_expr(e, env)?;
-                            s.push_str(&v.to_string());
+                            s.push_str(&self.value_to_display_string(&v, expr.span)?);
                         }
                     }
                 }
                 Ok(Value::str(s))
             }
-            ExprKind::Name(name) => env
-                .get(name)
-                .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span).into()),
+            ExprKind::Name(name) => match env.get(name) {
+                Some(v) => Ok(v),
+                None => self
+                    .implicit_this_field(env, name)
+                    .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span).into()),
+            },
             ExprKind::FieldAccess { receiver, field, safe, .. } => {
                 if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
                     let mut full_path = path;
@@ -554,6 +783,21 @@ impl<'a> Interpreter<'a> {
                         expr.span,
                     )
                     .into());
+                }
+                if let Value::Object(o) = &recv {
+                    let data = o.borrow();
+                    return match data.fields.get(field) {
+                        Some(v) => Ok(v.clone()),
+                        None => {
+                            // `type_name()` can't carry a dynamic class
+                            // name (`&'static str` only) — read the real
+                            // one directly off the object instead of
+                            // reporting the generic "'Object'" placeholder.
+                            let class_name = data.class.name.clone();
+                            drop(data);
+                            Err(RuntimeError::new(format!("'{class_name}' has no field '{field}'"), expr.span).into())
+                        }
+                    };
                 }
                 Err(RuntimeError::new(
                     format!("'{}' has no field '{field}'", recv.type_name()),
@@ -584,9 +828,32 @@ impl<'a> Interpreter<'a> {
                     )
                     .into());
                 }
-                let arg_values: Vec<Value> =
-                    self.eval_args(args, env)?.into_iter().map(|(_, v)| v).collect();
-                crate::stdlib::call_builtin_method(recv, method, arg_values, expr.span)
+                // Kept as `(Option<String>, Value)` pairs, not flattened to
+                // positional-only, until it's clear which dispatch this
+                // call needs: a `MethodImpl::UserDefined` method binds
+                // named arguments by name via `bind_params`, exactly like
+                // an ordinary function call — flattening here first (an
+                // earlier version of this code did, unconditionally) threw
+                // that away, silently reordering `obj.m(b = 1, a = 2)`'s
+                // arguments to positional instead of really matching them
+                // by name, a real static/runtime divergence since the
+                // resolver already checks named arguments correctly.
+                let named_arg_values: Vec<(Option<String>, Value)> = self.eval_args(args, env)?;
+                if let Value::Object(o) = &recv {
+                    let class = o.borrow().class.clone();
+                    return match crate::class::lookup_method(&class, method) {
+                        Some((_, crate::class::MethodImpl::UserDefined(f))) => {
+                            self.call_method(f, recv.clone(), named_arg_values, expr.span)
+                        }
+                        Some((_, crate::class::MethodImpl::Native(native))) => {
+                            let arg_values: Vec<Value> = named_arg_values.into_iter().map(|(_, v)| v).collect();
+                            (native)(self, recv.clone(), arg_values, expr.span)
+                        }
+                        None => Err(RuntimeError::new(format!("'{}' has no method '{method}'", class.name), expr.span).into()),
+                    };
+                }
+                let arg_values: Vec<Value> = named_arg_values.into_iter().map(|(_, v)| v).collect();
+                crate::stdlib::call_builtin_method(self, recv, method, arg_values, expr.span)
             }
             ExprKind::Unary { op, expr: inner } => {
                 let v = self.eval_expr(inner, env)?;
@@ -614,24 +881,43 @@ impl<'a> Interpreter<'a> {
                 // `StmtKind::Assign`'s `+=`/`-=` already goes through, so
                 // `Int`/`Double` widening and mutability/type-mismatch
                 // errors behave identically to the equivalent compound
-                // assignment.
-                let cur = env
-                    .get(name)
-                    .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span))?;
+                // assignment. Same local-shadows-field implicit-`this`
+                // fallback as `StmtKind::Assign` when there's no local by
+                // this name at all.
                 let bop = match op {
                     IncDecOp::Inc => BinaryOp::Add,
                     IncDecOp::Dec => BinaryOp::Sub,
                 };
-                let new_val = apply_binary(&self.gc, bop, cur.clone(), Value::Int(1), expr.span)?;
-                env.assign(name, new_val.clone()).map_err(|e| match e {
-                    AssignError::Undefined => RuntimeError::new(format!("undefined name '{name}'"), expr.span),
-                    AssignError::NotMutable => RuntimeError::new(format!("cannot reassign val '{name}'"), expr.span),
-                    AssignError::TypeMismatch(actual, expected) => RuntimeError::new(
-                        format!("type mismatch: expected {}, got {}", expected.name(), actual.name()),
-                        expr.span,
-                    ),
-                })?;
-                Ok(if *prefix { new_val } else { cur })
+                match env.get(name) {
+                    Some(cur) => {
+                        let new_val = apply_binary(&self.gc, bop, cur.clone(), Value::Int(1), expr.span)?;
+                        env.assign(name, new_val.clone()).map_err(|e| match e {
+                            AssignError::Undefined => RuntimeError::new(format!("undefined name '{name}'"), expr.span),
+                            AssignError::NotMutable => {
+                                RuntimeError::new(format!("cannot reassign val '{name}'"), expr.span)
+                            }
+                            AssignError::TypeMismatch(actual, expected) => RuntimeError::new(
+                                format!("type mismatch: expected {}, got {}", expected.name(), actual.name()),
+                                expr.span,
+                            ),
+                        })?;
+                        Ok(if *prefix { new_val } else { cur })
+                    }
+                    None => {
+                        let Some(Value::Object(o)) = env.get("this") else {
+                            return Err(RuntimeError::new(format!("undefined name '{name}'"), expr.span).into());
+                        };
+                        let cur = o
+                            .borrow()
+                            .fields
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span))?;
+                        let new_val = apply_binary(&self.gc, bop, cur.clone(), Value::Int(1), expr.span)?;
+                        self.write_object_field(&o, name, new_val.clone(), expr.span)?;
+                        Ok(if *prefix { new_val } else { cur })
+                    }
+                }
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 if *op == BinaryOp::And {
@@ -670,6 +956,34 @@ impl<'a> Interpreter<'a> {
                 }
             }
             ExprKind::Call { callee, args } => {
+                // Implicit `this`: a bare call whose name isn't a local at
+                // all (never a local that merely turns out uncallable —
+                // that still falls through to the ordinary path below,
+                // matching real Kotlin's shadowing) dispatches to
+                // `this.name(...)` when the enclosing instance's class has
+                // a method by that name — mirrors `MethodCall`'s own
+                // `Value::Object` branch exactly, including real
+                // named-argument binding.
+                if let ExprKind::Name(name) = &callee.kind {
+                    if env.get(name).is_none() {
+                        if let Some(Value::Object(o)) = env.get("this") {
+                            let class = o.borrow().class.clone();
+                            if let Some((_, m)) = crate::class::lookup_method(&class, name) {
+                                let named_arg_values: Vec<(Option<String>, Value)> = self.eval_args(args, env)?;
+                                return match m {
+                                    crate::class::MethodImpl::UserDefined(f) => {
+                                        self.call_method(f, Value::Object(o.clone()), named_arg_values, expr.span)
+                                    }
+                                    crate::class::MethodImpl::Native(native) => {
+                                        let arg_values: Vec<Value> =
+                                            named_arg_values.into_iter().map(|(_, v)| v).collect();
+                                        (native)(self, Value::Object(o.clone()), arg_values, expr.span)
+                                    }
+                                };
+                            }
+                        }
+                    }
+                }
                 let callee_val = self.eval_expr(callee, env)?;
                 let arg_values = self.eval_args(args, env)?;
                 // Fast path: the resolver already picked exactly one
@@ -734,6 +1048,15 @@ impl<'a> Interpreter<'a> {
                     Ok(l)
                 }
             }
+            // `this` is bound as an ordinary `env` entry — by
+            // `construct_object` (constructor/`init`/property-initializer
+            // scope) and `call_function_inner`'s own `this` parameter (a
+            // method call) — so a plain lookup is all this needs. The
+            // parser's own `class_member_depth` check already rejects
+            // `this` everywhere else at parse time.
+            ExprKind::This => env
+                .get("this")
+                .ok_or_else(|| RuntimeError::new("'this' is not bound here", expr.span).into()),
         }
     }
 
@@ -782,6 +1105,7 @@ impl<'a> Interpreter<'a> {
             }
             Value::Function(f) => self.call_function(&f, args, span),
             Value::Overload(group) => self.call_overload(&group, args, span),
+            Value::Class(c) => self.construct_object(&c, args, span),
             other => Err(RuntimeError::new(format!("'{}' is not callable", other.type_name()), span).into()),
         }
     }
@@ -861,6 +1185,52 @@ impl<'a> Interpreter<'a> {
         args: Vec<(Option<String>, Value)>,
         span: Span,
     ) -> Result<Value, Flow> {
+        self.call_function_with_this(f, None, args, span)
+    }
+
+    /// A method call — same as `call_function`, plus `this` bound in the
+    /// call's own scope before its parameters are.
+    pub(crate) fn call_method(
+        &mut self,
+        f: &FunctionValue,
+        this: Value,
+        args: Vec<(Option<String>, Value)>,
+        span: Span,
+    ) -> Result<Value, Flow> {
+        self.call_function_with_this(f, Some(this), args, span)
+    }
+
+    /// Renders `v` for `println`/`print`/string-interpolation — matches
+    /// Kotlin's own `println`, which always calls `toString()`: a
+    /// `Value::Object` whose class (or superclass chain, once that exists)
+    /// defines `toString` calls the real method; every other case
+    /// (including an object with no `toString` of its own — e.g. always,
+    /// before the `Any` hierarchy lands in a later step) falls back to the
+    /// same identity-based `Display` rendering as before.
+    pub(crate) fn value_to_display_string(&mut self, v: &Value, span: Span) -> Result<String, Flow> {
+        if let Value::Object(o) = v {
+            let class = o.borrow().class.clone();
+            if let Some((_, m)) = crate::class::lookup_method(&class, "toString") {
+                let result = match m {
+                    crate::class::MethodImpl::UserDefined(f) => self.call_method(f, v.clone(), Vec::new(), span)?,
+                    crate::class::MethodImpl::Native(native) => (native)(self, v.clone(), Vec::new(), span)?,
+                };
+                return Ok(result.to_string());
+            }
+        }
+        Ok(v.to_string())
+    }
+
+    /// The real shared tail `call_function`/`call_method` are both thin
+    /// wrappers over — push-frame/swap-file/restore/pop-frame happens
+    /// exactly once here, regardless of which one called it.
+    fn call_function_with_this(
+        &mut self,
+        f: &FunctionValue,
+        this: Option<Value>,
+        args: Vec<(Option<String>, Value)>,
+        span: Span,
+    ) -> Result<Value, Flow> {
         self.push_frame(function_signature(f), f.file.clone(), span);
         // Swapped for the duration of this call — a nested `fun`/lambda
         // declared *inside* `f`'s own body must be stamped with `f`'s own
@@ -872,7 +1242,7 @@ impl<'a> Interpreter<'a> {
         // context, not part of the call-stack/error-reporting mechanism.
         let caller_file = std::mem::replace(&mut self.current_file, f.file.clone());
         let caller_resolved = std::mem::replace(&mut self.current_resolved, f.resolved_calls.clone());
-        let result = self.call_function_inner(f, args, span);
+        let result = self.call_function_inner(f, this, args, span);
         self.current_file = caller_file;
         self.current_resolved = caller_resolved;
         if result.is_ok() {
@@ -884,56 +1254,21 @@ impl<'a> Interpreter<'a> {
     fn call_function_inner(
         &mut self,
         f: &FunctionValue,
+        this: Option<Value>,
         args: Vec<(Option<String>, Value)>,
         span: Span,
     ) -> Result<Value, Flow> {
         let call_env = f.closure.child();
+        if let Some(this) = this {
+            call_env.define("this", this, false, crate::types::Type::Unknown);
+        }
 
         // Implicit `it` parameter: a lambda declared with no explicit
         // parameter list, called with exactly one argument.
         if f.params.is_empty() && f.name.is_none() && args.len() == 1 {
             call_env.define("it", args.into_iter().next().unwrap().1, false, crate::types::Type::Unknown);
         } else {
-            if args.len() > f.params.len() {
-                return Err(RuntimeError::new(
-                    format!(
-                        "too many arguments: expected at most {}, got {}",
-                        f.params.len(),
-                        args.len()
-                    ),
-                    span,
-                )
-                .into());
-            }
-            let mut named: HashMap<String, Value> = HashMap::new();
-            let mut positional: Vec<Value> = Vec::new();
-            for (name, v) in args {
-                match name {
-                    Some(n) => {
-                        if !f.params.iter().any(|p| p.name == n) {
-                            return Err(RuntimeError::new(format!("unknown parameter '{n}'"), span).into());
-                        }
-                        named.insert(n, v);
-                    }
-                    None => positional.push(v),
-                }
-            }
-            let mut positional_iter = positional.into_iter();
-            for p in &f.params {
-                let v = if let Some(v) = named.remove(&p.name) {
-                    v
-                } else if let Some(v) = positional_iter.next() {
-                    v
-                } else if let Some(default) = &p.default {
-                    self.eval_expr(default, &call_env)?
-                } else {
-                    return Err(RuntimeError::new(format!("missing argument '{}'", p.name), span).into());
-                };
-                if let Some(ann) = &p.type_annotation {
-                    check_type(ann, &v, span)?;
-                }
-                call_env.define(&p.name, v, false, crate::types::Type::Unknown);
-            }
+            self.bind_params(&f.params, args, &call_env, span)?;
         }
 
         let result = match &f.body {
@@ -945,9 +1280,111 @@ impl<'a> Interpreter<'a> {
             },
         }?;
         if let Some(ann) = &f.return_type {
-            check_type(ann, &result, span)?;
+            self.check_type(ann, &result, span)?;
         }
         Ok(result)
+    }
+
+    /// Binds `args` to `params` into `env` — named/positional/defaults,
+    /// each checked against its own type annotation if it has one. Shared
+    /// by an ordinary call (`call_function_inner`) and constructing an
+    /// object (`construct_object`), which binds a class's constructor
+    /// parameters the exact same way.
+    fn bind_params(
+        &mut self,
+        params: &[Param],
+        args: Vec<(Option<String>, Value)>,
+        env: &Env,
+        span: Span,
+    ) -> Result<(), Flow> {
+        if args.len() > params.len() {
+            return Err(RuntimeError::new(
+                format!("too many arguments: expected at most {}, got {}", params.len(), args.len()),
+                span,
+            )
+            .into());
+        }
+        let mut named: HashMap<String, Value> = HashMap::new();
+        let mut positional: Vec<Value> = Vec::new();
+        for (name, v) in args {
+            match name {
+                Some(n) => {
+                    if !params.iter().any(|p| p.name == n) {
+                        return Err(RuntimeError::new(format!("unknown parameter '{n}'"), span).into());
+                    }
+                    named.insert(n, v);
+                }
+                None => positional.push(v),
+            }
+        }
+        let mut positional_iter = positional.into_iter();
+        for p in params {
+            let v = if let Some(v) = named.remove(&p.name) {
+                v
+            } else if let Some(v) = positional_iter.next() {
+                v
+            } else if let Some(default) = &p.default {
+                self.eval_expr(default, env)?
+            } else {
+                return Err(RuntimeError::new(format!("missing argument '{}'", p.name), span).into());
+            };
+            if let Some(ann) = &p.type_annotation {
+                self.check_type(ann, &v, span)?;
+            }
+            env.define(&p.name, v, false, crate::types::Type::Unknown);
+        }
+        Ok(())
+    }
+
+    /// Constructs an instance of `class` — binds its constructor
+    /// parameters (mirroring an ordinary call, see `bind_params`),
+    /// promotes any `val`/`var` ones to fields, binds `this` to the new
+    /// (still being built) object, then runs `constructor_body` in source
+    /// order (a property initializer's own `init` expression, or an
+    /// `init { ... }` block — both can see previously-initialized fields
+    /// and earlier constructor parameters via `this`, matching Kotlin).
+    fn construct_object(
+        &mut self,
+        class: &Rc<crate::class::ClassValue>,
+        args: Vec<(Option<String>, Value)>,
+        span: Span,
+    ) -> Result<Value, Flow> {
+        let ctor_env = class.closure.child();
+        let params: Vec<Param> = class.constructor_params.iter().map(|cp| cp.param.clone()).collect();
+        self.bind_params(&params, args, &ctor_env, span)?;
+
+        let mut fields = HashMap::new();
+        for cp in &class.constructor_params {
+            if cp.field.is_some() {
+                let v = ctor_env.get(&cp.param.name).expect("bind_params just defined this name");
+                fields.insert(cp.param.name.clone(), v);
+            }
+        }
+
+        let object = crate::gc::GcRef::new(self.gc.clone(), crate::class::ObjectData { class: class.clone(), fields });
+        let this_value = Value::Object(object.clone());
+        ctor_env.define("this", this_value.clone(), false, crate::types::Type::Unknown);
+
+        for step in &class.constructor_body {
+            match step {
+                crate::class::ConstructorStep::Property { name, init, .. } => {
+                    let v = self.eval_expr(init, &ctor_env)?;
+                    object.borrow_mut().fields.insert(name.clone(), v);
+                }
+                crate::class::ConstructorStep::Init(stmts) => {
+                    let init_env = ctor_env.child();
+                    match self.exec_block(stmts, &init_env) {
+                        Ok(_) => {}
+                        Err(Flow::Return(_)) => {
+                            return Err(RuntimeError::new("'return' is not allowed inside 'init'", span).into())
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+
+        Ok(this_value)
     }
 }
 
@@ -977,15 +1414,15 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
 /// Checks a value against a source-level type annotation — a thin wrapper
 /// over `types::resolve_type_annotation`/`Type::from_value`/`is_assignable`
 /// shared with the resolver's static checks (see `docs/roadmap.md`'s
-/// type-system phase). No generic-parameter/known-class context is
-/// threaded through here (both always empty today, same as the resolver's
-/// — see `types::resolve_type_hint`'s doc comment; once classes exist, the
-/// interpreter will need its own live class-name lookup to pass through
-/// here instead of an always-empty set, so a real class name doesn't
-/// start being rejected as "unknown" at runtime). Returns the resolved
-/// `Type` on success, so a caller (e.g. `ValDecl`) that needs it for the
-/// binding's own declared type doesn't have to resolve the annotation a
-/// second time.
+/// type-system phase). No generic-parameter context is threaded through
+/// here (always empty today, same as the resolver's — see
+/// `types::resolve_type_hint`'s doc comment); `known_classes` **is** real —
+/// see `Interpreter::known_classes`'s own doc comment for why the
+/// interpreter's version is necessarily a running accumulation, not a
+/// predpass like the resolver's own field of the same name. Returns the
+/// resolved `Type` on success, so a caller (e.g. `ValDecl`) that needs it
+/// for the binding's own declared type doesn't have to resolve the
+/// annotation a second time.
 ///
 /// A bare name that doesn't resolve to anything known is itself an error
 /// here — a typo or a reference to a type this interpreter doesn't have
@@ -997,8 +1434,14 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
 /// leniency as everywhere else an inner type can't be pinned down; the
 /// resolver's own static check is the one that flags every bad name
 /// precisely (see `resolve_type_annotation_here`).
-fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span) -> Result<crate::types::Type, Flow> {
-    let expected = crate::types::resolve_type_annotation(annotation, &[], &std::collections::HashSet::new());
+impl<'a> Interpreter<'a> {
+    fn check_type(&self, annotation: &TypeAnnotation, v: &Value, span: Span) -> Result<crate::types::Type, Flow> {
+        check_type(annotation, v, span, &self.known_classes)
+    }
+}
+
+fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span, known_classes: &HashSet<Rc<str>>) -> Result<crate::types::Type, Flow> {
+    let expected = crate::types::resolve_type_annotation(annotation, &[], known_classes);
     if let Some(name) = top_level_named_name(annotation) {
         let unresolved = match &expected {
             crate::types::Type::Unknown => true,
@@ -1290,6 +1733,299 @@ mod tests {
             matches!(result, Ok(crate::value::Value::Int(42))),
             "counter() should still work after collect_cycles"
         );
+    }
+
+    fn minimal_class(name: &str, closure: crate::environment::Env) -> std::rc::Rc<crate::class::ClassValue> {
+        std::rc::Rc::new(crate::class::ClassValue {
+            name: std::rc::Rc::from(name),
+            fields: Vec::new(),
+            methods: std::collections::HashMap::new(),
+            constructor_params: Vec::new(),
+            constructor_body: Vec::new(),
+            superclass: None,
+            interfaces: Vec::new(),
+            closure,
+            file: std::sync::Arc::from(std::path::Path::new("<test>")),
+            decl_span: crate::error::Span::default(),
+        })
+    }
+
+    /// The exact scenario `class.rs`'s own doc comments warn about: a
+    /// reference cycle running through two objects' own fields (not
+    /// through any `Env`), which only exists at all because `ObjectData`
+    /// is itself a real `GcRef`-tracked node (see `impl Trace for
+    /// ObjectData`).
+    #[test]
+    fn collect_cycles_reclaims_a_reference_cycle_through_object_fields() {
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        let class = minimal_class("Friend", interp.globals.clone());
+
+        let a = crate::gc::GcRef::new(
+            interp.gc.clone(),
+            crate::class::ObjectData { class: class.clone(), fields: std::collections::HashMap::new() },
+        );
+        let b = crate::gc::GcRef::new(
+            interp.gc.clone(),
+            crate::class::ObjectData { class, fields: std::collections::HashMap::new() },
+        );
+        a.borrow_mut().fields.insert("friend".to_string(), crate::value::Value::Object(b.clone()));
+        b.borrow_mut().fields.insert("friend".to_string(), crate::value::Value::Object(a.clone()));
+
+        // Weak handles only, past this point -- nothing but the a<->b
+        // cycle itself keeps either one alive.
+        let a_handle = a.handle();
+        let b_handle = b.handle();
+        drop(a);
+        drop(b);
+
+        interp.collect_cycles();
+
+        assert!(a_handle.upgrade().is_none(), "a should have been reclaimed");
+        assert!(b_handle.upgrade().is_none(), "b should have been reclaimed");
+    }
+
+    /// A class *value* saved somewhere reachable, with no instance ever
+    /// constructed — its own `closure` must stay reachable and usable.
+    /// (This one happens to pass even without `value_refs`'s `Value::Class`
+    /// edge too, since `class.closure`'s hold on the `Env` is a genuine,
+    /// real `Rc` reference `collect_cycles`'s strong-count accounting sees
+    /// regardless of tracing — a real external anchor from outside the
+    /// registry is never invisible just because nothing traces to it. The
+    /// edge's actual load-bearing case is the *next* test, a purely
+    /// self-referential local class with no external anchor at all.)
+    #[test]
+    fn collect_cycles_keeps_a_saved_classs_closure_reachable() {
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+
+        let local_env = interp.globals.child();
+        let class = minimal_class("Local", local_env.clone());
+        local_env.define("Local", crate::value::Value::Class(class.clone()), false, crate::types::Type::Unknown);
+        local_env.define("captured", crate::value::Value::Int(7), false, crate::types::Type::Unknown);
+        drop(local_env);
+
+        // Save the class itself somewhere genuinely reachable from a root
+        // — no instance is ever constructed, matching `val saved: Any =
+        // Local` (naming the class, not calling it).
+        interp.globals.define("savedClass", crate::value::Value::Class(class.clone()), false, crate::types::Type::Unknown);
+        drop(class);
+
+        interp.collect_cycles();
+
+        let saved = interp.globals.get("savedClass").expect("savedClass is defined");
+        let crate::value::Value::Class(c) = saved else { panic!("expected a Value::Class") };
+        let captured = c.closure.get("captured");
+        assert!(matches!(captured, Some(crate::value::Value::Int(7))), "the class's own closure must still be usable after collect_cycles");
+    }
+
+    /// The scenario that actually needs `value_refs`'s `Value::Class` edge:
+    /// a *purely self-referential* local class (`class.closure` points
+    /// back at the very `Env` that names it, with nothing external ever
+    /// anchoring it — mirrors `StmtKind::FunDecl`'s own self-cycle exactly,
+    /// see `collect_cycles_reclaims_a_local_self_referential_closure_
+    /// across_repeated_calls` above for the `fun` version of this same
+    /// test). Without the edge, nothing ever traces *into* this `Env`, so
+    /// `collect_cycles` can never subtract its one purely-internal
+    /// self-reference down to zero, and the registry grows without bound
+    /// across repeated "calls".
+    #[test]
+    fn collect_cycles_reclaims_a_purely_self_referential_local_class() {
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        let baseline = interp.registry_len();
+
+        for _ in 0..50 {
+            let local_env = interp.globals.child();
+            let class = minimal_class("Local", local_env.clone());
+            local_env.define("Local", crate::value::Value::Class(class), false, crate::types::Type::Unknown);
+            drop(local_env);
+            interp.collect_cycles();
+        }
+
+        let len = interp.registry_len();
+        assert_eq!(len, baseline, "registry grew beyond its fixed baseline across repeated calls");
+    }
+
+    // The resolver doesn't understand classes yet (that's a later step of
+    // this phase, §6 step 5) — `val p = Point(1)` would otherwise be
+    // flagged by Phase 2.1's own, already-shipped strictness ("cannot
+    // infer type of 'p'... classes aren't a known symbol to the resolver
+    // yet, so its own type is `Unknown`") before the script ever runs.
+    // `run_bypassing_static_check` (already used elsewhere in this file
+    // for exactly this "exercise the runtime layer ahead of/around the
+    // resolver" situation) skips that gate; `ksl-cli` itself would still
+    // reject these scripts until step 5 lands, which is expected.
+
+    #[test]
+    fn class_constructor_promotes_val_and_var_params_to_fields() {
+        let src = "class Point(val x: Int, var y: Int)\nval p = Point(1, 2)\nprintln(p.x)\nprintln(p.y)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "1\n2\n");
+    }
+
+    #[test]
+    fn class_field_write_through_a_var_ctor_param_works() {
+        let src = "class Point(val x: Int, var y: Int)\nval p = Point(1, 2)\np.y = 9\np.y += 1\nprintln(p.y)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "10\n");
+    }
+
+    #[test]
+    fn class_field_write_through_a_val_ctor_param_is_a_runtime_error() {
+        let err = run_err_bypassing_static_check("class Point(val x: Int)\nval p = Point(1)\np.x = 2");
+        assert!(err.contains("cannot reassign val 'x'"), "{err}");
+    }
+
+    #[test]
+    fn class_method_reads_a_field_via_this() {
+        let src = "class Counter(var count: Int) {\n    fun get(): Int = this.count\n}\nval c = Counter(5)\nprintln(c.get())";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "5\n");
+    }
+
+    #[test]
+    fn class_method_can_mutate_a_field_via_this() {
+        let src =
+            "class Counter(var count: Int) {\n    fun inc() {\n        this.count = this.count + 1\n    }\n}\nval c = Counter(5)\nc.inc()\nc.inc()\nprintln(c.count)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "7\n");
+    }
+
+    #[test]
+    fn class_body_property_initializer_sees_constructor_params() {
+        // `w`/`h` are ordinary bindings in the constructor's own scope
+        // (from `bind_params`), not fields — reading them bare here is
+        // just plain lexical scoping, not implicit `this` (which also
+        // works here for a real *field*, see the other tests below).
+        let src = "class Rect(val w: Int, val h: Int) {\n    val area = w * h\n}\nprintln(Rect(3, 4).area)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "12\n");
+    }
+
+    #[test]
+    fn class_init_block_runs_and_can_set_a_property() {
+        // Explicit `this.message` here, though a bare `message = ...`
+        // would work identically (implicit `this`) — this test's own
+        // point is the `init` block/property interaction, not the
+        // receiver syntax; see `interpreter.rs`'s implicit-`this` tests
+        // below for that.
+        let src =
+            "class Greeter(val name: String) {\n    var message = \"\"\n    init {\n        this.message = \"hi \" + name\n    }\n}\nprintln(Greeter(\"world\").message)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "hi world\n");
+    }
+
+    #[test]
+    fn class_init_block_runs_in_source_order_relative_to_properties() {
+        // Two `init`/property steps, order matters: `b` must see `a`'s
+        // already-set value, not the other way around. `this.a` written
+        // explicitly here purely for clarity — a bare `a` would resolve
+        // identically via implicit `this`.
+        let src =
+            "class C(val x: Int) {\n    var a = x\n    init {\n        this.a = this.a + 1\n    }\n    var b = this.a * 10\n}\nprintln(C(1).b)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "20\n");
+    }
+
+    #[test]
+    fn implicit_this_reads_writes_and_method_calls() {
+        let src = "class C {\n    var visits: Int = 0\n    val a: Int = 5\n    fun foo(): Int = 1\n    fun bar(): Int = foo() + a\n    init {\n        visits = visits + 1\n        visits++\n    }\n    fun getVisits(): Int = visits\n}\nval c = C()\nprintln(c.getVisits())\nprintln(c.bar())";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "2\n6\n");
+    }
+
+    #[test]
+    fn implicit_this_a_local_parameter_shadows_a_same_named_field() {
+        // Real Kotlin's own rule: a local always wins over a field of the
+        // same name — reaching the field from inside `f` would need
+        // `this.x` explicitly.
+        let src = "class Point(val x: Int) {\n    fun f(x: Int): Int = x\n}\nprintln(Point(1).f(99))";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "99\n");
+    }
+
+    #[test]
+    fn implicit_this_reassigning_a_val_field_bare_still_errors() {
+        let err = run_err_bypassing_static_check("class C {\n    val a: Int = 5\n    fun f() {\n        a = 6\n    }\n}\nC().f()");
+        assert!(err.contains("cannot reassign val 'a'"), "{err}");
+    }
+
+    #[test]
+    fn class_instances_are_distinct_by_identity_not_structure() {
+        let src = "class Point(val x: Int)\nprintln(Point(1) == Point(1))\nval p = Point(1)\nprintln(p == p)";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "false\ntrue\n");
+    }
+
+    #[test]
+    fn method_call_binds_named_arguments_by_name_not_position() {
+        // Regression test: an earlier version of `MethodCall`'s runtime
+        // dispatch flattened every argument to positional *before*
+        // `bind_params` ever saw it, silently reordering
+        // `obj.m(b = 1, a = 2)`'s arguments — a real static/runtime
+        // divergence, since the resolver already validates named
+        // arguments correctly for a method call.
+        let src = "class Greeter(val name: String) {\n    fun greet(prefix: String, suffix: String): String = prefix + this.name + suffix\n}\nprintln(Greeter(\"World\").greet(suffix = \"!\", prefix = \"Hi \"))\n";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "Hi World!\n");
+    }
+
+    #[test]
+    fn println_on_an_object_uses_a_real_user_defined_to_string() {
+        // `this.x`/`this.y` written explicitly here purely for clarity —
+        // bare `x`/`y` would resolve identically via implicit `this`
+        // (see this file's own implicit-`this` tests).
+        let src =
+            "class Point(val x: Int, val y: Int) {\n    fun toString(): String = \"(\" + this.x + \", \" + this.y + \")\"\n}\nprintln(Point(1, 2))";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "(1, 2)\n");
+    }
+
+    #[test]
+    fn println_on_an_object_with_no_to_string_falls_back_to_identity_format() {
+        let src = "class Point(val x: Int)\nprintln(Point(1))";
+        let out = run_bypassing_static_check(src).unwrap();
+        assert!(out.starts_with("Point@"), "{out:?}");
+    }
+
+    #[test]
+    fn object_with_no_override_inherits_anys_native_methods_via_explicit_dot_calls() {
+        // No `toString`/`equals`/`hashCode` override at all — these must
+        // still be real, callable methods (not just println's own
+        // separate `value_to_display_string` special-case), found by
+        // walking `Point`'s implicit `superclass: Some(Any)` via
+        // `lookup_method` exactly like a user-defined method would be.
+        let src = "class Point(val x: Int)\nval p = Point(1)\nprintln(p.toString() == p.toString())\nprintln(p.equals(p))\nprintln(p.hashCode() == p.hashCode())\n";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "true\ntrue\ntrue\n");
+    }
+
+    #[test]
+    fn object_equals_is_identity_based_not_structural() {
+        // Two distinct objects with identical fields are still unequal —
+        // `Any.equals`'s default is identity (via `Value::values_equal`'s
+        // `GcRef::ptr_eq` for `Object`), not a field-by-field comparison,
+        // matching real Kotlin's default `equals` for a class with no
+        // override.
+        let src = "class Point(val x: Int)\nprintln(Point(1).equals(Point(1)))\n";
+        assert_eq!(run_bypassing_static_check(src).unwrap(), "false\n");
+    }
+
+    #[test]
+    fn unknown_field_and_method_on_an_object_report_the_real_class_name() {
+        let err = run_err_bypassing_static_check("class Point(val x: Int)\nprintln(Point(1).y)");
+        assert!(err.contains("'Point' has no field 'y'"), "{err}");
+        let err = run_err_bypassing_static_check("class Point(val x: Int)\nPoint(1).bark()");
+        assert!(err.contains("'Point' has no method 'bark'"), "{err}");
+    }
+
+    #[test]
+    fn class_field_reference_cycle_is_reclaimed_by_collect_cycles() {
+        // `a`/`b` are local to `makeCycle`, never returned or stored
+        // anywhere else — the only thing keeping them alive after the call
+        // returns is the `a.other = b; b.other = a` cycle itself, exactly
+        // the `a.friend = b; b.friend = a` scenario `class.rs`'s own
+        // `Trace` impl doc comment describes, now exercised end-to-end
+        // through real class syntax instead of hand-built `ObjectData`.
+        let src = "class Friend {\n    var other: Friend? = null\n}\nfun makeCycle() {\n    val a = Friend()\n    val b = Friend()\n    a.other = b\n    b.other = a\n}\n";
+        let program = crate::parse_only(src).expect("valid syntax");
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+
+        let make_cycle = interp.globals.get("makeCycle").expect("makeCycle is defined");
+        assert!(interp.call_value(make_cycle, Vec::new(), crate::error::Span::default()).is_ok());
+
+        let cleared = interp.collect_cycles();
+        assert!(cleared >= 2, "expected at least the two cyclic Friend objects to be reclaimed, cleared={cleared}");
     }
 
     #[test]
@@ -1612,8 +2348,9 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
 
     #[test]
     fn field_access_on_a_value_with_no_fields_is_a_runtime_error() {
-        // No object system yet (Phase 5) — any `FieldAccess` whose base
-        // isn't a package name is a clear runtime error.
+        // Only `Value::Object` has real fields (Phase 6) — a builtin
+        // receiver whose base isn't a package name is still a clear
+        // runtime error.
         let err = run_err("val s = \"hi\"\nprintln(s.bogus)");
         assert!(err.contains("'String' has no field 'bogus'"), "{err}");
     }

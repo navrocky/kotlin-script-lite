@@ -1,0 +1,60 @@
+// Classes (Phase 6): primary constructor, val/var field promotion,
+// properties, init blocks, methods, `this`, real `toString`/`equals`/
+// `hashCode` inherited from the builtin `Any`, and object identity.
+
+class Point(val x: Int, val y: Int) {
+    var visits = 0
+
+    init {
+        visits = this.visits + 1
+    }
+
+    fun distanceSquared(other: Point): Int {
+        val dx = x - other.x
+        val dy = y - other.y
+        return dx * dx + dy * dy
+    }
+
+    fun toString(): String = "($x,$y)"
+}
+
+val origin = Point(0, 0)
+val p = Point(3, 4)
+
+// Overridden toString() is picked up by println/string interpolation, not
+// just an explicit .toString() call.
+println(p)
+println("p is $p")
+
+println(p.x)
+println(p.y)
+println(p.visits)
+println(p.distanceSquared(origin))
+
+// Named constructor arguments, same rules as an ordinary function call.
+val q = Point(y = 10, x = 5)
+println(q)
+
+// A mutable (var) field can be reassigned through the object.
+p.visits = p.visits + 1
+println(p.visits)
+
+// Object identity: `==`/`equals()` compare by identity, not by field
+// contents, unless a class overrides `equals()` (Point doesn't).
+println(p == p)
+println(p == Point(3, 4))
+println(p.equals(p))
+
+// No user-defined toString()/equals()/hashCode() at all -- inherited
+// straight from the builtin Any, real and callable.
+class Empty
+val e = Empty()
+println(e.equals(e))
+println(e.hashCode() == e.hashCode())
+
+// Plain (non-promoted) constructor parameters are visible bare inside the
+// constructor itself, but never become real fields on the object.
+class Greeting(prefix: String, val name: String) {
+    val text: String = prefix + ", " + name + "!"
+}
+println(Greeting(prefix = "Hello", "World").text)

@@ -350,72 +350,292 @@ fn type_error(name: &str, expected: &str, span: Span) -> Flow {
     RuntimeError::new(format!("{name} expects {expected}"), span).into()
 }
 
-/// `(receiver type, method name, signature, one-line doc)` for every
-/// builtin method `call_builtin_method` dispatches on — the `.`-syntax
-/// counterpart of `STDLIB_PACKAGES`'s `kotlin.text` package, used the same
-/// way for hover/completion in `ksl-lsp` (now filtered by receiver type —
-/// see `ksl-lsp`'s `completion.rs`/`hover.rs`). Deliberately kept as its
-/// own separate table, not folded into `STDLIB_PACKAGES`: it's dispatched
-/// by the *receiver's type*, not by package/namespace — a fundamentally
-/// different lookup axis (every entry below happens to duplicate a
-/// `kotlin.text` function under a `.`-call calling convention, exactly as
-/// `docs/stdlib.md#methods` documents as deliberate). Every entry here is
-/// currently also reachable as a plain stdlib function (`"x".length()` and
-/// `length("x")` both work) — see `call_builtin_method`, which reuses the
-/// same `text::str_*` helpers as `text::populate`'s registrations.
-pub const BUILTIN_METHOD_SIGNATURES: &[(&str, &str, &str, &str)] = &[
-    ("String", "length", "String.length(): Int", "Number of characters in the receiver."),
-    ("String", "uppercase", "String.uppercase(): String", "Uppercases the receiver."),
-    ("String", "lowercase", "String.lowercase(): String", "Lowercases the receiver."),
-    ("String", "trim", "String.trim(): String", "Removes leading and trailing whitespace from the receiver."),
+/// One builtin `.`-method — the `.`-syntax counterpart of a
+/// `BuiltinPackage` member, dispatched by the *receiver's type* (walking
+/// its real builtin-class chain, see `class::builtin_classes`/
+/// `builtin_type_chain`) rather than by package/namespace, a fundamentally
+/// different lookup axis from `STDLIB_PACKAGES`. Kept as its own table for
+/// exactly that reason. `call` is a plain `fn` pointer (not a closure) so
+/// this can live in a `pub const` array, and doubles as the real
+/// `MethodImpl::Native` implementation once `class::builtin_classes` wraps
+/// it — the same function backs both static metadata (hover/completion/
+/// resolver) and runtime dispatch, so they can never drift apart.
+pub struct BuiltinMethod {
+    pub receiver: &'static str,
+    pub symbol: BuiltinSymbol,
+    pub call: fn(&mut Interpreter, Value, Vec<Value>, Span) -> Result<Value, Flow>,
+}
+
+/// Every builtin `.`-method ksl provides — `String`'s own methods (also
+/// reachable as plain `kotlin.text` functions, see `text::populate`) plus
+/// `Any`'s three universal methods (`toString`/`hashCode`/`equals`),
+/// inherited by every other builtin type and every user class via the real
+/// superclass chain (`class::builtin_classes`, `exec_class_decl`'s
+/// `superclass: Some(Any)`) — neither `Int`/`Double`/`Boolean`/`List`/
+/// `Unit` nor a plain user class needs its own override entry here: `Any`'s
+/// implementations are written to branch correctly on any `Value` they're
+/// given (structural for a primitive/list, identity-based for an
+/// `Object`).
+pub const BUILTIN_METHODS: &[BuiltinMethod] = &[
+    BuiltinMethod {
+        receiver: "String",
+        symbol: BuiltinSymbol {
+            name: "length",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::Int,
+            doc: "Number of characters in the receiver.",
+        },
+        call: string_length,
+    },
+    BuiltinMethod {
+        receiver: "String",
+        symbol: BuiltinSymbol {
+            name: "uppercase",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::String,
+            doc: "Uppercases the receiver.",
+        },
+        call: string_uppercase,
+    },
+    BuiltinMethod {
+        receiver: "String",
+        symbol: BuiltinSymbol {
+            name: "lowercase",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::String,
+            doc: "Lowercases the receiver.",
+        },
+        call: string_lowercase,
+    },
+    BuiltinMethod {
+        receiver: "String",
+        symbol: BuiltinSymbol {
+            name: "trim",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::String,
+            doc: "Removes leading and trailing whitespace from the receiver.",
+        },
+        call: string_trim,
+    },
+    BuiltinMethod {
+        receiver: "Any",
+        symbol: BuiltinSymbol {
+            name: "toString",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::String,
+            doc: "A string representation of the receiver.",
+        },
+        call: any_to_string,
+    },
+    BuiltinMethod {
+        receiver: "Any",
+        symbol: BuiltinSymbol {
+            name: "hashCode",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::Int,
+            doc: "A hash code consistent with equals: equal values always report the same hashCode.",
+        },
+        call: any_hash_code,
+    },
+    BuiltinMethod {
+        receiver: "Any",
+        symbol: BuiltinSymbol {
+            name: "equals",
+            kind: SymbolKind::Fun,
+            params: &[BuiltinParam { name: "other", ty: Type::Any, nullable: true, default: None }],
+            variadic_param: None,
+            return_type: Type::Bool,
+            doc: "Structural equality for primitives/lists, identity for objects — the same rule '==' uses.",
+        },
+        call: any_equals,
+    },
 ];
+
+/// The static ancestor chain (own type name first, then each supertype in
+/// order, ending at `"Any"`) for a builtin type name — the resolver/
+/// `ksl-lsp`'s side of the same `Int`/`Double` -> `Number` -> `Any`, other
+/// builtins -> `Any` hierarchy `class::builtin_classes` builds as real
+/// `ClassValue`s at runtime, needed here too since neither the resolver nor
+/// `ksl-lsp` ever constructs an `Interpreter`. Returns an empty `Vec` for a
+/// name that isn't a builtin type at all (a user class name, or garbage) —
+/// callers already treat "not found anywhere in the chain" as `Unknown`/
+/// "no method", so an empty chain naturally falls out the same way.
+pub fn builtin_type_chain(receiver_type: &str) -> Vec<&'static str> {
+    let canonical: &'static str = match receiver_type {
+        "Int" => "Int",
+        "Double" => "Double",
+        "Boolean" => "Boolean",
+        "String" => "String",
+        "List" => "List",
+        "Unit" => "Unit",
+        "Number" => "Number",
+        "Any" => "Any",
+        _ => return Vec::new(),
+    };
+    let mut chain = vec![canonical];
+    let mut current = canonical;
+    while current != "Any" {
+        current = match current {
+            "Int" | "Double" => "Number",
+            _ => "Any",
+        };
+        chain.push(current);
+    }
+    chain
+}
 
 /// The static return type of a builtin `.`-method call, given its
 /// receiver's own statically known type — used by `resolver.rs`'s
 /// `walk_expr` (`MethodCall` inference) to type-check chained/nested
-/// method calls and their results. Hand-maintained separately from
-/// `BUILTIN_METHOD_SIGNATURES` (whose `signature` field is a free-text
-/// display string, not machine-readable); `(type, method)` pairs not
-/// listed here resolve to `Type::Unknown`, same as an unrecognized name
-/// anywhere else in this type system.
+/// method calls and their results. Walks `builtin_type_chain` so e.g.
+/// `"x".toString()` (a `String`, inheriting `Any`'s `toString`) resolves
+/// correctly rather than only an exact-receiver match. `(type, method)`
+/// pairs not found anywhere in the chain resolve to `Type::Unknown`, same
+/// as an unrecognized name anywhere else in this type system.
 pub fn builtin_method_return_type(receiver_type: &str, method: &str) -> Type {
-    match (receiver_type, method) {
-        ("String", "length") => Type::Int,
-        ("String", "uppercase" | "lowercase" | "trim") => Type::String,
-        _ => Type::Unknown,
+    builtin_method_signature(receiver_type, method).map(|(ret, ..)| ret).unwrap_or(Type::Unknown)
+}
+
+/// `(return type, param types, param names, param docs)` — the same shape
+/// `resolver.rs`'s own private `CallSignature` alias names, exposed here
+/// too since `builtin_method_signature` needs to return it across the
+/// crate boundary.
+pub type MethodSignature = (Type, Vec<Type>, Vec<String>, Vec<Option<String>>);
+
+/// Every parameter's real type/name/doc for a builtin method — the
+/// `.`-method counterpart of `stdlib_call_types`, giving `resolver.rs` a
+/// full checkable signature (not just a return type), so a method call's
+/// arguments — including named ones — get exactly the same checking a
+/// qualified/plain stdlib call already gets (see `resolver.rs`'s
+/// `class_method_signature`, which builds on this for both a real builtin
+/// receiver and a user class falling through to `Any`). Walks
+/// `builtin_type_chain` exactly like `builtin_method_return_type`, which is
+/// now just this function's return-type projection.
+pub fn builtin_method_signature(receiver_type: &str, method: &str) -> Option<MethodSignature> {
+    for rt in builtin_type_chain(receiver_type) {
+        if let Some(m) = BUILTIN_METHODS.iter().find(|m| m.receiver == rt && m.symbol.name == method) {
+            let param_types = m.symbol.params.iter().map(BuiltinParam::real_type).collect();
+            let param_names = m.symbol.params.iter().map(|p| p.name.to_string()).collect();
+            let param_docs = vec![None; m.symbol.params.len()];
+            return Some((m.symbol.return_type.clone(), param_types, param_names, param_docs));
+        }
     }
+    None
 }
 
 /// Dispatches a `.`-call (`receiver.method(args)`) once `receiver` has
 /// already evaluated to a real value — the counterpart of `parse_postfix`
-/// producing `ExprKind::MethodCall` for `receiver.method(...)` syntax. Only
-/// a handful of `String` methods exist so far (mirroring the equivalent
-/// plain stdlib functions); every other `(type, method)` pair is a runtime
-/// error until Phase 5 (classes) and Phase 7 (extension functions) give
-/// this real per-type dispatch.
-pub fn call_builtin_method(receiver: Value, method: &str, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
-    match (&receiver, method) {
-        (Value::Str(s), "length") => {
-            expect_no_args(method, &args, span)?;
-            Ok(text::str_length(s))
+/// producing `ExprKind::MethodCall` for `receiver.method(...)` syntax.
+/// Walks `interp.builtin_classes`' real superclass chain via
+/// `class::lookup_method`, exactly like `Value::Object` method dispatch
+/// does in `interpreter.rs` — this is what lets `5.toString()`/
+/// `"x".equals("x")`/etc. find `Any`'s methods without every builtin type
+/// needing its own duplicate entry in `BUILTIN_METHODS`.
+pub fn call_builtin_method(interp: &mut Interpreter, receiver: Value, method: &str, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    let receiver_type = receiver.type_name();
+    if let Some(class) = interp.builtin_classes.get(receiver_type).cloned() {
+        if let Some((_, m)) = crate::class::lookup_method(&class, method) {
+            return match m {
+                crate::class::MethodImpl::Native(native) => (native)(interp, receiver, args, span),
+                crate::class::MethodImpl::UserDefined(_) => {
+                    unreachable!("builtin classes only ever register Native methods")
+                }
+            };
         }
-        (Value::Str(s), "uppercase") => {
-            expect_no_args(method, &args, span)?;
-            Ok(text::str_uppercase(s))
+    }
+    Err(RuntimeError::new(format!("'{receiver_type}' has no method '{method}'"), span).into())
+}
+
+fn string_length(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("length", &args, span)?;
+    let Value::Str(s) = &this else { unreachable!("dispatched only for String receivers") };
+    Ok(text::str_length(s))
+}
+
+fn string_uppercase(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("uppercase", &args, span)?;
+    let Value::Str(s) = &this else { unreachable!("dispatched only for String receivers") };
+    Ok(text::str_uppercase(s))
+}
+
+fn string_lowercase(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("lowercase", &args, span)?;
+    let Value::Str(s) = &this else { unreachable!("dispatched only for String receivers") };
+    Ok(text::str_lowercase(s))
+}
+
+fn string_trim(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("trim", &args, span)?;
+    let Value::Str(s) = &this else { unreachable!("dispatched only for String receivers") };
+    Ok(text::str_trim(s))
+}
+
+/// `Any.toString()`'s default — reuses `Value`'s own `Display` impl
+/// directly, which already does the right thing for every kind of value:
+/// plain formatting for a primitive/list, `"ClassName@addr"` identity
+/// formatting for a `Value::Object` (see `value.rs`'s `Display` impl).
+fn any_to_string(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("toString", &args, span)?;
+    Ok(Value::str(this.to_string()))
+}
+
+/// `Any.hashCode()`'s default — identity (the object's own `GcRef` address)
+/// for a `Value::Object`, a real structural hash (see `value_hash`) for
+/// everything else. Consistent with `any_equals`: equal values (by
+/// `values_equal`) always report the same hash code.
+fn any_hash_code(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("hashCode", &args, span)?;
+    Ok(Value::Int(value_hash(&this)))
+}
+
+/// `Any.equals(other)`'s default — reuses `Value::values_equal` directly
+/// (structural for primitives/lists, identity via `GcRef::ptr_eq` for
+/// objects), the exact same rule `==` already uses. A distinct user
+/// override of `equals` is a real, separate `MethodImpl::UserDefined` on
+/// that class, taking precedence via `class::lookup_method` — this is only
+/// ever reached as the inherited fallback.
+fn any_equals(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    if args.len() != 1 {
+        return Err(arity_error("equals", "1", args.len(), span));
+    }
+    Ok(Value::Bool(Value::values_equal(&this, &args[0])))
+}
+
+/// A real, deterministic (within one process) structural hash for any
+/// value — the shared basis for `any_hash_code`'s non-`Object` case. Not
+/// required to match real Kotlin's own `hashCode` bit-for-bit (nothing in
+/// ksl reads a hash across processes/runs), only to be internally
+/// consistent with `values_equal`.
+fn value_hash(v: &Value) -> i64 {
+    use std::hash::{Hash, Hasher};
+    match v {
+        Value::Int(i) => *i,
+        Value::Double(d) => d.to_bits() as i64,
+        Value::Bool(b) => *b as i64,
+        Value::Str(s) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut hasher);
+            hasher.finish() as i64
         }
-        (Value::Str(s), "lowercase") => {
-            expect_no_args(method, &args, span)?;
-            Ok(text::str_lowercase(s))
-        }
-        (Value::Str(s), "trim") => {
-            expect_no_args(method, &args, span)?;
-            Ok(text::str_trim(s))
-        }
-        _ => Err(RuntimeError::new(
-            format!("'{}' has no method '{method}'", receiver.type_name()),
-            span,
-        )
-        .into()),
+        Value::List(l) => l.borrow().iter().fold(1i64, |acc, item| acc.wrapping_mul(31).wrapping_add(value_hash(item))),
+        Value::Object(o) => o.addr() as i64,
+        // Unit/Null/Function/Native/Class/Overload: no meaningful
+        // structural content to hash — a fixed constant is still
+        // consistent with `values_equal` (nothing compares equal to a
+        // different one of these that would need a different hash).
+        _ => 0,
     }
 }
 
@@ -609,41 +829,83 @@ mod tests {
         }
     }
 
-    /// Every name in `BUILTIN_METHOD_SIGNATURES` must actually be
-    /// dispatchable by `call_builtin_method` on some receiver — mirrors
-    /// `every_declared_symbol_is_registered_by_its_own_package` for the
-    /// `.`-method table.
+    /// Every entry in `BUILTIN_METHODS` must actually be dispatchable by
+    /// `call_builtin_method` on a real receiver of its own declared type —
+    /// mirrors `every_declared_symbol_is_registered_by_its_own_package` for
+    /// the `.`-method table. Needs a real `Interpreter` now (for
+    /// `builtin_classes`), unlike the old free-function version.
     #[test]
-    fn builtin_method_signatures_are_all_dispatchable_on_a_string() {
-        for (receiver_type, name, _, _) in BUILTIN_METHOD_SIGNATURES {
-            assert_eq!(*receiver_type, "String", "add a receiver-type-appropriate dispatch below if this changes");
-            let result = call_builtin_method(Value::str("x"), name, vec![], Span::default());
-            assert!(result.is_ok(), "'{name}' listed in BUILTIN_METHOD_SIGNATURES but not dispatchable: {:?}", result.err().map(|_| ()));
+    fn every_builtin_method_is_dispatchable_on_its_receiver_type() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        for m in BUILTIN_METHODS {
+            let receiver = match m.receiver {
+                "String" => Value::str("x"),
+                "Int" => Value::Int(1),
+                "Double" => Value::Double(1.0),
+                "Boolean" => Value::Bool(true),
+                "List" => Value::List(crate::gc::GcRef::new(interp.gc.clone(), Vec::new())),
+                "Any" => Value::Int(1),
+                other => panic!("add a receiver-type-appropriate value above for '{other}'"),
+            };
+            let args = if m.symbol.name == "equals" { vec![Value::Unit] } else { vec![] };
+            let result = call_builtin_method(&mut interp, receiver, m.symbol.name, args, Span::default());
+            assert!(result.is_ok(), "'{}' on '{}' listed in BUILTIN_METHODS but not dispatchable: {:?}", m.symbol.name, m.receiver, result.err().map(|_| ()));
         }
     }
 
     #[test]
-    fn builtin_method_return_type_matches_signatures() {
-        for (receiver_type, name, _, _) in BUILTIN_METHOD_SIGNATURES {
+    fn builtin_method_return_type_walks_the_hierarchy() {
+        for m in BUILTIN_METHODS {
             assert_ne!(
-                builtin_method_return_type(receiver_type, name),
+                builtin_method_return_type(m.receiver, m.symbol.name),
                 Type::Unknown,
-                "'{name}' listed in BUILTIN_METHOD_SIGNATURES but builtin_method_return_type doesn't know it"
+                "'{}' listed in BUILTIN_METHODS but builtin_method_return_type doesn't know it",
+                m.symbol.name
             );
         }
+        // Inherited from Any, not listed directly under these receivers.
+        assert_eq!(builtin_method_return_type("Int", "toString"), Type::String);
+        assert_eq!(builtin_method_return_type("String", "toString"), Type::String);
+        assert_eq!(builtin_method_return_type("String", "hashCode"), Type::Int);
         assert_eq!(builtin_method_return_type("Int", "length"), Type::Unknown);
         assert_eq!(builtin_method_return_type("String", "shout"), Type::Unknown);
     }
 
     #[test]
     fn call_builtin_method_dispatches_string_methods() {
-        assert!(matches!(call_builtin_method(Value::str("abc"), "length", vec![], Span::default()), Ok(Value::Int(3))));
-        assert!(matches!(call_builtin_method(Value::str("abc"), "uppercase", vec![], Span::default()), Ok(Value::Str(s)) if &*s == "ABC"));
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        assert!(matches!(call_builtin_method(&mut interp, Value::str("abc"), "length", vec![], Span::default()), Ok(Value::Int(3))));
+        assert!(matches!(call_builtin_method(&mut interp, Value::str("abc"), "uppercase", vec![], Span::default()), Ok(Value::Str(s)) if &*s == "ABC"));
+    }
+
+    /// The whole point of unifying dispatch through `builtin_classes`'
+    /// hierarchy: a primitive that declares no method of its own still
+    /// finds `Any`'s inherited `toString`/`hashCode`/`equals`.
+    #[test]
+    fn call_builtin_method_dispatches_inherited_any_methods() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        assert!(matches!(
+            call_builtin_method(&mut interp, Value::Int(5), "toString", vec![], Span::default()),
+            Ok(Value::Str(s)) if &*s == "5"
+        ));
+        assert!(matches!(
+            call_builtin_method(&mut interp, Value::Int(5), "equals", vec![Value::Int(5)], Span::default()),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call_builtin_method(&mut interp, Value::Int(5), "hashCode", vec![], Span::default()),
+            Ok(Value::Int(5))
+        ));
     }
 
     #[test]
     fn call_builtin_method_unknown_method_is_an_error() {
-        match call_builtin_method(Value::str("x"), "shout", vec![], Span::default()) {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        match call_builtin_method(&mut interp, Value::str("x"), "shout", vec![], Span::default()) {
             Err(Flow::Error(e)) => assert!(e.message.contains("has no method 'shout'"), "{}", e.message),
             other => panic!("expected an error, got {:?}", other.is_ok()),
         }
@@ -651,8 +913,10 @@ mod tests {
 
     #[test]
     fn call_builtin_method_arity_error_reports_the_given_span() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
         let span = Span::new(4, 2);
-        match call_builtin_method(Value::str("x"), "length", vec![Value::Int(1)], span) {
+        match call_builtin_method(&mut interp, Value::str("x"), "length", vec![Value::Int(1)], span) {
             Err(Flow::Error(e)) => assert_eq!(e.span, span),
             other => panic!("expected an error, got {:?}", other.is_ok()),
         }

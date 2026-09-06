@@ -40,7 +40,10 @@ fn populate(env: &Env) {
     register(env, "println", |interp, args, span| {
         match args.len() {
             0 => write_out(interp, "\n"),
-            1 => write_out(interp, &format!("{}\n", args[0])),
+            1 => {
+                let s = interp.value_to_display_string(&args[0], span)?;
+                write_out(interp, &format!("{s}\n"))
+            }
             n => return Err(arity_error("println", "0 or 1", n, span)),
         }?;
         Ok(Value::Unit)
@@ -48,7 +51,10 @@ fn populate(env: &Env) {
 
     register(env, "print", |interp, args, span| {
         match args.len() {
-            1 => write_out(interp, &format!("{}", args[0]))?,
+            1 => {
+                let s = interp.value_to_display_string(&args[0], span)?;
+                write_out(interp, &s)?
+            }
             n => return Err(arity_error("print", "1", n, span)),
         }
         Ok(Value::Unit)

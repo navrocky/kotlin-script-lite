@@ -1,6 +1,6 @@
 use ksl_core::error::{Expected, IdentRole};
 use ksl_core::resolver::SymbolKind;
-use ksl_core::stdlib::BUILTIN_METHOD_SIGNATURES;
+use ksl_core::stdlib::{format_signature, BUILTIN_METHODS};
 use ksl_core::token::TokenKind;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Documentation, Position};
 
@@ -119,32 +119,33 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
     let (prefix_path, _partial) = dotted_prefix_before_cursor(&up_to_cursor);
 
     if !prefix_path.is_empty() {
-        // A single-segment prefix resolving to a local with a known
-        // concrete type narrows the builtin-method suggestions to that
-        // type; anything else (multi-segment, unresolved, or `Unknown`)
-        // falls back to the over-suggesting "show everything" behavior.
-        // A numeric-literal prefix (`1`, or the two-segment `1.5` shape)
-        // is recognized directly — never a real identifier, so a symbol
-        // lookup for it would always fail — instead of falling through to
-        // the unfiltered case.
+        // A known concrete receiver type narrows the builtin-method
+        // suggestions to it; anything else (multi-segment, unresolved, or
+        // `Unknown`) falls back to the over-suggesting "show everything"
+        // behavior. A numeric-literal prefix (`1`, or the two-segment
+        // `1.5` shape) is recognized directly, via the raw-text
+        // `prefix_path` itself — the *one* case that genuinely can't be
+        // answered from the AST: a token like `1.5` is a single, already
+        // fully-typed `DoubleLit`, and the query position can land
+        // *inside* it (not past its own end) when the cursor sits right
+        // after the `.` in `1.<something>`, so there's no "expression
+        // ending here" to look up at all. Every other shape — a bare
+        // local, a constructor call, a function call's result, a chained
+        // `a.b().c()` — is answered generically by `type_ending_before`,
+        // which reads the real, already-resolved static type of whatever
+        // expression sits right before the cursor straight off the AST
+        // (`resolver.rs`'s `expr_types`, populated by `walk_expr_expected`
+        // for every expression in the file) — no raw-text re-parsing.
         let receiver_type = match prefix_path.as_slice() {
             [int_part] if is_digits(int_part) => Some(ksl_core::types::Type::Int),
             [int_part, frac_part] if is_digits(int_part) && is_digits(frac_part) => {
                 Some(ksl_core::types::Type::Double)
             }
-            [name] => {
+            _ => {
                 let line = position.line + 1;
                 let col = position.character + 1;
-                analysis
-                    .resolved
-                    .table
-                    .symbols_in_scope(line, col)
-                    .into_iter()
-                    .find(|s| s.name == *name)
-                    .map(|s| s.ty.clone())
-                    .filter(|ty| *ty != ksl_core::types::Type::Unknown)
+                analysis.resolved.table.type_ending_before(line, col).cloned().filter(|ty| *ty != ksl_core::types::Type::Unknown)
             }
-            _ => None,
         };
 
         return package_path_completions(analysis, &prefix_path, receiver_type.as_ref(), true);
@@ -179,7 +180,19 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         items.extend(named_arg_completions(analysis, &callee, &used_names, line, col));
     }
 
+    let mut in_class: Option<String> = None;
     for symbol in analysis.resolved.table.symbols_in_scope(line, col) {
+        // `this` is a real, scope-registered symbol inside a class
+        // member's own body (`resolver.rs`'s `walk_class_decl`/
+        // `walk_class_method`) — its type names the enclosing class,
+        // which is exactly what implicit `this` (bare field/method
+        // access, no `this.` needed) means completion should *also*
+        // offer here, below, alongside ordinary locals.
+        if symbol.name == "this" {
+            if let ksl_core::types::Type::Class(name) = &symbol.ty {
+                in_class = Some(name.to_string());
+            }
+        }
         items.push(CompletionItem {
             label: symbol.name.clone(),
             kind: Some(symbol_completion_kind(symbol.kind)),
@@ -187,6 +200,9 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             documentation: symbol.doc.clone().map(Documentation::String),
             ..Default::default()
         });
+    }
+    if let Some(class_name) = &in_class {
+        items.extend(class_member_completions(analysis, class_name));
     }
 
     for sym in ksl_core::stdlib::default_imported_symbols() {
@@ -387,8 +403,45 @@ fn package_path_completions(
     let package_shaped = !items.is_empty() || analysis.packages.package_names().any(|n| n == &package_name);
 
     if allow_builtin_fallback && (receiver_type.is_some() || !package_shaped) {
-        items.extend(builtin_method_completions(receiver_type));
+        // A `Type::Class(name)` receiver (a real user class instance, or
+        // the pseudo-class `Number`) — its own fields/methods plus `Any`'s
+        // inherited ones, not `BUILTIN_METHODS`' flat, name-keyed table
+        // (which has no entry for a dynamic class name at all).
+        match receiver_type {
+            Some(ksl_core::types::Type::Class(name)) => items.extend(class_member_completions(analysis, name)),
+            _ => items.extend(builtin_method_completions(receiver_type)),
+        }
     }
+    items
+}
+
+/// Every completable member of a real user class instance (or the
+/// pseudo-class `Number`) — its own fields/methods
+/// (`SymbolTable::class_members`, populated as `resolver.rs`'s
+/// `walk_class_decl`/`walk_class_method` define each one) plus `Any`'s
+/// three native methods (every class implicitly extends `Any`, see
+/// `stdlib::BUILTIN_METHODS`'s own doc comment) — the `Type::Class`
+/// counterpart of `builtin_method_completions`.
+fn class_member_completions(analysis: &Analysis, class_name: &str) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = analysis
+        .resolved
+        .table
+        .class_members(class_name)
+        .map(|s| CompletionItem {
+            label: s.name.clone(),
+            kind: Some(symbol_completion_kind(s.kind)),
+            detail: Some(s.signature.clone()),
+            documentation: s.doc.clone().map(Documentation::String),
+            ..Default::default()
+        })
+        .collect();
+    items.extend(BUILTIN_METHODS.iter().filter(|m| m.receiver == "Any").map(|m| CompletionItem {
+        label: m.symbol.name.to_string(),
+        kind: Some(CompletionItemKind::METHOD),
+        detail: Some(format_signature(&m.symbol)),
+        documentation: Some(Documentation::String(m.symbol.doc.to_string())),
+        ..Default::default()
+    }));
     items
 }
 
@@ -518,7 +571,12 @@ fn named_arg_completions(analysis: &Analysis, callee: &str, used: &[String], lin
     };
 
     for sym in analysis.resolved.table.symbols_in_scope(line, col) {
-        if sym.kind == SymbolKind::Fun && sym.name == callee {
+        // A `class`'s own `Symbol` carries its primary constructor's real
+        // `param_types`/`param_names` too (patched in by
+        // `resolver::Resolver::walk_class_decl`, mirroring an ordinary
+        // `fun`'s), so `Point(x = 1)` offers `x =` the same way a plain
+        // function call already does.
+        if (sym.kind == SymbolKind::Fun || sym.kind == SymbolKind::Class) && sym.name == callee {
             for (i, pname) in sym.param_names.iter().enumerate() {
                 let ty = sym.param_types.get(i).cloned().unwrap_or(ksl_core::types::Type::Unknown);
                 let doc = sym.param_docs.get(i).cloned().flatten();
@@ -553,24 +611,33 @@ fn package_member_completion(m: &crate::package_index::PackageMember) -> Complet
     }
 }
 
-/// `BUILTIN_METHOD_SIGNATURES`, filtered to `receiver_type` when it's
-/// concretely known (same `Nullable`-unwrapping rule as `hover.rs`'s
-/// identical filter) or offered unfiltered when it's `None` — the
-/// "over-suggest, never under-suggest" hedge described on
+/// `BUILTIN_METHODS`, filtered to `receiver_type`'s own builtin-class chain
+/// (`Int`/`Double` -> `Number` -> `Any`, others -> `Any` directly — see
+/// `builtin_type_chain`) when it's concretely known (same
+/// `Nullable`-unwrapping rule as `hover.rs`'s identical filter), so e.g.
+/// `5.` also offers `Any`'s inherited `toString`/`equals`/`hashCode`, not
+/// just methods declared directly on `Int` — or offered unfiltered when
+/// it's `None`, the "over-suggest, never under-suggest" hedge described on
 /// `package_path_completions`.
 fn builtin_method_completions(receiver_type: Option<&ksl_core::types::Type>) -> Vec<CompletionItem> {
-    BUILTIN_METHOD_SIGNATURES
+    let chain: Option<Vec<&str>> = receiver_type.map(|ty| {
+        let name = match ty {
+            ksl_core::types::Type::Nullable(inner) => inner.name(),
+            other => other.name(),
+        };
+        ksl_core::stdlib::builtin_type_chain(&name)
+    });
+    BUILTIN_METHODS
         .iter()
-        .filter(|(recv_ty, ..)| match receiver_type {
-            Some(ksl_core::types::Type::Nullable(inner)) => inner.name() == *recv_ty,
-            Some(ty) => ty.name() == *recv_ty,
+        .filter(|m| match &chain {
+            Some(chain) => chain.contains(&m.receiver),
             None => true,
         })
-        .map(|(_, name, signature, doc)| CompletionItem {
-            label: name.to_string(),
+        .map(|m| CompletionItem {
+            label: m.symbol.name.to_string(),
             kind: Some(CompletionItemKind::METHOD),
-            detail: Some(signature.to_string()),
-            documentation: Some(Documentation::String(doc.to_string())),
+            detail: Some(format_signature(&m.symbol)),
+            documentation: Some(Documentation::String(m.symbol.doc.to_string())),
             ..Default::default()
         })
         .collect()
@@ -588,8 +655,9 @@ fn is_digits(s: &str) -> bool {
 
 fn symbol_completion_kind(kind: SymbolKind) -> CompletionItemKind {
     match kind {
-        SymbolKind::Val | SymbolKind::Var | SymbolKind::Param => CompletionItemKind::VARIABLE,
-        SymbolKind::Fun => CompletionItemKind::FUNCTION,
+        SymbolKind::Val | SymbolKind::Var | SymbolKind::Param | SymbolKind::Field => CompletionItemKind::VARIABLE,
+        SymbolKind::Fun | SymbolKind::Method => CompletionItemKind::FUNCTION,
+        SymbolKind::Class => CompletionItemKind::CLASS,
     }
 }
 
@@ -910,6 +978,15 @@ mod tests {
         let general_names = labels(general_text, Position::new(3, 4));
         let general_kws = [
             "fun", "val", "var", "if", "when", "while", "do", "for", "return", "null", "true", "false",
+            // `class` is genuinely legal anywhere a statement can start,
+            // same as `fun`/`val`. `this` is not — real Kotlin (and this
+            // parser, `Parser::class_member_depth`) restricts it to inside
+            // a class member — but classes have no resolver-side scope
+            // integration yet (that's this phase's own later step), so
+            // there's no `inside_a_class_member_at`-style fact to gate on
+            // yet; offered unconditionally for now, same as every other
+            // keyword here, until that lands.
+            "class", "this",
         ];
         for kw in general_kws {
             assert!(general_names.contains(&kw.to_string()), "'{kw}' wasn't offered inside a function body");
@@ -1048,6 +1125,83 @@ mod tests {
     }
 
     #[test]
+    fn completion_after_a_dot_right_on_a_constructor_calls_own_result_offers_its_members() {
+        // The reported gap: `Point().<cursor>` -- `dotted_prefix_before_cursor`'s
+        // raw-text scan stops at the call's own closing `)`, so this used
+        // to fall through to an unfiltered builtin-method dump instead of
+        // Point's own members.
+        let text = "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\nPoint().bark()\n";
+        // "Point()." is 8 chars, cursor right after the dot on line 4 (0-based 3).
+        let names = labels(text, Position::new(3, 8));
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"bark".to_string()), "{names:?}");
+        assert!(names.contains(&"toString".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_val_decls_constructor_call_offers_its_members() {
+        // Exact shape from the reported screenshot: `val origin = Point(0,
+        // 0).` -- a real binding, multiple constructor arguments, cursor
+        // at the end of the line right after the dot. A trailing `.` with
+        // nothing after it doesn't parse on its own (no field/method name
+        // yet) -- exactly like `falls_back_to_last_good_tree_when_mid_typing`,
+        // this goes through the `last_good` fallback: the *previous*
+        // keystroke's tree (without the trailing dot) is what a real
+        // editor's LSP session would actually have cached at this point.
+        let good = "class Point(val x: Int, val y: Int) {\n    fun bark(): String = \"woof\"\n}\nval origin = Point(0, 0)\n";
+        let path = Path::new("/tmp/nonexistent_test.ksl");
+        let last_good = std::sync::Arc::new(ksl_core::parse_only(good).unwrap());
+        let text = format!("{}.\n", good.trim_end_matches('\n'));
+        let a = analysis::analyze(&text, Some(last_good), path).expect("should fall back");
+        // "val origin = Point(0, 0)." is 26 chars.
+        let names: Vec<String> = completion(&a, &text, Position::new(3, 26)).into_iter().map(|i| i.label).collect();
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"y".to_string()), "{names:?}");
+        assert!(names.contains(&"bark".to_string()), "{names:?}");
+        assert!(names.contains(&"toString".to_string()), "{names:?}");
+        assert!(!names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_plain_functions_call_result_offers_its_return_types_members() {
+        let text = "class Point(val x: Int)\nfun makePoint(): Point = Point(1)\nmakePoint().x\n";
+        // "makePoint()." is 12 chars, cursor right after the dot on line 3 (0-based 2).
+        let names = labels(text, Position::new(2, 12));
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_chained_method_calls_result() {
+        // `a.b().c().<cursor>` — previously an explicitly documented gap
+        // (the old, deleted `call_result_type_before_cursor` only ever
+        // handled a single bare `name(...)`, never a chain) — now works
+        // for free: `identity()`'s own `MethodCall` span is widened to
+        // its real closing `)` (`parser.rs`) and gets its own `expr_types`
+        // entry (`resolver.rs`) exactly like any other expression.
+        let text = "class Point(val x: Int) {\n    fun identity(): Point = this\n}\nPoint(1).identity().x\n";
+        // "Point(1).identity()." is 20 characters, cursor right after
+        // that second dot on line 4 (0-based 3).
+        let names = labels(text, Position::new(3, 20));
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"identity".to_string()), "{names:?}");
+        assert!(!names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_user_class_local_offers_its_own_members_plus_any() {
+        let text = "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\nval p = Point(1)\np.bark()\n";
+        // "p." is 2 chars, cursor right after the dot on line 5 (0-based 4).
+        let names = labels(text, Position::new(4, 2));
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"bark".to_string()), "{names:?}");
+        assert!(names.contains(&"toString".to_string()), "{names:?}");
+        assert!(names.contains(&"equals".to_string()), "{names:?}");
+        assert!(names.contains(&"hashCode".to_string()), "{names:?}");
+        // No String-specific method leaks in.
+        assert!(!names.contains(&"uppercase".to_string()), "{names:?}");
+    }
+
+    #[test]
     fn completion_after_a_dot_on_a_nullable_string_local_still_offers_string_methods() {
         // Regression test: a `String?`-typed local's static type is
         // `Type::Nullable(String)`, whose `name()` is `"String?"` — the
@@ -1077,10 +1231,14 @@ mod tests {
     fn completion_after_a_dot_on_an_int_literal_offers_nothing_string_shaped() {
         // The exact bug report: `1.length()` — `1` is an `Int` literal
         // (recognized directly, no symbol lookup involved), so no
-        // `String` method, and nothing from the general branch either.
+        // `String`-specific method. It correctly *does* still offer `Any`'s
+        // inherited `toString`/`hashCode`/`equals` (Step 4's real builtin
+        // hierarchy) — this only asserts no `String` method leaks in.
         let text = "1.length()\n";
         let names = labels(text, Position::new(0, 2)); // right after "1."
-        assert!(names.is_empty(), "{names:?}");
+        for string_only in ["length", "uppercase", "lowercase", "trim"] {
+            assert!(!names.contains(&string_only.to_string()), "{names:?}");
+        }
     }
 
     #[test]
@@ -1594,6 +1752,32 @@ mod tests {
         let text = "fun test(longParamName: String) {}\ntest(longParam)\n";
         let names = labels(text, Position::new(1, 14)); // right after "test(longParam"
         assert!(names.contains(&"longParamName =".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_inside_a_method_body_offers_implicit_field_and_method_access() {
+        // Implicit `this` (docs/syntax.md's "Classes" section) — a
+        // promoted field/another method must appear as a bare completion
+        // inside a method body too, not just via `this.`/`self.`-style
+        // qualification.
+        let text = "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n    fun getX(): Int {\n        return x\n    }\n}\n";
+        let names = labels(text, Position::new(3, 15));
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"bark".to_string()), "{names:?}");
+        assert!(names.contains(&"toString".to_string()), "{names:?}");
+        assert!(names.contains(&"this".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn named_arg_completion_offers_a_class_constructors_declared_parameter() {
+        // The reported bug: constructing a class (`Greeting(prefix = ...`)
+        // didn't offer parameter-name completions at all — `named_arg_
+        // completions` only ever checked `SymbolKind::Fun`, never
+        // `SymbolKind::Class`.
+        let text = "class Greeting(prefix: String, val name: String) {}\nGreeting(prefix)\n";
+        let names = labels(text, Position::new(1, 15)); // right after "Greeting(prefix"
+        assert!(names.contains(&"prefix =".to_string()), "{names:?}");
+        assert!(names.contains(&"name =".to_string()), "{names:?}");
     }
 
     #[test]

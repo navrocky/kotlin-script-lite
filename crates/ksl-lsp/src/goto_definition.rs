@@ -220,4 +220,52 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn goto_definition_on_a_field_use_jumps_to_its_declaration() {
+        // "class Point(val x: Int, val y: Int)" — a promoted ctor param's
+        // own real symbol (see `resolver::ClassFieldInfo::symbol_idx`'s
+        // doc comment on why a promoted field points at the *ctor param's*
+        // declaration, not a separate one).
+        let text = "class Point(val x: Int, val y: Int)\nval p = Point(1, 2)\nprintln(p.x)\n";
+        let a = analysis::analyze(text, None, std::path::Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
+        let uri = uri_for_missing();
+        // "println(p." is 10 chars, so "x" is at column 11 (0-based 10).
+        let response = goto_definition(&a, &uri, Position::new(2, 10)).expect("field use should resolve");
+        match response {
+            GotoDefinitionResponse::Scalar(loc) => {
+                // "class Point(val " is 16 chars, so x's own declaration is
+                // at column 17 (0-based 16) on line 1 (0-based 0).
+                assert_eq!(loc.range.start.line, 0);
+                assert_eq!(loc.range.start.character, 16);
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goto_definition_on_a_method_use_jumps_to_its_declaration() {
+        let text = "class Point(val x: Int) {\n    fun bark(): String = \"woof\"\n}\nval p = Point(1)\np.bark()\n";
+        let a = analysis::analyze(text, None, std::path::Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
+        let uri = uri_for_missing();
+        // "p." is 2 chars, so "bark" starts at column 3 (0-based 2), line 5 (0-based 4).
+        let response = goto_definition(&a, &uri, Position::new(4, 2)).expect("method use should resolve");
+        match response {
+            GotoDefinitionResponse::Scalar(loc) => {
+                // "    fun " is 8 chars, so bark's own declaration starts
+                // at column 9 (0-based 8) on line 2 (0-based 1).
+                assert_eq!(loc.range.start.line, 1);
+                assert_eq!(loc.range.start.character, 8);
+            }
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    /// A file that was never actually written to disk, but exists for
+    /// `Url::from_file_path` purposes only — same trick `completion.rs`'s
+    /// own tests already use (`/tmp/nonexistent_test.ksl`), fine here since
+    /// neither new test touches the filesystem or cross-file resolution.
+    fn uri_for_missing() -> Url {
+        Url::parse("file:///tmp/nonexistent_test.ksl").unwrap()
+    }
 }

@@ -147,4 +147,12 @@ impl<T: Trace + 'static> GcRef<T> {
     pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
         Rc::ptr_eq(&a.data, &b.data)
     }
+
+    /// A stable-for-this-value's-lifetime identity address — used for the
+    /// default, identity-based `Display`/`hashCode` every class instance
+    /// gets unless it overrides `toString`/`hashCode` itself (real
+    /// Kotlin's own `Any` default: `ClassName@<hex address>`-shaped).
+    pub(crate) fn addr(&self) -> usize {
+        Rc::as_ptr(&self.data) as usize
+    }
 }

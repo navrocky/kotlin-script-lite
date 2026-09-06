@@ -38,6 +38,22 @@ pub enum SymbolKind {
     Var,
     Fun,
     Param,
+    /// A `class` declaration's own name (`Point` in `class Point(...)`) —
+    /// distinct from an *instance* of it, which has no symbol of its own
+    /// (see `ExprKind::This`'s handling, the only place a real instance
+    /// gets a synthesized `Symbol`, kind `Val`).
+    Class,
+    /// A class's own field — constructor `val`/`var` param promotion or a
+    /// body `Property` member. Synthesized via `define_class_member`, not
+    /// `define` (a field is never a bare, scope-visible name — only
+    /// reachable through `this.name`/`obj.name`, see `Resolver::
+    /// class_info`), mirroring `named_arg_labels`'s existing "synthesize a
+    /// `Symbol`, don't register it in `scope.names`" pattern.
+    Field,
+    /// A class's own method — synthesized the same way as `Field`, for the
+    /// same reason (only reachable through `this.name(...)`/
+    /// `obj.name(...)`, never as a bare call).
+    Method,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +118,56 @@ pub struct Symbol {
 /// parameter (`None` where there is none, or where the callee has no doc
 /// comments to begin with, e.g. a stdlib function).
 type CallSignature = (Type, Vec<Type>, Vec<String>, Vec<Option<String>>);
+
+/// A `class` declaration's own static shape — `Resolver::class_info`'s
+/// value, keyed by class name. Built in two passes by `Resolver::
+/// walk_class_decl`: every field's/method's *signature* is inserted before
+/// any member body is walked, so one member referencing another (either
+/// order — `this.other()` calling a method declared later in the same
+/// class) resolves correctly, mirroring how `StmtKind::FunDecl` defines its
+/// own name before walking its body. Flat, no superclass chain of its own —
+/// every user class implicitly extends the real builtin `Any` (single hop;
+/// `:` multi-level inheritance is Phase 7's job), so a lookup that misses
+/// here falls through to `stdlib::builtin_method_signature("Any", ...)`
+/// directly (see `Resolver::class_method_signature`) rather than walking a
+/// chain of `ClassInfo`s.
+struct ClassInfo {
+    fields: Vec<ClassFieldInfo>,
+    methods: Vec<ClassMethodInfo>,
+    /// The primary constructor's own real parameter types/names — what
+    /// lets `Point(3, 4)` (`ExprKind::Call`, callee resolving to this
+    /// class's own `SymbolKind::Class` symbol) get exactly the same
+    /// argument/named-argument checking an ordinary `fun` call already
+    /// gets, with `Type::Class(name)` (not `Type::Unknown`, unlike the
+    /// class symbol's own bare-reference type) as the call's result.
+    ctor_param_types: Vec<Type>,
+    ctor_param_names: Vec<String>,
+}
+
+struct ClassFieldInfo {
+    name: String,
+    ty: Type,
+    mutable: bool,
+    /// The field's own declaration-site `Symbol` index — a promoted ctor
+    /// param's real, scope-registered symbol (`self.define`), or a body
+    /// `Property`'s synthesized one (`define_class_member`). Lets a
+    /// `this.field`/`obj.field` *use* site record a real `occurrences`
+    /// entry pointing back at it, the same way a use of any ordinary local
+    /// does — see `ExprKind::FieldAccess`'s handling.
+    symbol_idx: usize,
+}
+
+struct ClassMethodInfo {
+    name: String,
+    return_type: Type,
+    param_types: Vec<Type>,
+    param_names: Vec<String>,
+    param_docs: Vec<Option<String>>,
+    /// The method's own declaration-site `Symbol` index
+    /// (`define_class_member`) — see `ClassFieldInfo::symbol_idx`'s
+    /// identical rationale.
+    symbol_idx: usize,
+}
 
 /// A `following` hint (see `Resolver::walk_stmt`) meaning "there's no
 /// concrete next sibling — extends to the end of the file." A scope's
@@ -223,6 +289,27 @@ pub struct SymbolTable {
     /// here" from a real fact instead of a raw-text "does this look like
     /// it's right after a `}`" guess — see `else_allowed_at`.
     dangling_ifs: Vec<(Span, Span)>,
+    /// Every class's own member symbols (fields and methods, in
+    /// declaration order — ctor-promoted fields first, then body
+    /// `Property`s, then methods, matching `walk_class_decl`'s own
+    /// traversal order), keyed by class name — lets a caller (`ksl-lsp`'s
+    /// completion, post-`.` on a `Type::Class` receiver) enumerate a
+    /// class's own completable members without needing `resolver::
+    /// Resolver`'s private `class_info` (which doesn't survive past
+    /// resolution) — see `class_members`.
+    class_members: HashMap<String, Vec<usize>>,
+    /// Every expression's own span, paired with its statically computed
+    /// `Type` — populated once, generically, by `Resolver::
+    /// walk_expr_expected`'s thin wrapper (see its own doc comment), for
+    /// *every* `ExprKind` at *every* nesting depth, not just calls. Lets a
+    /// caller (`ksl-lsp`'s completion, via `type_ending_before`) find "the
+    /// static type of whatever expression sits right before this cursor
+    /// position" straight from the AST — no text-based heuristics (no
+    /// re-parsing/paren-balancing over raw source text). Pushed in
+    /// post-order (every subexpression's own entry lands before the
+    /// enclosing expression's), which `type_ending_before` relies on to
+    /// prefer the outermost expression on a tie.
+    expr_types: Vec<(Span, Type)>,
 }
 
 impl SymbolTable {
@@ -291,6 +378,43 @@ impl SymbolTable {
     /// position within *this* file, not "what does this file export".
     pub fn top_level_symbols(&self) -> impl Iterator<Item = &Symbol> {
         self.scopes[0].names.values().flatten().map(|&idx| &self.symbols[idx])
+    }
+
+    /// Every member symbol (fields and methods) `class_name`'s own
+    /// `ClassDecl` declares — empty for a name that isn't a real,
+    /// already-walked class in this file (an unknown name, or a real
+    /// class whose own declaration hasn't been walked yet — see
+    /// `Resolver::class_info`'s doc comment on that latter, accepted
+    /// limitation). Used by `ksl-lsp`'s completion for post-`.` member
+    /// suggestions on a `Type::Class` receiver.
+    pub fn class_members(&self, class_name: &str) -> impl Iterator<Item = &Symbol> {
+        self.class_members.get(class_name).into_iter().flatten().map(|&idx| &self.symbols[idx])
+    }
+
+    /// The static `Type` of whichever recorded expression ends closest to
+    /// (but strictly before) `(line, col)` on that same line — e.g. for
+    /// `val origin = Point(0, 0).` with `(line, col)` right after the
+    /// dot, this finds the `Call` expression `Point(0, 0)` (its span
+    /// widened to its own closing `)` — see `parser.rs`'s `parse_postfix`)
+    /// and returns its `Type::Class("Point")`. Strict `<` (not `<=`)
+    /// deliberately doesn't care whether the operator right before the
+    /// cursor is one character (`.`) or two (`?.`): either way the
+    /// expression's own `end_col` (which never includes the operator
+    /// itself) sits strictly below the cursor's column. On a tie (more
+    /// than one expression ending at the same column — always nested
+    /// ones, never two unrelated expressions, since only one real
+    /// expression chain can end at a given source position),
+    /// `max_by_key` returns the last-pushed entry, which — thanks to
+    /// `expr_types`'s post-order recording — is the outermost one, the
+    /// correct choice. `None` when nothing recorded ends there at all
+    /// (e.g. a completely stale/unresolved position, or the line is
+    /// something `expr_types` never covers, like a bare type annotation).
+    pub fn type_ending_before(&self, line: u32, col: u32) -> Option<&Type> {
+        self.expr_types
+            .iter()
+            .filter(|(span, _)| span.end_line == line && span.end_col < col)
+            .max_by_key(|(span, _)| span.end_col)
+            .map(|(_, ty)| ty)
     }
 
     /// Like `symbol_at`, but also returns the exact span of the occurrence
@@ -474,6 +598,8 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
             name_refs: Vec::new(),
             named_arg_labels: Vec::new(),
             dangling_ifs: Vec::new(),
+            class_members: HashMap::new(),
+            expr_types: Vec::new(),
         },
         diagnostics,
         type_errors: Vec::new(),
@@ -482,7 +608,28 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
         imports,
         packages,
         generic_params: Vec::new(),
-        known_classes: HashSet::new(),
+        // Real predpass: every top-level `class`'s name, known *before*
+        // `walk_stmts` starts — lets a type annotation reference a class
+        // declared later in the same file (`fun f(p: Point)` appearing
+        // before `class Point(...)`), exactly the forward-reference
+        // freedom a top-level `fun` already has for its own name (that
+        // one's handled by `define`ing it before its body is walked, but a
+        // *type annotation* referencing a class needs the name known
+        // ahead of the whole file, not just ahead of one declaration's own
+        // body). Top-level only, not recursive into nested bodies: a
+        // locally-scoped class (legal — see `interpreter.rs`'s local-class
+        // tests) is a much rarer forward-reference case, deliberately not
+        // handled by this predpass.
+        known_classes: program
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::ClassDecl { name, .. } => Some(Rc::from(name.as_str())),
+                _ => None,
+            })
+            .collect(),
+        class_info: HashMap::new(),
+        current_class: None,
         return_type_stack: Vec::new(),
         narrowed: HashSet::new(),
     };
@@ -587,6 +734,32 @@ struct Resolver<'a> {
     /// declaration is parsed yet; see `types::resolve_type_hint`'s doc
     /// comment.
     known_classes: HashSet<Rc<str>>,
+    /// Every `class` declared in this file's own static shape (fields'/
+    /// methods' real, checkable signatures) — see `ClassInfo`'s own doc
+    /// comment. Populated as each `ClassDecl` is walked (`walk_class_decl`),
+    /// not by the up-front `known_classes` predpass (which only needs
+    /// names, for type-annotation resolution) — a class referenced in a
+    /// type annotation *before* its own `ClassDecl` is walked resolves to a
+    /// real `Type::Class`, but a field/method access on such a not-yet-
+    /// walked class (a real, accepted limitation, not fixed this phase)
+    /// won't find anything here yet.
+    class_info: HashMap<Rc<str>, ClassInfo>,
+    /// The class whose constructor body/property initializer/`init`
+    /// block/method body is currently being walked, if any — `None`
+    /// everywhere else. This is what makes implicit `this` real: a bare
+    /// name that isn't a local at all (`resolve_name`) or a bare call
+    /// (`ExprKind::Call`) falls back to this class's own fields/methods,
+    /// matching real Kotlin's own implicit-receiver rule (a local of the
+    /// same name always shadows a field — checked first, unconditionally,
+    /// by the ordinary scope-chain lookup this only ever runs *after*).
+    /// Saved and restored around each class member's own body walk
+    /// (`walk_class_decl`/`walk_class_method`), the same pattern
+    /// `return_type_stack`/`generic_params` already use for their own
+    /// enclosing-context state — a single `Option`, not a stack, since
+    /// classes can't nest yet (no local-class-inside-a-method-body
+    /// interaction to worry about: a local class's own body walk saves
+    /// and restores this exactly like a top-level one would).
+    current_class: Option<Rc<str>>,
     /// Stack of enclosing functions'/lambdas' return-type contexts,
     /// pushed/popped around walking a body, so `Return` checks/collects
     /// against the right one even when nested. See `ReturnTypeContext`.
@@ -919,6 +1092,35 @@ impl<'a> Resolver<'a> {
             }
             return ty;
         }
+        // Implicit `this` (see `current_class`'s own doc comment): only
+        // consulted once the ordinary scope-chain lookup above has
+        // already failed, so a local of the same name always shadows a
+        // field/method, matching real Kotlin. A found *method* resolves
+        // structurally to its `Type::Function` shape here (so a bare
+        // call like `foo()` isn't wrongly flagged as an undefined name by
+        // this same function, reached via `ExprKind::Call`'s own initial
+        // `walk_expr(callee)`) — the real, checkable call signature
+        // (named-argument checking included) is built separately, by the
+        // `Call` arm itself, via `class_method_signature`.
+        if let Some(class_name) = self.current_class.clone() {
+            if let Some(info) = self.class_info.get(class_name.as_ref()) {
+                if let Some(f) = info.fields.iter().find(|f| f.name == name) {
+                    self.table.occurrences.push((use_span, f.symbol_idx));
+                    return f.ty.clone();
+                }
+                if let Some(m) = info.methods.iter().find(|m| m.name == name) {
+                    self.table.occurrences.push((use_span, m.symbol_idx));
+                    return Type::Function(m.param_types.clone(), Box::new(m.return_type.clone()));
+                }
+            }
+            // Every class implicitly extends `Any` — a bare `toString()`/
+            // `equals(...)`/`hashCode()` inside a method resolves to it
+            // too. No resolver `Symbol` exists for a builtin method, so no
+            // `occurrences` entry to record here.
+            if let Some((ret, params, ..)) = crate::stdlib::builtin_method_signature("Any", name) {
+                return Type::Function(params, Box::new(ret));
+            }
+        }
         if crate::stdlib::is_known(name) {
             return Type::Unknown;
         }
@@ -1175,25 +1377,70 @@ impl<'a> Resolver<'a> {
             }
             StmtKind::Assign { name, op, value } => {
                 let value_ty = self.walk_expr(value, scope, following);
-                let target_ty =
-                    self.resolve_symbol(scope, name).map(|s| s.ty.clone()).unwrap_or(Type::Unknown);
-                self.resolve_name(scope, name, stmt.span);
-                // Compound assignment (`+=` etc.) is out of scope for v1 —
-                // its result type would need the same widening rules as
-                // arithmetic, and isn't a plain "is the RHS compatible"
-                // check the way `=` is. `target_ty` is whatever the
-                // declaration's own type is — explicit hint or inferred
-                // from its initializer, no distinction (see `ValDecl`
-                // above) — so this enforces reassignment for both forms.
-                if *op == AssignOp::Set
-                    && target_ty != Type::Unknown
-                    && value_ty != Type::Unknown
-                    && !types::is_assignable(&value_ty, &target_ty)
-                {
-                    self.type_errors.push(RuntimeError::new(
-                        format!("cannot assign {} to var '{name}' of type {}", value_ty.name(), target_ty.name()),
-                        stmt.span,
-                    ));
+                match self.resolve_symbol(scope, name) {
+                    Some(sym) => {
+                        let target_ty = sym.ty.clone();
+                        self.resolve_name(scope, name, stmt.span);
+                        // Compound assignment (`+=` etc.) is out of scope
+                        // for v1 — its result type would need the same
+                        // widening rules as arithmetic, and isn't a plain
+                        // "is the RHS compatible" check the way `=` is.
+                        // `target_ty` is whatever the declaration's own
+                        // type is — explicit hint or inferred from its
+                        // initializer, no distinction (see `ValDecl`
+                        // above) — so this enforces reassignment for both
+                        // forms.
+                        if *op == AssignOp::Set
+                            && target_ty != Type::Unknown
+                            && value_ty != Type::Unknown
+                            && !types::is_assignable(&value_ty, &target_ty)
+                        {
+                            self.type_errors.push(RuntimeError::new(
+                                format!("cannot assign {} to var '{name}' of type {}", value_ty.name(), target_ty.name()),
+                                stmt.span,
+                            ));
+                        }
+                    }
+                    // Not a local at all — implicit `this.<name>` fallback
+                    // (see `current_class`'s doc comment), with exactly
+                    // the same mutability/type checking `FieldAssign`'s
+                    // own real handling does (a local of this name always
+                    // wins, per the `Some(sym)` arm above, matching real
+                    // Kotlin).
+                    None => {
+                        let field = self.current_class.clone().and_then(|c| {
+                            self.class_info.get(c.as_ref()).and_then(|info| {
+                                info.fields.iter().find(|f| f.name == *name).map(|f| (f.ty.clone(), f.mutable, f.symbol_idx))
+                            })
+                        });
+                        match field {
+                            Some((field_ty, mutable, symbol_idx)) => {
+                                self.touch(scope, stmt.span);
+                                self.table.occurrences.push((stmt.span, symbol_idx));
+                                if !mutable {
+                                    self.type_errors
+                                        .push(RuntimeError::new(format!("cannot reassign val '{name}'"), stmt.span));
+                                }
+                                if *op == AssignOp::Set
+                                    && field_ty != Type::Unknown
+                                    && value_ty != Type::Unknown
+                                    && !types::is_assignable(&value_ty, &field_ty)
+                                {
+                                    self.type_errors.push(RuntimeError::new(
+                                        format!(
+                                            "cannot assign {} to field '{name}' of type {}",
+                                            value_ty.name(),
+                                            field_ty.name()
+                                        ),
+                                        stmt.span,
+                                    ));
+                                }
+                            }
+                            None => {
+                                self.resolve_name(scope, name, stmt.span);
+                            }
+                        }
+                    }
                 }
                 Type::Unit
             }
@@ -1459,6 +1706,43 @@ impl<'a> Resolver<'a> {
                 Type::Unit
             }
             StmtKind::Break | StmtKind::Continue => Type::Unit,
+            StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment } => {
+                self.walk_class_decl(name, *name_span, ctor_params, members, doc_comment.as_deref(), scope, following, stmt.span);
+                Type::Unit
+            }
+            StmtKind::FieldAssign { receiver, field, field_span, op, value } => {
+                let recv_ty = self.walk_expr(receiver, scope, following);
+                let value_ty = self.walk_expr(value, scope, following);
+                if recv_ty != Type::Unknown {
+                    match self.class_field_type(&recv_ty, field) {
+                        Some((field_ty, mutable)) => {
+                            if let Some(idx) = self.class_field_symbol_idx(&recv_ty, field) {
+                                self.table.occurrences.push((*field_span, idx));
+                            }
+                            if !mutable {
+                                self.type_errors.push(RuntimeError::new(format!("cannot reassign val '{field}'"), *field_span));
+                            }
+                            if *op == AssignOp::Set
+                                && field_ty != Type::Unknown
+                                && value_ty != Type::Unknown
+                                && !types::is_assignable(&value_ty, &field_ty)
+                            {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!("cannot assign {} to field '{field}' of type {}", value_ty.name(), field_ty.name()),
+                                    stmt.span,
+                                ));
+                            }
+                        }
+                        None => {
+                            self.type_errors.push(RuntimeError::new(
+                                format!("'{}' has no field '{field}'", recv_ty.name()),
+                                *field_span,
+                            ));
+                        }
+                    }
+                }
+                Type::Unit
+            }
         }
     }
 
@@ -1503,6 +1787,546 @@ impl<'a> Resolver<'a> {
             let doc = fun_doc.and_then(|d| d.param(&p.name)).map(str::to_string);
             self.define(fn_scope, &p.name, SymbolKind::Param, p.name_span, false, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), doc);
         }
+    }
+
+    /// Synthesizes a `Symbol` for a class member's own declaration site (a
+    /// field or a method) and records its occurrence there — mirrors
+    /// `named_arg_labels`'s existing "synthesize a `Symbol`, don't
+    /// register it in any scope's `names`" pattern: a field/method is only
+    /// ever reached through `this.name`/`obj.name`, dispatched via
+    /// `class_info`, never as a bare, scope-visible name the way a
+    /// top-level `fun`'s own name is — registering it into `scope.names`
+    /// too would wrongly make it resolvable unqualified inside its own
+    /// class. Wiring up hover/goto-def for a *use* site (`this.field`,
+    /// `obj.method()`) is a later step of this phase (`ksl-lsp`) — this
+    /// only covers the declaration itself.
+    #[allow(clippy::too_many_arguments)]
+    fn define_class_member(
+        &mut self,
+        kind: SymbolKind,
+        name: &str,
+        def_span: Span,
+        mutable: bool,
+        signature: String,
+        ty: Type,
+        return_type: Type,
+        param_types: Vec<Type>,
+        param_names: Vec<String>,
+        param_docs: Vec<Option<String>>,
+        doc: Option<String>,
+    ) -> usize {
+        let idx = self.table.symbols.len();
+        self.table.symbols.push(Symbol {
+            name: name.to_string(),
+            kind,
+            def_span,
+            mutable,
+            signature,
+            ty,
+            return_type,
+            param_types,
+            param_names,
+            param_docs,
+            doc,
+        });
+        self.table.occurrences.push((def_span, idx));
+        idx
+    }
+
+    /// Real static integration for a `class` declaration (this phase's
+    /// plan, §4/§6 step 5) — the class's own name (a bare-visible `Symbol`,
+    /// kind `Class`), then its full static shape into `self.class_info` in
+    /// two passes: every field's/method's own *signature* first (from
+    /// annotations only, no bodies walked, no diagnostics — mirrors
+    /// `StmtKind::FunDecl`'s own quiet `param_types`/`ret_ty` computed
+    /// before `define()`), so one member referencing another (either
+    /// order — `this.other()` calling a method declared later in the same
+    /// class) resolves correctly; then real bodies (property
+    /// initializers/`init` blocks/method bodies), each with real
+    /// diagnostics and, for an inferred (unannotated) property/method
+    /// return type, a patch back into `class_info` once the real type is
+    /// known — again mirroring `FunDecl`'s own after-the-body patch.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_class_decl(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        ctor_params: &[ClassParam],
+        members: &[ClassMember],
+        doc_comment: Option<&str>,
+        scope: usize,
+        following: Span,
+        own_span: Span,
+    ) {
+        let doc = doc_comment.map(crate::doc_comment::parse).map(|d| d.summary).filter(|s| !s.is_empty());
+        let ctor_sig_params = ctor_params
+            .iter()
+            .map(|cp| match &cp.param.type_annotation {
+                Some(ann) => format!("{}: {}", cp.param.name, type_annotation_display(ann)),
+                None => cp.param.name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A bare reference to the class's own name (`val c = Point`, no
+        // call) is the class *value* itself — `Type::Unknown` at runtime
+        // (see `Type::from_value`'s `Value::Class` arm), deliberately not
+        // `Type::Class(name)`, which is reserved for a real *instance*'s
+        // type (`this`, and a constructed `Point(...)` call's result).
+        // `param_types`/`param_names` are patched in below, once the
+        // constructor's own real signature is computed — `ksl-lsp`'s
+        // completion reads them straight off this `Symbol` (`named_arg_
+        // completions`) to offer `paramName =` inside `Point(...)`'s own
+        // argument list, the same way it already does for an ordinary
+        // `fun`'s `Symbol`.
+        let class_idx = self.define(
+            scope,
+            name,
+            SymbolKind::Class,
+            name_span,
+            false,
+            format!("class {name}({ctor_sig_params})"),
+            Type::Unknown,
+            Type::Unknown,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            doc,
+        );
+
+        let mut fields = Vec::new();
+        for cp in ctor_params {
+            if let Some(mutable) = cp.field {
+                let ty = cp
+                    .param
+                    .type_annotation
+                    .as_ref()
+                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                    .unwrap_or(Type::Unknown);
+                // `symbol_idx` is a placeholder here — patched below, once
+                // the ctor param's own real `Symbol` is defined into
+                // `ctor_scope` (Phase 2 defines it; Phase 1 only computes
+                // signatures).
+                fields.push(ClassFieldInfo { name: cp.param.name.clone(), ty, mutable, symbol_idx: 0 });
+            }
+        }
+        for m in members {
+            if let ClassMember::Property { name: fname, type_annotation, mutable, .. } = m {
+                let ty = type_annotation
+                    .as_ref()
+                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                    .unwrap_or(Type::Unknown);
+                // Patched below too, once `define_class_member` runs for
+                // this property in Phase 2.
+                fields.push(ClassFieldInfo { name: fname.clone(), ty, mutable: *mutable, symbol_idx: 0 });
+            }
+        }
+        let mut methods = Vec::new();
+        for m in members {
+            if let ClassMember::Method(method_stmt) = m {
+                if let StmtKind::FunDecl { name: mname, return_type, params, .. } = &method_stmt.kind {
+                    let ret_ty = return_type
+                        .as_ref()
+                        .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                        .unwrap_or(Type::Unknown);
+                    let param_types = params
+                        .iter()
+                        .map(|p| {
+                            p.type_annotation
+                                .as_ref()
+                                .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                                .unwrap_or(Type::Unknown)
+                        })
+                        .collect();
+                    let param_names = params.iter().map(|p| p.name.clone()).collect();
+                    methods.push(ClassMethodInfo {
+                        name: mname.clone(),
+                        return_type: ret_ty,
+                        param_types,
+                        param_names,
+                        param_docs: vec![None; params.len()],
+                        // Patched in `walk_class_method`, once its real
+                        // `define_class_member` call returns a real index.
+                        symbol_idx: 0,
+                    });
+                }
+            }
+        }
+        let ctor_param_types: Vec<Type> = ctor_params
+            .iter()
+            .map(|cp| {
+                cp.param
+                    .type_annotation
+                    .as_ref()
+                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                    .unwrap_or(Type::Unknown)
+            })
+            .collect();
+        let ctor_param_names: Vec<String> = ctor_params.iter().map(|cp| cp.param.name.clone()).collect();
+        self.table.symbols[class_idx].param_types = ctor_param_types.clone();
+        self.table.symbols[class_idx].param_names = ctor_param_names.clone();
+        self.class_info.insert(Rc::from(name), ClassInfo { fields, methods, ctor_param_types, ctor_param_names });
+
+        // The constructor's own scope (ctor params, bare — property
+        // initializers/`init` blocks see them directly, matching
+        // `construct_object`'s `ctor_env`) and each method's own body
+        // scope (built by `walk_class_method`) are *siblings*, both
+        // direct children of `scope` — not one nested inside the other —
+        // so a method body never sees the primary constructor's own
+        // (non-promoted) parameters, matching runtime exactly (a method
+        // call's own frame is `class.closure.child()`, never `ctor_env`).
+        // `this` is defined separately in each one (cheap, harmless
+        // duplication) rather than shared through a common parent scope,
+        // for the same reason.
+        let ctor_scope = self.open_scope(scope, own_span, following, ScopeKind::Other);
+        self.define(
+            ctor_scope,
+            "this",
+            SymbolKind::Val,
+            name_span,
+            false,
+            format!("this: {name}"),
+            Type::Class(Rc::from(name)),
+            Type::Unknown,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        for cp in ctor_params {
+            let ty = self.resolve_type_annotation_here(cp.param.type_annotation.as_ref());
+            if cp.param.type_annotation.is_none() {
+                self.type_errors.push(RuntimeError::new(
+                    format!("constructor parameter '{}' must have an explicit type annotation", cp.param.name),
+                    cp.param.name_span,
+                ));
+            }
+            let sig = match &ty {
+                Type::Unknown => format!("param {}", cp.param.name),
+                t => format!("param {}: {}", cp.param.name, t.name()),
+            };
+            let param_idx = self.define(
+                ctor_scope,
+                &cp.param.name,
+                SymbolKind::Param,
+                cp.param.name_span,
+                cp.field == Some(true),
+                sig,
+                ty,
+                Type::Unknown,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
+            // A promoted field (`val`/`var` ctor param) has no separate
+            // declaration site of its own — `this.x`'s own use sites point
+            // back at the ctor param's real symbol directly (see
+            // `ClassFieldInfo::symbol_idx`'s doc comment).
+            if cp.field.is_some() {
+                if let Some(info) = self.class_info.get_mut(name) {
+                    if let Some(f) = info.fields.iter_mut().find(|f| f.name == cp.param.name) {
+                        f.symbol_idx = param_idx;
+                    }
+                }
+                self.table.class_members.entry(name.to_string()).or_default().push(param_idx);
+            }
+        }
+
+        // Implicit `this` (see `current_class`'s own doc comment) is in
+        // effect for every member body below — property initializers,
+        // `init` blocks, and (via `walk_class_method`) every method body —
+        // restored to whatever it was before (always `None` today, since
+        // classes can't nest, but this stays correct if that ever
+        // changes).
+        let outer_class = self.current_class.replace(Rc::from(name));
+        for m in members {
+            match m {
+                ClassMember::Property { name: fname, name_span: fspan, type_annotation, mutable, init, doc_comment } => {
+                    let expected = type_annotation.as_ref().map(|a| self.resolve_type_annotation_here(Some(a)));
+                    let init_ty = self.walk_expr_expected(init, ctor_scope, following, expected.as_ref());
+                    let field_ty = match &expected {
+                        Some(t) => {
+                            if init_ty != Type::Unknown && *t != Type::Unknown && !types::is_assignable(&init_ty, t) {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!(
+                                        "property '{fname}' has type {}, but its initializer has type {}",
+                                        t.name(),
+                                        init_ty.name()
+                                    ),
+                                    init.span,
+                                ));
+                            }
+                            t.clone()
+                        }
+                        None => {
+                            if init_ty == Type::Unknown {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!("cannot infer type of property '{fname}'; add an explicit type annotation"),
+                                    *fspan,
+                                ));
+                            }
+                            init_ty
+                        }
+                    };
+                    if let Some(info) = self.class_info.get_mut(name) {
+                        if let Some(f) = info.fields.iter_mut().find(|f| f.name == *fname) {
+                            f.ty = field_ty.clone();
+                        }
+                    }
+                    let sig = match &field_ty {
+                        Type::Unknown => format!("{} {fname}", if *mutable { "var" } else { "val" }),
+                        t => format!("{} {fname}: {}", if *mutable { "var" } else { "val" }, t.name()),
+                    };
+                    let member_doc =
+                        doc_comment.as_deref().map(crate::doc_comment::parse).map(|d| d.summary).filter(|s| !s.is_empty());
+                    let field_idx = self.define_class_member(
+                        SymbolKind::Field,
+                        fname,
+                        *fspan,
+                        *mutable,
+                        sig,
+                        field_ty,
+                        Type::Unknown,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        member_doc,
+                    );
+                    if let Some(info) = self.class_info.get_mut(name) {
+                        if let Some(f) = info.fields.iter_mut().find(|f| f.name == *fname) {
+                            f.symbol_idx = field_idx;
+                        }
+                    }
+                    self.table.class_members.entry(name.to_string()).or_default().push(field_idx);
+                }
+                ClassMember::Init(stmts) => {
+                    self.walk_stmts(stmts, ctor_scope, following);
+                }
+                ClassMember::Method(method_stmt) => {
+                    self.walk_class_method(method_stmt, name, scope, following);
+                }
+            }
+        }
+        self.current_class = outer_class;
+    }
+
+    /// A class method's own body — near-identical to `StmtKind::FunDecl`'s
+    /// own handling (same return-type inference, same doc-comment
+    /// building), except the method's own name gets a synthesized,
+    /// non-scope-registered `Symbol` (`define_class_member`, not
+    /// `define` — see its doc comment) rather than a bare-callable one,
+    /// and its own body scope additionally carries a real `this` (typed
+    /// `Type::Class(class_name)`). An inferred (unannotated) return type
+    /// is patched back into `self.class_info[class_name]`'s own entry
+    /// once known, mirroring `FunDecl`'s identical patch of its own
+    /// symbol.
+    fn walk_class_method(&mut self, stmt: &Stmt, class_name: &str, scope: usize, following: Span) {
+        let StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment } = &stmt.kind else {
+            return;
+        };
+        let parsed_doc = doc_comment.as_deref().map(crate::doc_comment::parse);
+        let fun_doc = parsed_doc.as_ref().and_then(|d| {
+            if d.summary.is_empty() && d.returns.is_none() && d.params.is_empty() {
+                None
+            } else {
+                let mut parts = Vec::new();
+                if !d.summary.is_empty() {
+                    parts.push(d.summary.clone());
+                }
+                if !d.params.is_empty() {
+                    let mut block = String::from("**Parameters:**");
+                    for (pname, desc) in &d.params {
+                        block.push_str(&format!("\n- `{pname}` — {desc}"));
+                    }
+                    parts.push(block);
+                }
+                if let Some(returns) = &d.returns {
+                    parts.push(format!("**Returns:** {returns}"));
+                }
+                Some(parts.join("\n\n"))
+            }
+        });
+        let ret_ty = self.resolve_type_annotation_here(return_type.as_ref());
+        let param_types: Vec<Type> = params
+            .iter()
+            .map(|p| match &p.type_annotation {
+                Some(ann) => types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes),
+                None => Type::Unknown,
+            })
+            .collect();
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let param_docs: Vec<Option<String>> =
+            params.iter().map(|p| parsed_doc.as_ref().and_then(|d| d.param(&p.name)).map(str::to_string)).collect();
+        let has_return_annotation = return_type.is_some();
+
+        let method_idx = self.define_class_member(
+            SymbolKind::Method,
+            name,
+            *name_span,
+            false,
+            format!("fun {name}({})", param_list(params)),
+            Type::Function(param_types.clone(), Box::new(ret_ty.clone())),
+            ret_ty.clone(),
+            param_types.clone(),
+            param_names.clone(),
+            param_docs.clone(),
+            fun_doc,
+        );
+        if let Some(info) = self.class_info.get_mut(class_name) {
+            if let Some(m) = info.methods.iter_mut().find(|m| m.name == *name) {
+                m.symbol_idx = method_idx;
+            }
+        }
+        self.table.class_members.entry(class_name.to_string()).or_default().push(method_idx);
+
+        let fn_scope = self.open_scope(scope, stmt.span, following, ScopeKind::FunctionBoundary);
+        self.define(
+            fn_scope,
+            "this",
+            SymbolKind::Val,
+            *name_span,
+            false,
+            format!("this: {class_name}"),
+            Type::Class(Rc::from(class_name)),
+            Type::Unknown,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        self.walk_params(params, fn_scope, following, parsed_doc.as_ref());
+        self.return_type_stack.push(if has_return_annotation {
+            ReturnTypeContext::Expected(ret_ty.clone())
+        } else {
+            ReturnTypeContext::Collect(Vec::new())
+        });
+        let body_ty = match body {
+            FunBody::Expr(e) => self.walk_expr(e, fn_scope, following),
+            FunBody::Block(stmts) => self.walk_stmts(stmts, fn_scope, following),
+        };
+        let ctx = self.return_type_stack.pop().unwrap();
+        let final_ret_ty = match ctx {
+            ReturnTypeContext::Expected(declared) => {
+                if matches!(body, FunBody::Expr(_))
+                    && body_ty != Type::Unknown
+                    && declared != Type::Unknown
+                    && !types::is_assignable(&body_ty, &declared)
+                {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("return type mismatch: expected {}, got {}", declared.name(), body_ty.name()),
+                        stmt.span,
+                    ));
+                }
+                declared
+            }
+            ReturnTypeContext::Collect(mut seen) => {
+                let falls_through = match body {
+                    FunBody::Expr(_) => true,
+                    FunBody::Block(stmts) => !stmts.last().map(always_returns).unwrap_or(false),
+                };
+                if falls_through {
+                    seen.push(body_ty.clone());
+                }
+                match reconcile_types(&seen) {
+                    Reconciled::Agreed(t) => t,
+                    Reconciled::Nothing => {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("cannot infer return type of method '{name}'; add an explicit return type annotation"),
+                            *name_span,
+                        ));
+                        Type::Unknown
+                    }
+                    Reconciled::Disagreement(a, b) => {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("method '{name}' returns both {} and {}", a.name(), b.name()),
+                            stmt.span,
+                        ));
+                        Type::Unknown
+                    }
+                }
+            }
+        };
+        if let Some(info) = self.class_info.get_mut(class_name) {
+            if let Some(m) = info.methods.iter_mut().find(|m| m.name == *name) {
+                m.return_type = final_ret_ty.clone();
+            }
+        }
+        // The signature built at `define_class_member()` time above (before
+        // the body was walked) couldn't have known this yet — mirrors
+        // `StmtKind::FunDecl`'s identical patch of its own symbol's
+        // signature string, for the same reason (an unannotated return
+        // type is only known after walking the body).
+        self.table.symbols[method_idx].signature = match &final_ret_ty {
+            Type::Unknown => format!("fun {name}({})", param_list(params)),
+            t => format!("fun {name}({}): {}", param_list(params), t.name()),
+        };
+    }
+
+    /// The full checkable signature of `t.method(...)` for a real value
+    /// receiver (a package-qualified path never reaches this — see
+    /// `ExprKind::MethodCall`'s own handling) — unifies dispatch for a
+    /// builtin receiver (`Int`, `String`, ...) and a user class
+    /// (`Type::Class(name)`): a user class's own method wins if declared,
+    /// else falls through to `Any`'s native methods (every user class
+    /// implicitly extends `Any`, single hop — see `ClassInfo`'s doc
+    /// comment), exactly mirroring `class::lookup_method`'s runtime rule.
+    /// `None` for an `Unknown` receiver (deferred, not an error) or a
+    /// receiver type with no such method anywhere in its chain.
+    fn class_method_signature(&self, t: &Type, method: &str) -> Option<CallSignature> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        if *t == Type::Unknown {
+            return None;
+        }
+        let name = t.name();
+        if let Some(info) = self.class_info.get(name.as_str()) {
+            if let Some(m) = info.methods.iter().find(|m| m.name == method) {
+                return Some((m.return_type.clone(), m.param_types.clone(), m.param_names.clone(), m.param_docs.clone()));
+            }
+            return crate::stdlib::builtin_method_signature("Any", method);
+        }
+        crate::stdlib::builtin_method_signature(&name, method)
+    }
+
+    /// `(field's type, mutable)` for `t.field`/`t.field = ...` — a real
+    /// value receiver only (`Type::Class(name)` matching a known
+    /// `ClassInfo`); `Any` has no fields, so a class's own miss here is
+    /// always `None`, never a fallback (unlike `class_method_signature`).
+    fn class_field_type(&self, t: &Type, field: &str) -> Option<(Type, bool)> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        self.class_info.get(name.as_str()).and_then(|info| info.fields.iter().find(|f| f.name == field).map(|f| (f.ty.clone(), f.mutable)))
+    }
+
+    /// The field's own declaration-site `Symbol` index, for recording a
+    /// real `occurrences` entry at a `this.field`/`obj.field` *use* site —
+    /// see `ClassFieldInfo::symbol_idx`'s doc comment. `None` in exactly
+    /// the same cases `class_field_type` returns `None`.
+    fn class_field_symbol_idx(&self, t: &Type, field: &str) -> Option<usize> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        self.class_info.get(name.as_str()).and_then(|info| info.fields.iter().find(|f| f.name == field).map(|f| f.symbol_idx))
+    }
+
+    /// The method's own declaration-site `Symbol` index — `None` both when
+    /// no such method exists at all *and* when it resolved only through
+    /// `Any`'s native fallback (which has no resolver-side `Symbol` of its
+    /// own to point at; see `class_method_signature`'s identical fallback).
+    fn class_method_symbol_idx(&self, t: &Type, method: &str) -> Option<usize> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        self.class_info.get(name.as_str()).and_then(|info| info.methods.iter().find(|m| m.name == method).map(|m| m.symbol_idx))
     }
 
     /// A lambda's parameters, unlike a named `fun`'s (`walk_params`), are
@@ -1961,7 +2785,29 @@ impl<'a> Resolver<'a> {
     /// argument, not one buried three calls deep inside it), so every
     /// nested `walk_expr`/`walk_stmt` call below still goes through the
     /// plain, expected-type-less path.
+    /// Thin wrapper over `walk_expr_expected_inner` — records every
+    /// expression's own span and computed `Type` into `self.table.
+    /// expr_types` (`ksl-lsp`'s completion reads this, via `SymbolTable::
+    /// type_ending_before`, to find "what's the static type of whatever
+    /// sits right before this `.`", entirely from the AST rather than
+    /// re-parsing text). Wrapping the whole function this way — rather
+    /// than pushing at the tail of its own body — is what makes this
+    /// correct even for `ExprKind::Call`'s own early `return`s (real
+    /// overload resolution shortcuts several hundred lines into that
+    /// arm): `return` only ever unwinds the *inner* function, so every
+    /// exit path still passes back through this wrapper exactly once
+    /// before reaching any caller. Every recursive call inside `_inner`'s
+    /// own body still says `self.walk_expr`/`self.walk_expr_expected` (its
+    /// pre-rename name) — after this split, that name refers to *this*
+    /// wrapper, so nested sub-expressions get recorded too, not just the
+    /// outermost one.
     fn walk_expr_expected(&mut self, expr: &Expr, scope: usize, following: Span, expected: Option<&Type>) -> Type {
+        let ty = self.walk_expr_expected_inner(expr, scope, following, expected);
+        self.table.expr_types.push((expr.span, ty.clone()));
+        ty
+    }
+
+    fn walk_expr_expected_inner(&mut self, expr: &Expr, scope: usize, following: Span, expected: Option<&Type>) -> Type {
         self.touch(scope, expr.span);
         match &expr.kind {
             ExprKind::IntLit(_) => Type::Int,
@@ -1992,26 +2838,28 @@ impl<'a> Resolver<'a> {
                 self.table.name_refs.push((*name_span, name.clone()));
                 self.resolve_name(scope, name, *name_span)
             }
-            // `receiver.field` — this resolver has no notion of packages or
-            // (pre-Phase-5) object fields, so it can't tell a local field
-            // access apart from a package-qualified reference any more
-            // than the interpreter can at parse time (see
-            // `ExprKind::FieldAccess`'s doc comment). Mirrors
-            // `Interpreter::dotted_path_if_unresolved`'s approach: if the
-            // whole chain is bare identifiers and its base name does *not*
-            // resolve to a real local declaration, record it in
+            // `receiver.field` — this resolver has no notion of packages, so
+            // it can't tell a local field access apart from a package-
+            // qualified reference any more than the interpreter can at
+            // parse time (see `ExprKind::FieldAccess`'s doc comment).
+            // Mirrors `Interpreter::dotted_path_if_unresolved`'s approach:
+            // if the whole chain is bare identifiers and its base name does
+            // *not* resolve to a real local declaration, record it in
             // `qualified_refs` (never flagged as undefined — deferred to
             // `ksl-lsp`'s cross-file package index, or to the interpreter
             // at runtime) instead of walking it as an ordinary expression.
-            // A receiver that *is* a real local, though, is an immediate
-            // error — no value has real fields until classes exist (same
-            // wording as the runtime error this mirrors), unless the
-            // receiver's own type is itself `Unknown` (an already-reported
-            // problem elsewhere — don't cascade a second diagnostic onto
-            // it here).
-            ExprKind::FieldAccess { receiver, field, safe, .. } => {
-                match self.dotted_path_if_not_local(expr, scope) {
-                    Some(path) => self.table.qualified_refs.push((expr.span, path)),
+            // A receiver that *is* a real local looks up the field for
+            // real via `class_field_type` (a real `Type::Class` receiver —
+            // including `this`) — "has no field" only when the receiver's
+            // own type is concretely known and genuinely has none (an
+            // `Unknown` receiver is an already-reported problem elsewhere,
+            // never a second cascading diagnostic here).
+            ExprKind::FieldAccess { receiver, field, field_span, safe } => {
+                let result_ty = match self.dotted_path_if_not_local(expr, scope) {
+                    Some(path) => {
+                        self.table.qualified_refs.push((expr.span, path));
+                        Type::Unknown
+                    }
                     None => {
                         let recv_ty = self.walk_expr(receiver, scope, following);
                         // An unsafe (`.`) access on a still-nullable
@@ -2022,6 +2870,9 @@ impl<'a> Resolver<'a> {
                         // field" message. A narrowed receiver never reaches
                         // here as `Nullable` in the first place (see
                         // `resolve_name`'s smart-cast integration).
+                        // `class_field_type` unwraps `Nullable` itself, so
+                        // a safe (`?.`) access on a nullable receiver still
+                        // finds its field, wrapped `Nullable` again below.
                         if let Type::Nullable(_) = &recv_ty {
                             if !*safe {
                                 self.type_errors.push(RuntimeError::new(
@@ -2032,15 +2883,39 @@ impl<'a> Resolver<'a> {
                                     expr.span,
                                 ));
                             }
-                        } else if recv_ty != Type::Unknown {
-                            self.type_errors.push(RuntimeError::new(
-                                format!("'{}' has no field '{field}'", recv_ty.name()),
-                                expr.span,
-                            ));
+                            if let Some(idx) = self.class_field_symbol_idx(&recv_ty, field) {
+                                self.table.occurrences.push((*field_span, idx));
+                            }
+                            self.class_field_type(&recv_ty, field).map(|(ty, _)| ty).unwrap_or(Type::Unknown)
+                        } else if recv_ty == Type::Unknown {
+                            Type::Unknown
+                        } else {
+                            match self.class_field_type(&recv_ty, field) {
+                                Some((ty, _)) => {
+                                    if let Some(idx) = self.class_field_symbol_idx(&recv_ty, field) {
+                                        self.table.occurrences.push((*field_span, idx));
+                                    }
+                                    ty
+                                }
+                                None => {
+                                    self.type_errors.push(RuntimeError::new(
+                                        format!("'{}' has no field '{field}'", recv_ty.name()),
+                                        expr.span,
+                                    ));
+                                    Type::Unknown
+                                }
+                            }
                         }
                     }
+                };
+                // A safe (`?.`) access's own result is nullable whenever it
+                // produced a real type — matches `MethodCall`'s identical
+                // rule (`s?.length()` is `Int?`, not `Int`).
+                if *safe && result_ty != Type::Unknown {
+                    Type::Nullable(Box::new(result_ty))
+                } else {
+                    result_ty
                 }
-                Type::Unknown
             }
             ExprKind::MethodCall { receiver, method, method_span, args, safe } => {
                 self.table.method_refs.push((*method_span, method.clone()));
@@ -2112,6 +2987,25 @@ impl<'a> Resolver<'a> {
                     }
                 };
                 let use_overload_resolution = overloads.len() > 1 || user_candidates.len() > 1;
+                // The receiver-type-dispatched case (a real value receiver,
+                // not a package-qualified path — `recv_ty` is `Some(..)`)
+                // — computed *before* `walk_call_args` runs, same as the
+                // qualified-path/stdlib signature just below, so a class
+                // method's named arguments get checked by name exactly
+                // like a stdlib/cross-file call's already do (this phase's
+                // own plan flags this ordering as risk #6: getting it
+                // wrong silently drops named-argument checking for every
+                // method call).
+                let class_method_signature: Option<CallSignature> =
+                    recv_ty.as_ref().and_then(|t| self.class_method_signature(t, method));
+                // A real user-defined method (not `Any`'s native
+                // fallback, which has no resolver-side `Symbol` to point
+                // at — see `class_method_symbol_idx`'s doc comment) gets a
+                // real `occurrences` entry at its own call-site span, the
+                // same way any other declared symbol's use does.
+                if let Some(idx) = recv_ty.as_ref().and_then(|t| self.class_method_symbol_idx(t, method)) {
+                    self.table.occurrences.push((*method_span, idx));
+                }
                 let signature = if use_overload_resolution {
                     None
                 } else {
@@ -2130,6 +3024,7 @@ impl<'a> Resolver<'a> {
                                 (m.symbol.return_type.clone(), m.symbol.param_types.clone(), names, m.symbol.param_docs.clone())
                             })
                         })
+                        .or_else(|| class_method_signature.clone())
                 };
                 let arg_infos = self.walk_call_args(args, signature.as_ref(), scope, following);
                 // An unsafe (`.`) call on a still-nullable receiver is
@@ -2160,26 +3055,19 @@ impl<'a> Resolver<'a> {
                         Some(t) => {
                             // A `Nullable(T)` receiver here can only be a
                             // *safe* (`?.`) call at this point (the unsafe
-                            // case already returned above) — dispatches
-                            // against `T`'s own builtin-method table
+                            // case already returned above) — `class_
+                            // method_signature` unwraps `Nullable` itself
                             // (`String?`'s methods are exactly `String`'s —
-                            // matches Kotlin's own safe-call semantics).
-                            let dispatch_name = match t {
-                                Type::Nullable(inner) => inner.name(),
-                                other => other.name(),
-                            };
-                            let known = crate::stdlib::BUILTIN_METHOD_SIGNATURES
-                                .iter()
-                                .any(|(recv_type, name, ..)| *recv_type == dispatch_name && *name == method);
-                            if known {
-                                crate::stdlib::builtin_method_return_type(&dispatch_name, method)
-                            } else {
+                            // matches Kotlin's own safe-call semantics),
+                            // covering both a real builtin receiver and a
+                            // user class (falling through to `Any`).
+                            if class_method_signature.is_none() {
                                 self.type_errors.push(RuntimeError::new(
                                     format!("'{}' has no method '{method}'", t.name()),
                                     *method_span,
                                 ));
-                                Type::Unknown
                             }
+                            self.check_call_signature(&arg_infos, class_method_signature, *method_span)
                         }
                         // The qualified-path case (`kotlin.test.assertFalse(...)`,
                         // or a real user package's `a.b.c(...)`): `signature`/
@@ -2443,6 +3331,24 @@ impl<'a> Resolver<'a> {
                                 // parameters).
                                 if s.kind == SymbolKind::Fun {
                                     Some((s.return_type.clone(), s.param_types.clone(), s.param_names.clone(), s.param_docs.clone()))
+                                } else if s.kind == SymbolKind::Class {
+                                    // Constructing an instance — `Point(3,
+                                    // 4)` — not a bare reference to the
+                                    // class itself (`s.ty`, unlike this
+                                    // call's own result, stays
+                                    // `Type::Unknown`; see `walk_class_decl`'s
+                                    // doc comment on why). The primary
+                                    // constructor's real parameter types/
+                                    // names live in `class_info`, not on
+                                    // the class's own `Symbol`.
+                                    self.class_info.get(name.as_str()).map(|info| {
+                                        (
+                                            Type::Class(Rc::from(name.as_str())),
+                                            info.ctor_param_types.clone(),
+                                            info.ctor_param_names.clone(),
+                                            vec![None; info.ctor_param_types.len()],
+                                        )
+                                    })
                                 } else if let Type::Function(params, ret) = &s.ty {
                                     let names = vec![String::new(); params.len()];
                                     let docs = vec![None; params.len()];
@@ -2450,6 +3356,23 @@ impl<'a> Resolver<'a> {
                                 } else {
                                     None
                                 }
+                            })
+                            .or_else(|| {
+                                // Implicit `this`: `name` isn't a local at
+                                // all (the `and_then` above only reaches
+                                // here when `resolve_symbol` found
+                                // nothing), but the enclosing class (if
+                                // any) has a method by that name — same
+                                // precedence `resolve_name` already
+                                // establishes (local shadows field/method,
+                                // checked first; this is only ever a
+                                // fallback). Gives `foo()` real named-
+                                // argument checking against `this.foo`'s
+                                // actual signature, not just a suppressed
+                                // "undefined name".
+                                self.current_class
+                                    .clone()
+                                    .and_then(|c| self.class_method_signature(&Type::Class(c), name))
                             })
                             .or_else(|| {
                                 crate::stdlib::stdlib_call_types(name)
@@ -2680,6 +3603,14 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
+            // `this` is a real symbol, defined once per constructor/`init`
+            // scope and once per method's own body scope (see
+            // `walk_class_decl`/`walk_class_method`) — ordinary name
+            // resolution handles it exactly like any other local. The
+            // parser already rejects `this` anywhere outside a class
+            // member (`class_member_depth`), so reaching here with no
+            // `this` in scope is not a real user-facing case.
+            ExprKind::This => self.resolve_name(scope, "this", expr.span),
         }
     }
 }
@@ -2979,6 +3910,37 @@ mod tests {
         assert_eq!(span.col, 1);
         // Not present outside the qualified-name expression's own span.
         assert!(result.table.qualified_ref_at(1, 25).is_none());
+    }
+
+    #[test]
+    fn type_ending_before_finds_a_constructor_calls_own_type() {
+        // "val o = P(1)" is 12 characters — the widened `Call` span
+        // (`parser.rs`'s `parse_postfix`) ends right after its own `)`,
+        // at column 13 (1-based, one-past-the-last-character).
+        let result = resolve_src("class P(val x: Int)\nval o = P(1)\n");
+        assert_eq!(result.table.type_ending_before(2, 14), Some(&Type::Class(Rc::from("P"))));
+        // Querying right at the `Call`'s own boundary (its `end_col` is
+        // 13, so `< 13` excludes it) still correctly finds the *inner*
+        // `1` argument's own type (`Int`, ending at column 12) — proof
+        // `max_by_key` genuinely prefers whichever recorded expression is
+        // closest to the query position, not just the outermost one
+        // unconditionally.
+        assert_eq!(result.table.type_ending_before(2, 13), Some(&Type::Int));
+    }
+
+    #[test]
+    fn type_ending_before_finds_a_bare_names_own_type() {
+        // "println(x)" — "println(" is 8 characters, "x" spans columns
+        // 9..10 (end_col 10, one-past).
+        let result = resolve_src("val x = 5\nprintln(x)\n");
+        assert_eq!(result.table.type_ending_before(2, 11), Some(&Type::Int));
+    }
+
+    #[test]
+    fn type_ending_before_is_none_with_nothing_recorded_there() {
+        let result = resolve_src("val x = 5\nprintln(x)\n");
+        assert_eq!(result.table.type_ending_before(2, 1), None);
+        assert_eq!(result.table.type_ending_before(99, 1), None);
     }
 
     #[test]
@@ -4091,6 +5053,199 @@ mod tests {
         // `!(s == null)` is equivalent to `s != null` for narrowing
         // purposes.
         let result = resolve_src("fun f(s: String?): Int {\n    if (!(s == null)) {\n        return s.length()\n    }\n    return -1\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn constructing_a_class_infers_its_instance_type() {
+        let result = resolve_src("class Point(val x: Int, val y: Int)\nval p = Point(1, 2)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        let (_, symbol) = result.table.occurrence_at(2, 5).expect("p should resolve");
+        assert_eq!(symbol.ty, Type::Class(Rc::from("Point")));
+    }
+
+    #[test]
+    fn constructor_named_arguments_are_checked_by_name() {
+        let result = resolve_src("class Point(val x: Int, val y: Int)\nval p = Point(y = 2, x = 1)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        let bad = resolve_src("class Point(val x: Int, val y: Int)\nval p = Point(z = 2, x = 1)\n");
+        assert!(bad.type_errors.iter().any(|e| e.message.contains("unknown parameter 'z'")), "{:?}", bad.type_errors);
+    }
+
+    #[test]
+    fn constructor_argument_type_mismatch_is_flagged() {
+        let result = resolve_src("class Point(val x: Int)\nval p = Point(\"nope\")\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("argument 1")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn field_access_and_assignment_are_checked() {
+        let ok = resolve_src("class Point(val x: Int, var y: Int)\nval p = Point(1, 2)\nfun f() {\n    p.y = 3\n}\n");
+        assert!(ok.type_errors.is_empty(), "{:?}", ok.type_errors);
+
+        let unknown_field = resolve_src("class Point(val x: Int)\nval p = Point(1)\nprintln(p.z)\n");
+        assert!(unknown_field.type_errors.iter().any(|e| e.message.contains("'Point' has no field 'z'")), "{:?}", unknown_field.type_errors);
+
+        let reassign_val = resolve_src("class Point(val x: Int)\nval p = Point(1)\nfun f() {\n    p.x = 2\n}\n");
+        assert!(reassign_val.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'x'")), "{:?}", reassign_val.type_errors);
+
+        let wrong_type = resolve_src("class Point(var x: Int)\nval p = Point(1)\nfun f() {\n    p.x = \"nope\"\n}\n");
+        assert!(wrong_type.type_errors.iter().any(|e| e.message.contains("cannot assign")), "{:?}", wrong_type.type_errors);
+    }
+
+    #[test]
+    fn user_defined_method_calls_are_checked_including_named_arguments() {
+        let result = resolve_src(
+            "class Greeter(val name: String) {\n    fun greet(prefix: String): String = prefix + this.name\n}\nval g = Greeter(\"World\")\nprintln(g.greet(prefix = \"Hi \"))\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        let unknown_method = resolve_src("class Point(val x: Int)\nval p = Point(1)\np.bark()\n");
+        assert!(unknown_method.type_errors.iter().any(|e| e.message.contains("'Point' has no method 'bark'")), "{:?}", unknown_method.type_errors);
+    }
+
+    #[test]
+    fn a_class_with_no_to_string_override_still_resolves_the_inherited_any_method() {
+        // No `toString`/`equals`/`hashCode` declared on `Point` at all —
+        // every user class implicitly extends the real builtin `Any` (see
+        // `ClassInfo`'s doc comment), so these must still resolve, with
+        // `Any`'s own real return types, not be flagged as unknown methods.
+        let result = resolve_src(
+            "class Point(val x: Int)\nval p = Point(1)\nval s: String = p.toString()\nval h: Int = p.hashCode()\nval b: Boolean = p.equals(p)\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn this_resolves_to_the_enclosing_classs_instance_type() {
+        let result = resolve_src("class Point(val x: Int) {\n    fun getX(): Int = this.x\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_a_method_can_bare_reference_a_promoted_field() {
+        let result = resolve_src("class Point(val x: Int) {\n    fun getX(): Int = x\n}\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_a_method_can_bare_reference_a_body_property() {
+        let result = resolve_src("class C {\n    val a: Int = 5\n    fun f(): Int = a\n}\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_a_method_can_bare_call_another_method_with_named_arguments_checked() {
+        let result = resolve_src("class C {\n    fun foo(step: Int): Int = step\n    fun bar(): Int = foo(step = 1)\n}\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        let bad = resolve_src("class C {\n    fun foo(step: Int): Int = step\n    fun bar(): Int = foo(nope = 1)\n}\n");
+        assert!(bad.type_errors.iter().any(|e| e.message.contains("unknown parameter 'nope'")), "{:?}", bad.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_a_property_can_bare_reference_another_property() {
+        let result = resolve_src("class C {\n    val a: Int = 5\n    val b: Int = a + 1\n}\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_bare_assignment_to_a_var_field_is_checked() {
+        let ok = resolve_src("class C {\n    var count: Int = 0\n    fun bump() {\n        count = count + 1\n    }\n}\n");
+        assert!(ok.diagnostics.is_empty(), "{:?}", ok.diagnostics);
+        assert!(ok.type_errors.is_empty(), "{:?}", ok.type_errors);
+
+        let reassign_val = resolve_src("class C {\n    val a: Int = 5\n    fun f() {\n        a = 6\n    }\n}\n");
+        assert!(reassign_val.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'a'")), "{:?}", reassign_val.type_errors);
+
+        let wrong_type = resolve_src("class C {\n    var a: Int = 5\n    fun f() {\n        a = \"nope\"\n    }\n}\n");
+        assert!(wrong_type.type_errors.iter().any(|e| e.message.contains("cannot assign")), "{:?}", wrong_type.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_bare_inc_dec_on_a_var_field_is_accepted() {
+        let result = resolve_src("class C {\n    var count: Int = 0\n    fun bump() {\n        count++\n    }\n}\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn implicit_this_a_method_can_bare_call_the_inherited_any_methods() {
+        let result = resolve_src("class C {\n    fun describe(): String = toString()\n}\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn implicit_this_a_local_of_the_same_name_shadows_the_field() {
+        // Real Kotlin's own rule: a local variable/parameter always wins
+        // over a same-named field — reaching it would need explicit
+        // `this.x`. Here the local `x` (a `String` param) shadows the
+        // `Int` field, so returning it as `Int` is a real type error —
+        // proof the *local*, not the field, was what actually resolved.
+        let result = resolve_src("class Point(val x: Int) {\n    fun f(x: String): Int = x\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("return type mismatch")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn constructor_parameters_are_bare_visible_in_the_constructors_own_scope_too() {
+        // A ctor-only (non-promoted) parameter has no field at all — it's
+        // only ever a real, bare binding *inside the constructor's own
+        // scope* (property initializers, `init` blocks), matching
+        // `construct_object`'s real `ctor_env` at runtime; a promoted one
+        // is bare-visible there *and* (via implicit `this`) everywhere
+        // else in the class.
+        let result = resolve_src("class Greeting(prefix: String, val name: String) {\n    val text: String = prefix + name\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_class_referenced_before_its_own_declaration_still_resolves() {
+        // `known_classes`'s real predpass (top-level names, before
+        // `walk_stmts` runs) — a function's own type annotation can name a
+        // class declared later in the same file, resolving to a real
+        // `Type::Class` rather than an "unknown type" error. A *member*
+        // access through such a not-yet-walked class (e.g. calling a
+        // method on `p` inside `describe`'s own body) is a real, accepted
+        // limitation instead — `class_info` isn't populated until
+        // `Point`'s own `ClassDecl` is walked, textually later in this
+        // same file (see `Resolver::class_info`'s doc comment) — so this
+        // only exercises the annotation itself, not a member access.
+        let result = resolve_src("fun describe(p: Point) {}\nclass Point(val x: Int)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn one_methods_forward_reference_to_another_resolves() {
+        // `walk_class_decl`'s own two-phase design: every method's
+        // signature is known before any method body is walked, so `bar`
+        // can call `foo` even though `foo` is declared later in the same
+        // class.
+        let result = resolve_src(
+            "class C {\n    fun bar(): Int = this.foo()\n    fun foo(): Int = 1\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn property_initializer_type_mismatch_is_flagged() {
+        let result = resolve_src("class C {\n    val x: Int = \"nope\"\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("property 'x'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn init_as_a_context_keyword_does_not_break_ordinary_use() {
+        // `init` is only a keyword in class-member position, immediately
+        // before `{` — a plain `val`/`fun` named `init` elsewhere is
+        // unaffected (parser-level guarantee; this just confirms the
+        // resolver sees a normal declaration in that case, not a parse
+        // failure).
+        let result = resolve_src("val init = 5\nprintln(init)\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 }

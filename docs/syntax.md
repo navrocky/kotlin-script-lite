@@ -584,25 +584,116 @@ the import/call site (`unknown package '...'`/`undefined name '...'`), and
 a resolved one gets real argument-count/type checking against its actual
 signature — an editor sees this live, before the script ever runs.
 
+## Classes
+
+```kotlin
+class Point(val x: Int, val y: Int) {
+    var visits: Int = 0
+
+    init {
+        visits = visits + 1
+    }
+
+    fun distanceSquared(other: Point): Int {
+        val dx = x - other.x
+        val dy = y - other.y
+        return dx * dx + dy * dy
+    }
+
+    fun toString(): String = "(" + x + ", " + y + ")"
+}
+
+val p = Point(1, 2)
+println(p)             // (1, 2) -- via the overridden toString()
+println(p.x)            // 1
+println(p.distanceSquared(Point(4, 6)))
+```
+
+`class Name(...)` declares a **primary constructor** right in the header,
+same as real Kotlin — parentheses (and the body's own `{ }`) are optional:
+`class Empty` and `class Empty()` are both legal, empty classes. Each
+constructor parameter is either:
+
+- **promoted to a real field** by writing `val` or `var` in front of it
+  (`val x: Int`) — readable (and, for `var`, writable) via `this.x`/
+  `obj.x` from anywhere the object is visible;
+- a **plain constructor parameter** (no `val`/`var`) — only a real binding
+  *inside the constructor itself* (property initializers and `init`
+  blocks), not a field; it doesn't exist on the object afterward.
+
+A class body can contain, in any order, any number of:
+
+- **properties** — `val`/`var name: Type = initializer` (the initializer
+  is required; every property is either a promoted ctor parameter or has
+  its own, with no third option);
+- **`init { ... }` blocks** — arbitrary statements, run as part of
+  construction;
+- **methods** — ordinary `fun` declarations.
+
+Properties and `init` blocks run **in the order they're written**,
+interleaved — matching real Kotlin's initialization order — so a later
+property's initializer (or an `init` block) can read an earlier one's
+already-assigned value via `this.`.
+
+**Implicit `this`.** Matching real Kotlin: a bare name inside a property
+initializer, `init` block, or method body — anywhere in the class — that
+isn't a local variable/parameter resolves to `this`'s own field or method
+of that name, no `this.` prefix needed. `this.` is only ever required to
+disambiguate, exactly like real Kotlin's own rule: **a local variable or
+parameter always shadows a same-named field** — inside `fun f(x: Int) {
+... }`, a bare `x` means the parameter, and reaching the field (if there
+even is one, and it's a different name) needs an explicit `this.x`. The
+**primary constructor's own (non-promoted) parameters** are visible bare
+*only inside the constructor's own scope* (property initializers, `init`
+blocks) — they're not fields, so there's no `this.`-qualified way to reach
+them from an ordinary method at all; only a promoted (`val`/`var`)
+parameter is visible everywhere, via the same implicit-`this` rule as any
+other field.
+
+**Construction** is an ordinary call — `Point(1, 2)`, or with named
+arguments (`Point(y = 2, x = 1)`), same rules as calling a function.
+
+**Every class implicitly extends `Any`** — the real root of the type
+hierarchy — and inherits three real, overridable methods from it:
+`toString(): String`, `equals(other: Any?): Boolean`, and
+`hashCode(): Int`. Their default behavior (when a class doesn't override
+them) is **identity-based**, matching Kotlin: `toString()` shows a
+`ClassName@address`-shaped string, `equals()`/`hashCode()` compare/hash by
+object identity, not by field contents. Overriding `toString()` (as
+`Point` does above) is picked up automatically by `println`/string
+interpolation (`"$p"`), not just an explicit `p.toString()` call.
+
+The `==` operator itself is unaffected by an `equals()` override — for an
+object, `==` always compares identity directly (same object or not),
+mirroring Kotlin's default `==` behavior for a class with no
+`equals()`/`hashCode()` pair overridden. Numbers, strings, booleans, and
+`Int`/`Double` (via `Number`) also support `.toString()`/`.equals()`/
+`.hashCode()` explicitly (`5.toString()`, `"x".equals("x")`), with the
+expected structural (not identity) behavior for those.
+
+**Not supported yet**: `:` superclass syntax, `open`/`override`,
+`interface`, generic classes (`class Box<T>`), and collection indexing
+syntax (`obj[i]`) even on a user class — all separate, later phases.
+
 ## Methods
 
 Some values support `.` method-call syntax, e.g. `"hi".uppercase()` —
 equivalent to, and currently implemented in terms of, the same-named
-plain stdlib function (`uppercase("hi")`). See
-[`stdlib.md`](stdlib.md#methods) for the full list. `.field` access with
-no call is also legal syntax, but no value has real fields yet (that
-needs classes/objects, not yet implemented) — it's always a runtime
-error until then.
+plain stdlib function (`uppercase("hi")`) — plus every class's own
+methods (see [Classes](#classes) above) and every value's inherited
+`toString()`/`equals()`/`hashCode()`. See [`stdlib.md`](stdlib.md#methods)
+for the full builtin list. `.field` access with no call is also legal
+syntax — real on a class instance (again, see [Classes](#classes)); a
+runtime error on anything else, which has no fields.
 
 ## Not supported
 
-Deliberately out of scope for now: classes/objects, inheritance,
-generics, list/map literal syntax (`[1, 2, 3]` isn't real Kotlin syntax
+Deliberately out of scope for now: interfaces, inheritance (`:`
+superclass syntax, `open`/`override`), generics (including generic
+classes), list/map literal syntax (`[1, 2, 3]` isn't real Kotlin syntax
 either — build a list with [`listOf(...)`](stdlib.md#listof); a `{k: v}`
 map literal doesn't exist in real Kotlin at all), collection indexing
-(`list[i]`) — deferred until classes, generics, properties, and
-`operator fun get`/`set` exist, so it can be real operator overloading on
-a real `List<T>` rather than a special case — `try`/`catch`, coroutines,
-extension functions, and network imports. `.` method syntax only covers
-the small builtin set in [`stdlib.md`](stdlib.md#methods) — arbitrary
-field/method access on a value needs classes/objects first.
+(`list[i]`, including on a user class) — deferred until generics,
+properties, and `operator fun get`/`set` exist, so it can be real
+operator overloading rather than a special case — `try`/`catch`,
+coroutines, extension functions, and network imports.
