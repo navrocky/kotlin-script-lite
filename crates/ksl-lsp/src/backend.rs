@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionOptions, CompletionParams, CompletionResponse,
+    CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, CompletionTriggerKind,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, Diagnostic, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
@@ -65,7 +65,26 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
-                completion_provider: Some(CompletionOptions::default()),
+                // Trigger characters are what make the client (Kate, VS
+                // Code, ...) invoke completion automatically right after
+                // typing one of these, instead of requiring an explicit
+                // manual trigger (Ctrl+Space) every time: `.` covers both
+                // post-`.` member completion and package/namespace
+                // segments (`kotlin.`); `@` covers both `@file:Import`'s
+                // own head and a KDoc comment's `@param`/`@return` tags
+                // (`kdoc_tag_completions`/`file_head_completion`); `:`
+                // covers both a type annotation position and `@file:`'s
+                // own colon (`import_keyword_completion`). All three are
+                // declared unconditionally here (the protocol has no
+                // notion of a "conditional" trigger character — the
+                // client always asks), but `completion::completion_with_
+                // trigger` is what actually stays quiet whenever the
+                // character landed somewhere it isn't meaningful — see
+                // its own doc comment.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string(), "@".to_string(), ":".to_string()]),
+                    ..Default::default()
+                }),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                     SemanticTokensOptions {
                         legend: SemanticTokensLegend {
@@ -170,7 +189,21 @@ impl LanguageServer for Backend {
             Some(doc) => doc.text.clone(),
             None => return Ok(None),
         };
-        let items: Vec<CompletionItem> = crate::completion::completion(&analysis, &text, position);
+        // Only a real, client-reported auto-fire on one of our own
+        // declared trigger characters (`.`/`@`) gets treated as such —
+        // an explicit Ctrl+Space (`Invoked`) or a client that sends no
+        // `context` at all both fall through to `None`, keeping the
+        // existing, more permissive completion behavior for a request
+        // the user actively asked for (see `completion_with_trigger`'s
+        // own doc comment for why the distinction matters).
+        let trigger_char = params
+            .context
+            .as_ref()
+            .filter(|ctx| ctx.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER)
+            .and_then(|ctx| ctx.trigger_character.as_deref())
+            .and_then(|s| s.chars().next());
+        let items: Vec<CompletionItem> =
+            crate::completion::completion_with_trigger(&analysis, &text, position, trigger_char);
         Ok(Some(CompletionResponse::Array(items)))
     }
 }

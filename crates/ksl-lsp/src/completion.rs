@@ -38,7 +38,44 @@ use crate::analysis::Analysis;
 /// or built-in package, wildcard or named, package-less flat namespace —
 /// see `resolver::ResolveResult::imported_symbols`), and language
 /// keywords — merged in that order (most relevant first).
-pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
+/// Test-only convenience — `backend.rs`'s real `completion` RPC handler
+/// always calls `completion_with_trigger` directly (it has real trigger
+/// info to pass); every existing test written against the simpler
+/// 3-argument shape keeps working unchanged, with `trigger_char: None`
+/// (the same "permissive" behavior as an explicit Ctrl+Space).
+#[cfg(test)]
+fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<CompletionItem> {
+    completion_with_trigger(analysis, text, position, None)
+}
+
+/// Like `completion`, but told *why* the client is asking — specifically,
+/// `trigger_char` is `Some('.')`/`Some('@')` when this request exists only
+/// because the user just typed that exact character and the client's
+/// `CompletionOptions::trigger_characters` auto-fired (see `backend.rs`'s
+/// own `completion` handler, which extracts this from `CompletionParams`'
+/// `context.trigger_character`, but only when `trigger_kind ==
+/// TRIGGER_CHARACTER` — an explicit Ctrl+Space invocation, or a client that
+/// doesn't send trigger info at all, both pass `None` here, same as
+/// `completion`'s own unconditional `None`).
+///
+/// This matters because `.`/`@` firing automatically on *every* keystroke
+/// means a `.`/`@` typed somewhere that isn't actually meaningful (an
+/// unresolvable receiver, a bare `@` outside any doc comment/`@file:
+/// Import`) must produce an *empty* result — most clients show no popup at
+/// all for an empty list — rather than the broader "over-suggest, never
+/// under-suggest" fallback (every builtin method, or the generic bare-name
+/// completion list) that a real, explicit Ctrl+Space still reasonably
+/// wants: a manual invocation is the user actively asking "what fits
+/// here," where a permissive guess is better than nothing, but an
+/// automatic popup firing on essentially every dot typed as part of, say,
+/// a decimal number or an unrelated `@` needs to stay quiet by default,
+/// only speaking up when it's actually confident.
+pub fn completion_with_trigger(
+    analysis: &Analysis,
+    text: &str,
+    position: Position,
+    trigger_char: Option<char>,
+) -> Vec<CompletionItem> {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let up_to_cursor: String = line_text.chars().take(position.character as usize).collect();
     let full_up_to_cursor = text_up_to_position(text, position);
@@ -100,9 +137,21 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
         }
     }
 
+    // Every position where a bare `@` is actually meaningful (a KDoc tag,
+    // `@param`'s own name, `@file:Import`'s head/path) already returned
+    // above — reaching here while `trigger_char` says `@` was just typed
+    // means it landed somewhere it isn't, so an auto-fired request must
+    // stay quiet (see `completion_with_trigger`'s own doc comment) rather
+    // than falling through to the generic locals/stdlib/keywords list
+    // below, which would otherwise show up as unrelated noise every time
+    // `@` is typed anywhere at all.
+    if trigger_char == Some('@') {
+        return Vec::new();
+    }
+
     if import_use_context(&up_to_cursor) {
         let (prefix_path, _partial) = dotted_prefix_before_cursor(&up_to_cursor);
-        return package_path_completions(analysis, &prefix_path, None, false);
+        return package_path_completions(analysis, &prefix_path, None, false, false, true);
     }
 
     if expected.contains(&Expected::Identifier(IdentRole::TypeName)) {
@@ -114,6 +163,14 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
                 ..Default::default()
             })
             .collect();
+    }
+
+    // Every position where a bare `:` is actually meaningful (a type
+    // annotation — just handled above — or `@file:`'s own colon, handled
+    // earlier by `file_import_context`'s `AfterFileColon` arm) already
+    // returned by this point; same reasoning as the `@` check above.
+    if trigger_char == Some(':') {
+        return Vec::new();
     }
 
     let (prefix_path, _partial) = dotted_prefix_before_cursor(&up_to_cursor);
@@ -148,7 +205,14 @@ pub fn completion(analysis: &Analysis, text: &str, position: Position) -> Vec<Co
             }
         };
 
-        return package_path_completions(analysis, &prefix_path, receiver_type.as_ref(), true);
+        return package_path_completions(
+            analysis,
+            &prefix_path,
+            receiver_type.as_ref(),
+            true,
+            trigger_char == Some('.'),
+            false,
+        );
     }
 
     let line = position.line + 1;
@@ -394,15 +458,47 @@ fn package_path_completions(
     prefix_path: &[String],
     receiver_type: Option<&ksl_core::types::Type>,
     allow_builtin_fallback: bool,
+    strict_without_a_known_type: bool,
+    offer_wildcard_import: bool,
 ) -> Vec<CompletionItem> {
     let package_name = prefix_path.join(".");
     let mut items: Vec<CompletionItem> =
         analysis.packages.members_of(&package_name).iter().map(package_member_completion).collect();
     items.extend(next_segment_completions(analysis, prefix_path));
 
-    let package_shaped = !items.is_empty() || analysis.packages.package_names().any(|n| n == &package_name);
+    let is_real_package = analysis.packages.has_package(&package_name);
+    let package_shaped = !items.is_empty() || is_real_package;
+
+    // `import a.b.` completion (never for an ordinary value receiver —
+    // `offer_wildcard_import` is only ever `true` from `import_use_context`'s
+    // own call site): whenever the prefix typed *so far* is itself a real,
+    // complete package — not just a common prefix of others, which
+    // `is_real_package` already excludes — `import a.b.*` is always a
+    // legal, meaningful completion of its own, on top of (not instead of)
+    // its real members and the next dotted segment. This applies at
+    // *every* level of a multi-segment path, not only the final/deepest
+    // one: if both `a` and `a.b` are independently real packages, typing
+    // `import a.` offers `*` for `a` too, not only once `a.b.` is reached.
+    if offer_wildcard_import && is_real_package {
+        items.push(wildcard_import_completion(&package_name));
+    }
 
     if allow_builtin_fallback && (receiver_type.is_some() || !package_shaped) {
+        // `strict_without_a_known_type` (set when this request exists
+        // only because the client auto-fired on a just-typed `.` — see
+        // `completion_with_trigger`'s own doc comment) deliberately skips
+        // the "show every builtin method" over-suggest fallback when
+        // there's no concretely known receiver type at all: dumping every
+        // method on an unresolvable `.` (a decimal point mid-number, a
+        // typo, anything the resolver couldn't pin down) would fire on
+        // essentially every dot typed anywhere, which is exactly the
+        // "too dumb" auto-popup behavior this is meant to avoid. An
+        // explicit Ctrl+Space (`strict_without_a_known_type: false`)
+        // keeps the permissive guess — the user asked outright, so
+        // something beats nothing.
+        if strict_without_a_known_type && receiver_type.is_none() {
+            return items;
+        }
         // A `Type::Class(name)` receiver (a real user class instance, or
         // the pseudo-class `Number`) — its own fields/methods plus `Any`'s
         // inherited ones, not `BUILTIN_METHODS`' flat, name-keyed table
@@ -607,6 +703,18 @@ fn package_member_completion(m: &crate::package_index::PackageMember) -> Complet
         kind: Some(symbol_completion_kind(m.symbol.kind)),
         detail: Some(m.symbol.signature.clone()),
         documentation: m.symbol.doc.clone().map(Documentation::String),
+        ..Default::default()
+    }
+}
+
+/// `import package_name.*` — offered alongside `package_name`'s own real
+/// members whenever `package_name` is itself a real, complete package (see
+/// `package_path_completions`'s `offer_wildcard_import`).
+fn wildcard_import_completion(package_name: &str) -> CompletionItem {
+    CompletionItem {
+        label: "*".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: Some(format!("import {package_name}.*")),
         ..Default::default()
     }
 }
@@ -946,6 +1054,11 @@ mod tests {
         completion(&analysis, text, position).into_iter().map(|i| i.label).collect()
     }
 
+    fn labels_with_trigger(text: &str, position: Position, trigger_char: Option<char>) -> Vec<String> {
+        let analysis = analysis::analyze(text, None, Path::new("/tmp/nonexistent_test.ksl")).expect("should parse");
+        completion_with_trigger(&analysis, text, position, trigger_char).into_iter().map(|i| i.label).collect()
+    }
+
     #[test]
     fn includes_locals_stdlib_and_keywords() {
         let text = "val outer = 1\nfun f(p: Int): Int {\n    val inner = 2\n    return inner\n}\n";
@@ -1109,6 +1222,93 @@ mod tests {
         let names: Vec<String> =
             completion(&fallback, &broken, Position::new(1, 4)).into_iter().map(|i| i.label).collect();
         assert!(names.contains(&"p".to_string()));
+    }
+
+    #[test]
+    fn completion_auto_triggered_by_dot_on_a_known_local_still_offers_its_methods() {
+        // An auto-fired `.` (the client's `trigger_characters` popping the
+        // list right after the user typed the dot, not an explicit
+        // Ctrl+Space) must still show real, confidently-known results —
+        // strictness only ever suppresses the *unresolvable* case, never
+        // a genuinely known receiver type.
+        let text = "val s = \"hi\"\ns.uppercase()\n";
+        let names = labels_with_trigger(text, Position::new(1, 2), Some('.'));
+        assert!(names.contains(&"uppercase".to_string()), "{names:?}");
+        assert!(names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_auto_triggered_by_dot_with_no_resolvable_receiver_stays_empty() {
+        // The reported complaint: an auto-popup firing on *every* `.`
+        // typed anywhere — including one after something the resolver
+        // couldn't pin down a type for at all — is noise, not help.
+        // `nope` is never declared, so its own type is `Unknown`; an
+        // explicit Ctrl+Space (`completion_after_a_dot_offers_builtin_methods`-
+        // style, `trigger_char: None`) still gets the permissive
+        // "show everything" guess, but an auto-fired `.` must not.
+        let text = "nope.uppercase()\n";
+        let names = labels_with_trigger(text, Position::new(0, 5), Some('.'));
+        assert!(names.is_empty(), "{names:?}");
+
+        // The *same* position, but as if manually invoked (no trigger
+        // info) — unaffected, keeps today's permissive fallback.
+        let names_manual = labels_with_trigger(text, Position::new(0, 5), None);
+        assert!(names_manual.contains(&"uppercase".to_string()), "{names_manual:?}");
+    }
+
+    #[test]
+    fn completion_auto_triggered_by_at_outside_any_doc_comment_stays_empty() {
+        // Same reasoning as the `.` case above, for `@`: real KDoc/
+        // `@file:Import` positions already return their own real
+        // completions before this check ever runs (see the other
+        // `completion_after_at_*` tests) — this is specifically the
+        // "typed `@` somewhere it isn't meaningful" case, which an
+        // auto-fired request must answer with nothing, not the generic
+        // locals/stdlib/keywords dump a manual Ctrl+Space still shows.
+        // Same technique as `completion_after_at_outside_any_doc_comment_
+        // does_not_offer_kdoc_tags`: the early text-based `@` context
+        // checks don't need `analysis` to actually match `text`, so an
+        // empty-document analysis sidesteps needing `text` itself to
+        // parse. `@` sits past the file's own header (real code already
+        // came before it), so `file_import_context`'s "AtHead" doesn't
+        // match either — genuinely nowhere meaningful for `@` to be.
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let text = "println(1)\n@\n";
+        let names: Vec<String> = completion_with_trigger(&a, text, Position::new(1, 1), Some('@'))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+
+        let names_manual: Vec<String> = completion_with_trigger(&a, text, Position::new(1, 1), None)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(!names_manual.is_empty(), "{names_manual:?}");
+    }
+
+    #[test]
+    fn completion_auto_triggered_by_colon_outside_any_type_or_file_import_position_stays_empty() {
+        // `:` is meaningful in exactly two places: a type annotation
+        // (`Expected::Identifier(IdentRole::TypeName)`, handled earlier)
+        // and `@file:`'s own colon (`FileImportContext::AfterFileColon`,
+        // also handled earlier) — both return their own real completions
+        // before this check ever runs. A `:` typed anywhere else (here,
+        // right after an ordinary completed statement) must answer an
+        // auto-fired request with nothing.
+        let a = analysis::analyze("", None, Path::new("/tmp/nonexistent_test.ksl")).unwrap();
+        let text = "println(1):\n";
+        let names: Vec<String> = completion_with_trigger(&a, text, Position::new(0, 12), Some(':'))
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+
+        let names_manual: Vec<String> = completion_with_trigger(&a, text, Position::new(0, 12), None)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(!names_manual.is_empty(), "{names_manual:?}");
     }
 
     #[test]
@@ -1614,7 +1814,11 @@ mod tests {
         let names = labels(text, Position::new(0, 19)); // right after "import kotlin.test."
         let mut sorted = names.clone();
         sorted.sort();
-        assert_eq!(sorted, vec!["assertEquals", "assertFalse", "assertNotNull", "assertNull", "assertTrue"]);
+        // "*" alongside the real members — `kotlin.test` is itself a real,
+        // complete package, so `import kotlin.test.*` is a meaningful
+        // completion of its own (see `package_path_completions`'s
+        // `offer_wildcard_import`).
+        assert_eq!(sorted, vec!["*", "assertEquals", "assertFalse", "assertNotNull", "assertNull", "assertTrue"]);
         assert!(!names.contains(&"length".to_string()), "{names:?}");
         assert!(!names.contains(&"uppercase".to_string()), "{names:?}");
     }
@@ -1699,6 +1903,49 @@ mod tests {
             .collect(); // right after "import a.b."
         assert!(names2.contains(&"helper".to_string()), "{names2:?}");
         assert!(!names2.contains(&"length".to_string()), "{names2:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wildcard_import_is_offered_at_every_real_intermediate_package_level_too() {
+        // `a` and `a.b` are *both* independently real, complete packages
+        // here (two separate files, each with its own `package` decl) —
+        // `import a.*` must be offered once `a.` is typed, not only once
+        // the deeper `a.b.` is reached (see `package_path_completions`'s
+        // `offer_wildcard_import` doc comment).
+        let dir = std::env::temp_dir().join(format!(
+            "ksl_completion_test_wildcard_pkg_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ksl"), "package a\nfun topLevel(): Int = 1\n").unwrap();
+        std::fs::write(dir.join("ab.ksl"), "package a.b\nfun helper(): Int = 1\n").unwrap();
+        let main_path = dir.join("main.ksl");
+        let main_text = "@file:Import(\"a.ksl\")\n@file:Import(\"ab.ksl\")\nimport a.b.helper\n";
+        std::fs::write(&main_path, main_text).unwrap();
+
+        let analysis = analysis::analyze(main_text, None, &main_path).expect("should parse");
+
+        // `import a.` -> "a" is itself real: its own member, the next
+        // segment "b", *and* "*" for wildcarding "a" itself.
+        let names: Vec<String> = completion(&analysis, main_text, Position::new(2, 9))
+            .into_iter()
+            .map(|i| i.label)
+            .collect(); // right after "import a."
+        assert!(names.contains(&"topLevel".to_string()), "{names:?}");
+        assert!(names.contains(&"b".to_string()), "{names:?}");
+        assert!(names.contains(&"*".to_string()), "{names:?}");
+
+        // `import a.b.` -> "a.b" is also independently real: its own
+        // member plus "*" again, this time for "a.b".
+        let names2: Vec<String> = completion(&analysis, main_text, Position::new(2, 11))
+            .into_iter()
+            .map(|i| i.label)
+            .collect(); // right after "import a.b."
+        assert!(names2.contains(&"helper".to_string()), "{names2:?}");
+        assert!(names2.contains(&"*".to_string()), "{names2:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
