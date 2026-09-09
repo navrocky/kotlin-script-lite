@@ -29,6 +29,24 @@ pub(super) const PACKAGE: BuiltinPackage = BuiltinPackage {
             return_type: Type::Unit,
             doc: "Like println, but without the trailing newline.",
         },
+        BuiltinSymbol {
+            name: "readLine",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            // Really `String?` — see `list_get`'s own doc comment in
+            // `stdlib.rs` for why `BuiltinSymbol::return_type` can't
+            // express `Nullable` in this `const` table. Unlike `List.get`
+            // (where the element usually isn't actually null), this one
+            // really can return `Value::Null` on every call at EOF, so
+            // `Type::String` would be an actual soundness gap (a caller
+            // assigning the "known non-null" result to a `val`, then
+            // calling a String method on an unchecked, possibly-null
+            // value) — `Type::Any` is the only sound static type here,
+            // same as `.get`'s own reasoning, just for a stronger reason.
+            return_type: Type::Any,
+            doc: "Reads one line from stdin (without the trailing newline), or null at end of input.",
+        },
     ],
     populate,
 };
@@ -58,6 +76,25 @@ fn populate(env: &Env) {
             n => return Err(arity_error("print", "1", n, span)),
         }
         Ok(Value::Unit)
+    });
+
+    register(env, "readLine", |_interp, args, span| {
+        if !args.is_empty() {
+            return Err(arity_error("readLine", "0", args.len(), span));
+        }
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => Ok(Value::Null), // EOF, nothing read at all
+            Ok(_) => {
+                // `read_line` keeps the trailing newline (and a preceding
+                // '\r' on a CRLF input) — real Kotlin's `readLine()` strips
+                // it, matching every other line-oriented readLine in
+                // common use.
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                Ok(Value::str(trimmed.to_string()))
+            }
+            Err(e) => Err(RuntimeError::new(format!("io error: {e}"), span).into()),
+        }
     });
 }
 

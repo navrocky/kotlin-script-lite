@@ -54,6 +54,17 @@ println("${"nested ${name}"}")      // templates can nest
 `$name` only accepts a bare identifier (no `.member` or `[index]`); for
 anything else use `${ ... }`.
 
+### Escape sequences
+
+`\n` `\t` `\r` `\\` `\"` `\$`, plus a variable-length Unicode escape
+`\u{XXXX}` (1-6 hex digits) for any other codepoint, including control
+characters no other escape can produce — `"\u{1b}"` is ESC (`0x1b`),
+`"\u{2764}"` is `❤`:
+
+```kotlin
+println("\u{1b}[2J")   // ESC [ 2 J — an ANSI "clear screen" sequence
+```
+
 ## Variables
 
 ```kotlin

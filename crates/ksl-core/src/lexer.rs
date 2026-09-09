@@ -540,6 +540,7 @@ impl<'a> Lexer<'a> {
                         Some('\\') => '\\',
                         Some('"') => '"',
                         Some('$') => '$',
+                        Some('u') => self.lex_unicode_escape(span)?,
                         Some(other) => {
                             return Err(ParseError::new(format!("unknown escape sequence '\\{other}'"), span))
                         }
@@ -582,6 +583,39 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+    }
+
+    /// Parses the `{XXXX}` part of a `\u{XXXX}` escape (the `u` itself is
+    /// already consumed by the caller) — a variable-length (1-6 digit) hex
+    /// Unicode codepoint escape, e.g. `\u{1b}` for ESC or `\u{2764}` for ❤.
+    /// This is the only way to put a byte a string literal has no other
+    /// syntax for (control characters like ESC in particular — no `\x1b`-
+    /// style fixed-width escape exists) into a ksl string; general-purpose
+    /// on its own merits, not terminal-specific, even though a terminal
+    /// control library is what first needed it (`ksl.term`, `docs/roadmap.md`
+    /// Phase 6.6).
+    fn lex_unicode_escape(&mut self, escape_start: Span) -> Result<char, ParseError> {
+        if self.advance() != Some('{') {
+            return Err(ParseError::new("expected '{' after '\\u'", escape_start));
+        }
+        let mut hex = String::new();
+        loop {
+            match self.advance() {
+                Some('}') => break,
+                Some(c) if c.is_ascii_hexdigit() => hex.push(c),
+                Some(c) => {
+                    return Err(ParseError::new(format!("invalid character '{c}' in \\u{{...}} escape"), escape_start))
+                }
+                None => return Err(self.err("unterminated string literal")),
+            }
+        }
+        if hex.is_empty() {
+            return Err(ParseError::new("empty \\u{...} escape", escape_start));
+        }
+        let code = u32::from_str_radix(&hex, 16)
+            .map_err(|_| ParseError::new(format!("'\\u{{{hex}}}' escape value out of range"), escape_start))?;
+        char::from_u32(code)
+            .ok_or_else(|| ParseError::new(format!("'\\u{{{hex}}}' is not a valid Unicode codepoint"), escape_start))
     }
 }
 
@@ -660,6 +694,42 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn unicode_escape_produces_the_named_codepoint() {
+        // \u{1b} is ESC (0x1b) — the byte a terminal-control library needs
+        // and no other ksl string escape can produce.
+        assert_eq!(
+            kinds("\"\\u{1b}[2J\""),
+            vec![
+                TokenKind::StringStart,
+                TokenKind::StringText("\u{1b}[2J".into()),
+                TokenKind::StringEnd,
+                TokenKind::Eof,
+            ]
+        );
+        // A short hex run and a longer one both work — no fixed width.
+        assert_eq!(kinds("\"\\u{41}\""), vec![
+            TokenKind::StringStart,
+            TokenKind::StringText("A".into()),
+            TokenKind::StringEnd,
+            TokenKind::Eof,
+        ]);
+        assert_eq!(kinds("\"\\u{2764}\""), vec![
+            TokenKind::StringStart,
+            TokenKind::StringText("❤".into()),
+            TokenKind::StringEnd,
+            TokenKind::Eof,
+        ]);
+    }
+
+    #[test]
+    fn unicode_escape_rejects_malformed_input() {
+        assert!(tokenize("\"\\u1b\"").is_err(), "missing '{{' must error");
+        assert!(tokenize("\"\\u{}\"").is_err(), "empty escape must error");
+        assert!(tokenize("\"\\u{d800}\"").is_err(), "a lone surrogate is not a valid codepoint");
+        assert!(tokenize("\"\\u{110000}\"").is_err(), "past the max codepoint must error");
     }
 
     #[test]

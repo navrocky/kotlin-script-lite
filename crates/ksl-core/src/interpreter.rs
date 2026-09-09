@@ -80,6 +80,14 @@ pub struct Interpreter<'a> {
     /// reports "unknown type" here — an accepted limitation, not fixed
     /// this phase.
     pub(crate) known_classes: HashSet<Rc<str>>,
+    /// `stdlib::random`'s own PRNG state (a splitmix64 generator, see that
+    /// module) — one plain field, mutated directly by `kotlin.random`'s
+    /// native closures the same way every other native function already
+    /// gets `&mut Interpreter`, no `Cell`/interior mutability needed. Seeded
+    /// once from the system clock in `new` below; deliberately *not*
+    /// reseeded per call, so successive `random()`/`randomInt()` calls in
+    /// one script produce a real, non-repeating sequence.
+    pub(crate) rng_state: u64,
     /// Test-only instrumentation: counts calls that fell through to
     /// `call_overload`'s by-runtime-value search, as opposed to the
     /// `ExprKind::Call` fast path that uses the resolver's own
@@ -98,6 +106,13 @@ pub struct Interpreter<'a> {
 /// working anymore.
 impl<'a> Drop for Interpreter<'a> {
     fn drop(&mut self) {
+        // Must run before anything else here: a script that called
+        // `enableRawMode()` and then errored (or just ended) must never
+        // leave the real terminal in raw mode — see
+        // `stdlib::terminal`'s own module doc comment for the full
+        // restoration story, including the separate Ctrl+C case this
+        // alone doesn't cover.
+        crate::stdlib::terminal::restore_if_active();
         self.globals.clear();
         for env in self.packages.values() {
             env.clear();
@@ -141,6 +156,14 @@ impl<'a> Interpreter<'a> {
             gc,
             builtin_classes: crate::class::builtin_classes(),
             known_classes: HashSet::new(),
+            // Any nonzero seed works for splitmix64; system time is just a
+            // convenient, cheap source of per-process variation, not a
+            // cryptographic requirement (`kotlin.random`'s doc comment).
+            rng_state: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+                | 1,
             #[cfg(test)]
             overload_search_count: 0,
         }

@@ -13,6 +13,11 @@ see [Math](#math) and [Assertions](#assertions) below. A fully-qualified
 call (`kotlin.io.println(...)`) always works too, imported or not. See
 [`syntax.md`](syntax.md) for the language itself.
 
+A small number of ksl-only extensions with **no real Kotlin stdlib
+equivalent** (terminal/game utilities) live under a `ksl.*` namespace
+instead of `kotlin.*` — flagged as such in [Terminal](#terminal) below,
+not real Kotlin.
+
 Errors thrown by these functions are runtime errors like any other — they
 stop the script and print `runtime error: <message> at <line:col>` to
 stderr, `<line:col>` being the actual call site, followed by a stack
@@ -43,6 +48,16 @@ println()          // (blank line)
 Like `println`, but without the trailing newline. Requires exactly one
 argument.
 
+### `readLine(): String?`
+
+Reads one line from stdin (without the trailing newline), or `null` at
+end of input — exactly real Kotlin's own `readLine()`.
+
+```kotlin
+val name = readLine()
+println("Hello, " + name)
+```
+
 ## Lists
 
 Lives in `kotlin.collections`, auto-imported — also callable as
@@ -59,6 +74,29 @@ for (x in xs) { println(x) }
 
 Lists are also produced by an inclusive `Int` range, e.g. `1..5` — see
 [`syntax.md`](syntax.md#for). `+` concatenates two lists.
+
+### Methods
+
+`List` is mutable — these are `.`-only, matching real Kotlin's own
+`MutableList` (no bare-function `kotlin.collections.get(...)` form exists,
+same as real Kotlin):
+
+```kotlin
+val xs = listOf(1, 2, 3)
+xs.add(4)              // [1, 2, 3, 4]
+xs.set(0, 99)           // [99, 2, 3, 4]
+println(xs.get(0))      // 99
+println(xs.size())      // 4
+println(xs.removeAt(0)) // 99 — and xs is now [2, 3, 4]
+```
+
+- `get(index: Int): Any` — the element at `index`. Throws if out of bounds.
+- `set(index: Int, value: Any?)` — replaces the element at `index`. Throws if out of bounds. Returns `Unit`, unlike real Kotlin's `MutableList.set` (which returns the replaced element) — a ksl-only simplification.
+- `add(value: Any?)` — appends `value`, growing the list by one. Returns `Unit`, unlike real Kotlin's `MutableList.add` (which returns `Boolean`) — a ksl-only simplification.
+- `size(): Int` — the element count. A method (`xs.size()`), not a bare property (`xs.size`) — same divergence `String.length()` already has, see [Methods](#methods-1) below.
+- `removeAt(index: Int): Any` — removes and returns the element at `index`, shifting later elements down by one. Throws if out of bounds.
+
+Not `[]` indexing syntax (`xs[0]`) — that's a separate, larger, still-unimplemented feature (see `docs/roadmap.md`'s Phase 3); these are ordinary method calls only, for now.
 
 ## Strings
 
@@ -100,9 +138,12 @@ println("kotlin".uppercase())  // "KOTLIN"
 println("  Loud  ".trim().uppercase())   // "LOUD" — methods chain
 ```
 
-No other type has methods yet, and `.field` access (no call) always
-fails at runtime — there's no object system yet to have real fields (see
-`docs/syntax.md`'s "Not supported"). `receiver.name` is otherwise
+`List` has its own `.`-only methods too — see [Lists → Methods](#methods)
+above, which unlike these have no bare-function form at all (`get`/`set`/
+`add`/`size()` are never callable as plain `get(xs, 0)`, matching real
+Kotlin's own `MutableList`). Every user-declared `class` has real
+fields/methods too (`docs/syntax.md`'s "Classes"). Nothing else has
+methods — a bare `receiver.name` is otherwise
 ambiguous with a package-qualified reference (`util.math.square`, see
 `syntax.md`'s "Packages"); this is resolved by trying `receiver` as a
 local value first and only falling back to a package lookup if it isn't
@@ -161,6 +202,99 @@ convenience silently widened a mixed call to `Double` at runtime instead;
 it was retired once overload resolution started picking a real, declared
 overload by actual argument type — same mechanism for every stdlib
 function, not a numeric-specific special case.)
+
+## Random
+
+Lives in `kotlin.random`, same story as `kotlin.math` above — **not**
+auto-imported: needs `import kotlin.random.*` (or a per-name import, or a
+fully-qualified `kotlin.random.randomInt(...)` call).
+
+Real Kotlin's `kotlin.random.Random` is an object (`Random.nextInt(...)`,
+`Random.nextDouble()`) — ksl has no `object`/singleton declarations yet,
+so these are plain top-level functions instead, a deliberate shape
+divergence (same kind `sqrt(Int)` above already has). Not cryptographically
+secure — good enough for game logic (food placement, etc.), not a security
+primitive.
+
+### `random(): Double`
+
+A random value in `[0, 1)`.
+
+### `randomInt(bound: Int): Int`
+
+A random value in `[0, bound)`. `bound` must be positive.
+
+```kotlin
+import kotlin.random.*
+
+println(randomInt(6) + 1)   // a random die roll, 1..6
+```
+
+## Terminal
+
+Lives in `ksl.term` — **not** auto-imported, and, unlike every package
+above, **not real Kotlin at all**: there is no `kotlin.term` in the real
+language. This is the one ksl-only namespace in the standard library (see
+the intro above), added for terminal/game scripts.
+
+Deliberately minimal: only functions that genuinely need a real OS
+syscall live here. Screen/cursor control (clearing the screen, moving the
+cursor, colors) is **not** provided — those are just ANSI escape-sequence
+strings, buildable entirely in ordinary ksl code via the `\u{XXXX}` string
+escape (`docs/syntax.md`'s "Strings") with no syscall involved, so they
+belong in an ordinary ksl library instead (see
+`crates/ksl-core/tests/demos/tui.ksl` for a small one, built on exactly
+these primitives).
+
+### `enableRawMode()` / `disableRawMode()`
+
+Turns off line buffering and character echo on stdin ("cbreak" mode), so
+`readByte()` sees each keypress immediately instead of waiting for Enter.
+`enableRawMode()` throws if stdin isn't a real terminal — check
+`isTerminal()` first to fail gracefully instead. `disableRawMode()` is
+always safe to call, even if raw mode isn't active.
+
+Ctrl+C still works as normal (sends `SIGINT`) even while raw mode is
+active, and the terminal is always restored to normal automatically —
+whether the script ends normally, errors out, or is interrupted with
+Ctrl+C — so a script never needs its own cleanup-on-error logic for this.
+
+### `readByte(): Int?`
+
+The next byte waiting on stdin (its code, `0`-`255`), or `null` if
+nothing is available right now. Only non-blocking after `enableRawMode()`
+— without it, this blocks like an ordinary read. Multi-byte input (e.g.
+an arrow key, which sends an `ESC [ A`-style sequence) arrives as
+separate `readByte()` calls — assembling those into one keypress is a
+library's job, not this function's.
+
+```kotlin
+import ksl.term.*
+
+enableRawMode()
+val b = readByte()
+if (b != null) {
+    println("got byte " + b)
+}
+disableRawMode()
+```
+
+### `isTerminal(): Boolean`
+
+Whether stdin is connected to a real terminal.
+
+### `terminalWidth(): Int` / `terminalHeight(): Int`
+
+The terminal's current size, in columns/rows.
+
+### `sleep(millis: Int)`
+
+Pauses execution for the given number of milliseconds.
+
+### `currentTimeMillis(): Int`
+
+Milliseconds since the Unix epoch — for frame timing, or seeding your own
+generator instead of `kotlin.random`.
 
 ## Assertions
 

@@ -1876,13 +1876,13 @@ mod tests {
     fn import_kotlin_dot_offers_only_the_next_segment() {
         // `kotlin.*` now names several real built-in packages
         // (`kotlin.io`, `kotlin.collections`, `kotlin.text`, `kotlin.math`,
-        // `kotlin.test`) — every one of them offers its own next segment,
-        // never a full member name (`println`, `assertEquals`, ...) this
-        // early.
+        // `kotlin.random`, `kotlin.test`) — every one of them offers its own
+        // next segment, never a full member name (`println`,
+        // `assertEquals`, ...) this early.
         let text = "import kotlin.test.assertEquals\n";
         let mut names = labels(text, Position::new(0, 14)); // right after "import kotlin."
         names.sort();
-        assert_eq!(names, vec!["collections", "io", "math", "test", "text"]);
+        assert_eq!(names, vec!["collections", "io", "math", "random", "test", "text"]);
     }
 
     #[test]

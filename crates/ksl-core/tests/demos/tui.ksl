@@ -1,0 +1,13 @@
+// A tiny ksl-level TUI helper library — screen/cursor control, built
+// entirely on plain ANSI escape strings via the `\u{XXXX}` string escape.
+// No native support needed for any of this (see docs/roadmap.md's Phase
+// 6.6 design principle): only `ksl.term`'s raw-mode/input primitives are
+// native, because only those genuinely need a real OS syscall.
+
+fun clearScreen(): Unit = print("\u{1b}[2J\u{1b}[H")
+
+fun moveCursor(row: Int, col: Int): Unit = print("\u{1b}[" + row + ";" + col + "H")
+
+fun hideCursor(): Unit = print("\u{1b}[?25l")
+
+fun showCursor(): Unit = print("\u{1b}[?25h")

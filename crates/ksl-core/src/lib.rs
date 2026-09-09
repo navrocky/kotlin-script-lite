@@ -78,6 +78,18 @@ pub fn run_source(
     Importer::new().run_top_level(src, base_dir, entry_path, &mut interp)
 }
 
+/// Restores the terminal to normal mode if a script left it in raw mode
+/// (`ksl.term`'s `enableRawMode()`, never explicitly undone) — a thin,
+/// crate-root re-export of `stdlib::terminal`'s otherwise-`pub(crate)`
+/// restore logic, for `ksl-cli`'s own `SIGINT` handler to call without
+/// reaching into `stdlib`'s private internals. A silent no-op if raw mode
+/// isn't active. See `stdlib::terminal`'s own module doc comment for the
+/// full restoration story (this covers the Ctrl+C case specifically —
+/// `Interpreter`'s own `Drop` impl already covers every other exit path).
+pub fn emergency_restore_terminal() {
+    stdlib::terminal::restore_if_active();
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_only, static_check};

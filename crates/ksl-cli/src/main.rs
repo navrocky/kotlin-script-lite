@@ -4,7 +4,45 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+const SIGINT: i32 = 2;
+const SIG_DFL: usize = 0;
+
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn raise(signum: i32) -> i32;
+}
+
+/// Ctrl+C while a script is mid-`enableRawMode()` (`ksl.term`) would
+/// otherwise leave the real terminal in raw mode forever: `SIGINT`'s
+/// *default* disposition is immediate process termination, which never
+/// runs Rust destructors, so `Interpreter`'s own `Drop`-based restore
+/// (`stdlib::terminal`'s module doc comment) never gets a chance to run.
+/// This handler restores the terminal first, then re-arms `SIGINT`'s
+/// default disposition and re-raises it — so Ctrl+C still terminates the
+/// process exactly as it always did, just after a clean restore.
+///
+/// # Safety
+/// A signal handler may only call async-signal-safe functions —
+/// `emergency_restore_terminal` is written to satisfy that (no
+/// allocation, no panics, see `stdlib::terminal::restore_if_active`'s own
+/// doc comment); `signal`/`raise` themselves are async-signal-safe by
+/// POSIX definition.
+extern "C" fn handle_sigint(_signum: i32) {
+    ksl_core::emergency_restore_terminal();
+    unsafe {
+        signal(SIGINT, SIG_DFL);
+        raise(SIGINT);
+    }
+}
+
 fn main() -> ExitCode {
+    // SAFETY: installed once, before any script runs (in particular before
+    // any call to `enableRawMode()` is even possible) — no reentrancy
+    // concern at install time.
+    unsafe {
+        signal(SIGINT, handle_sigint as *const () as usize);
+    }
+
     let args: Vec<String> = env::args().collect();
 
     let (source, base_dir, entry_path): (String, PathBuf, Option<PathBuf>) =

@@ -27,6 +27,8 @@ mod assertions;
 mod collections;
 mod io;
 mod math;
+mod random;
+pub(crate) mod terminal;
 mod text;
 
 /// One parameter of a `BuiltinSymbol` with a real, checkable type — the
@@ -184,6 +186,8 @@ pub const STDLIB_PACKAGES: &[BuiltinPackage] = &[
     text::PACKAGE,
     math::PACKAGE,
     assertions::PACKAGE,
+    random::PACKAGE,
+    terminal::PACKAGE,
 ];
 
 /// The combined symbols of every `default_imported` package — every stdlib
@@ -426,6 +430,88 @@ pub const BUILTIN_METHODS: &[BuiltinMethod] = &[
         call: string_trim,
     },
     BuiltinMethod {
+        receiver: "List",
+        symbol: BuiltinSymbol {
+            name: "get",
+            kind: SymbolKind::Fun,
+            params: &[BuiltinParam { name: "index", ty: Type::Int, nullable: false, default: None }],
+            variadic_param: None,
+            // `List` has no element-type tracking at all (no generics yet —
+            // `docs/roadmap.md`'s Phase 9/3), so there's no real static type
+            // to give this beyond "unknown" — `Type::Unknown`, not
+            // `Type::Any`, and deliberately so: unlike `Any` (a real,
+            // closed type with exactly three methods and no fields —
+            // `FieldAccess`'s static check rejects `result.someField`
+            // outright), `Unknown` is what the resolver already treats as
+            // "deferred, not an error" everywhere else (see `FieldAccess`'s
+            // own `Some(Type::Unknown) => Type::Unknown` arm) — the only
+            // choice that lets `val p: Point = xs.get(0)` (an explicit
+            // annotation, needed anyway since a hint-less `val`/`var` whose
+            // initializer type is `Unknown` is its own separate "cannot
+            // infer type" error — the strict-typing decision) then use
+            // `p.x`/`p.y` normally. `is_assignable`'s `(Type::Unknown, _) |
+            // (_, Type::Unknown) => true` rule is at least as permissive as
+            // `Any`'s own null-acceptance for anyone that *doesn't*
+            // annotate, so this costs nothing there either.
+            return_type: Type::Unknown,
+            doc: "The element at the given index. Throws if the index is out of bounds.",
+        },
+        call: list_get,
+    },
+    BuiltinMethod {
+        receiver: "List",
+        symbol: BuiltinSymbol {
+            name: "set",
+            kind: SymbolKind::Fun,
+            params: &[
+                BuiltinParam { name: "index", ty: Type::Int, nullable: false, default: None },
+                BuiltinParam { name: "value", ty: Type::Any, nullable: true, default: None },
+            ],
+            variadic_param: None,
+            return_type: Type::Unit,
+            doc: "Replaces the element at the given index. Throws if the index is out of bounds.",
+        },
+        call: list_set,
+    },
+    BuiltinMethod {
+        receiver: "List",
+        symbol: BuiltinSymbol {
+            name: "add",
+            kind: SymbolKind::Fun,
+            params: &[BuiltinParam { name: "value", ty: Type::Any, nullable: true, default: None }],
+            variadic_param: None,
+            return_type: Type::Unit,
+            doc: "Appends a value to the end of the list, growing it by one.",
+        },
+        call: list_add,
+    },
+    BuiltinMethod {
+        receiver: "List",
+        symbol: BuiltinSymbol {
+            name: "size",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::Int,
+            doc: "The number of elements in the list.",
+        },
+        call: list_size,
+    },
+    BuiltinMethod {
+        receiver: "List",
+        symbol: BuiltinSymbol {
+            name: "removeAt",
+            kind: SymbolKind::Fun,
+            params: &[BuiltinParam { name: "index", ty: Type::Int, nullable: false, default: None }],
+            variadic_param: None,
+            // `Type::Unknown`, same reasoning as `.get`'s own doc comment
+            // (this also returns a real, untracked list element).
+            return_type: Type::Unknown,
+            doc: "Removes and returns the element at the given index, shifting later elements down by one. Throws if the index is out of bounds.",
+        },
+        call: list_remove_at,
+    },
+    BuiltinMethod {
         receiver: "Any",
         symbol: BuiltinSymbol {
             name: "toString",
@@ -582,6 +668,71 @@ fn string_trim(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: S
     Ok(text::str_trim(s))
 }
 
+/// Real Kotlin's `MutableList.get(index)`/`.set`/`.add`/`.size` — not new
+/// `[]` indexing syntax (`docs/roadmap.md`'s Phase 3 stays exactly as
+/// deferred as its own text already documents: real `[]` needs classes +
+/// generics + `operator fun get`/`set`, only the first of which exists
+/// today) but genuine, permanent Kotlin `List` methods, dispatched through
+/// the same `BUILTIN_METHODS`/`MethodImpl::Native` mechanism `String`'s
+/// methods already use — when `[]` eventually lands, `a[i]`/`a[i] = v`
+/// desugar to calling these same functions unchanged, so this is forward
+/// groundwork for that phase, not the "builtin special case over today's
+/// untyped `Value::List`" its text explicitly rejects.
+fn list_get(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    if args.len() != 1 {
+        return Err(arity_error("get", "1", args.len(), span));
+    }
+    let Value::List(items) = &this else { unreachable!("dispatched only for List receivers") };
+    let Value::Int(index) = &args[0] else { return Err(type_error("get's index", "an Int", span)) };
+    let items = items.borrow();
+    if *index < 0 || *index as usize >= items.len() {
+        return Err(RuntimeError::new(format!("index {index} out of bounds for length {}", items.len()), span).into());
+    }
+    Ok(items[*index as usize].clone())
+}
+
+fn list_set(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    if args.len() != 2 {
+        return Err(arity_error("set", "2", args.len(), span));
+    }
+    let Value::List(items) = &this else { unreachable!("dispatched only for List receivers") };
+    let Value::Int(index) = &args[0] else { return Err(type_error("set's index", "an Int", span)) };
+    let mut items = items.borrow_mut();
+    if *index < 0 || *index as usize >= items.len() {
+        return Err(RuntimeError::new(format!("index {index} out of bounds for length {}", items.len()), span).into());
+    }
+    items[*index as usize] = args[1].clone();
+    Ok(Value::Unit)
+}
+
+fn list_add(_interp: &mut Interpreter, this: Value, mut args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    if args.len() != 1 {
+        return Err(arity_error("add", "1", args.len(), span));
+    }
+    let Value::List(items) = &this else { unreachable!("dispatched only for List receivers") };
+    items.borrow_mut().push(args.remove(0));
+    Ok(Value::Unit)
+}
+
+fn list_size(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("size", &args, span)?;
+    let Value::List(items) = &this else { unreachable!("dispatched only for List receivers") };
+    Ok(Value::Int(items.borrow().len() as i64))
+}
+
+fn list_remove_at(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    if args.len() != 1 {
+        return Err(arity_error("removeAt", "1", args.len(), span));
+    }
+    let Value::List(items) = &this else { unreachable!("dispatched only for List receivers") };
+    let Value::Int(index) = &args[0] else { return Err(type_error("removeAt's index", "an Int", span)) };
+    let mut items = items.borrow_mut();
+    if *index < 0 || *index as usize >= items.len() {
+        return Err(RuntimeError::new(format!("index {index} out of bounds for length {}", items.len()), span).into());
+    }
+    Ok(items.remove(*index as usize))
+}
+
 /// `Any.toString()`'s default — reuses `Value`'s own `Display` impl
 /// directly, which already does the right thing for every kind of value:
 /// plain formatting for a primitive/list, `"ClassName@addr"` identity
@@ -687,6 +838,7 @@ mod tests {
         let expected: &[(&str, &str)] = &[
             ("println", "fun println(value: Any?): Unit"),
             ("print", "fun print(value: Any?): Unit"),
+            ("readLine", "fun readLine(): Any"),
             ("listOf", "fun listOf(vararg values): List"),
             ("length", "fun length(s: String): Int"),
             ("uppercase", "fun uppercase(s: String): String"),
@@ -705,6 +857,16 @@ mod tests {
             ("assertFalse", "fun assertFalse(actual: Boolean, message: String? = null): Unit"),
             ("assertNull", "fun assertNull(actual, message: String? = null): Unit"),
             ("assertNotNull", "fun assertNotNull(actual, message: String? = null): Unit"),
+            ("random", "fun random(): Double"),
+            ("randomInt", "fun randomInt(bound: Int): Int"),
+            ("enableRawMode", "fun enableRawMode(): Unit"),
+            ("disableRawMode", "fun disableRawMode(): Unit"),
+            ("readByte", "fun readByte(): Any"),
+            ("isTerminal", "fun isTerminal(): Boolean"),
+            ("terminalWidth", "fun terminalWidth(): Int"),
+            ("terminalHeight", "fun terminalHeight(): Int"),
+            ("sleep", "fun sleep(millis: Int): Unit"),
+            ("currentTimeMillis", "fun currentTimeMillis(): Int"),
         ];
         let actual: Vec<(&str, String)> = STDLIB_PACKAGES
             .iter()
@@ -844,11 +1006,20 @@ mod tests {
                 "Int" => Value::Int(1),
                 "Double" => Value::Double(1.0),
                 "Boolean" => Value::Bool(true),
-                "List" => Value::List(crate::gc::GcRef::new(interp.gc.clone(), Vec::new())),
+                // Non-empty so `.get(0)`/`.set(0, ...)` below have a real
+                // slot to hit instead of always failing out-of-range.
+                "List" => Value::List(crate::gc::GcRef::new(interp.gc.clone(), vec![Value::Int(0)])),
                 "Any" => Value::Int(1),
                 other => panic!("add a receiver-type-appropriate value above for '{other}'"),
             };
-            let args = if m.symbol.name == "equals" { vec![Value::Unit] } else { vec![] };
+            let args = match m.symbol.name {
+                "equals" => vec![Value::Unit],
+                "get" => vec![Value::Int(0)],
+                "set" => vec![Value::Int(0), Value::Int(1)],
+                "add" => vec![Value::Int(1)],
+                "removeAt" => vec![Value::Int(0)],
+                _ => vec![],
+            };
             let result = call_builtin_method(&mut interp, receiver, m.symbol.name, args, Span::default());
             assert!(result.is_ok(), "'{}' on '{}' listed in BUILTIN_METHODS but not dispatchable: {:?}", m.symbol.name, m.receiver, result.err().map(|_| ()));
         }
@@ -857,6 +1028,16 @@ mod tests {
     #[test]
     fn builtin_method_return_type_walks_the_hierarchy() {
         for m in BUILTIN_METHODS {
+            // `.get`/`.removeAt` genuinely *declare* `Type::Unknown` as
+            // their real return type (no element-type tracking without
+            // generics — see their own doc comments in `BUILTIN_METHODS`),
+            // so this assertion can't tell "found, declared Unknown" apart
+            // from "not found, defaulted to Unknown" for just these two —
+            // `every_builtin_method_is_dispatchable_on_its_receiver_type`
+            // (which actually calls them) is what proves they're real.
+            if m.symbol.name == "get" || m.symbol.name == "removeAt" {
+                continue;
+            }
             assert_ne!(
                 builtin_method_return_type(m.receiver, m.symbol.name),
                 Type::Unknown,
@@ -878,6 +1059,78 @@ mod tests {
         let mut interp = Interpreter::new(&mut out);
         assert!(matches!(call_builtin_method(&mut interp, Value::str("abc"), "length", vec![], Span::default()), Ok(Value::Int(3))));
         assert!(matches!(call_builtin_method(&mut interp, Value::str("abc"), "uppercase", vec![], Span::default()), Ok(Value::Str(s)) if &*s == "ABC"));
+    }
+
+    fn new_list(interp: &Interpreter, items: Vec<Value>) -> Value {
+        Value::List(crate::gc::GcRef::new(interp.gc.clone(), items))
+    }
+
+    #[test]
+    fn list_get_returns_the_element_and_rejects_an_out_of_range_index() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        let list = new_list(&interp, vec![Value::Int(10), Value::Int(20)]);
+        assert!(matches!(
+            call_builtin_method(&mut interp, list.clone(), "get", vec![Value::Int(1)], Span::default()),
+            Ok(Value::Int(20))
+        ));
+        assert!(call_builtin_method(&mut interp, list.clone(), "get", vec![Value::Int(2)], Span::default()).is_err());
+        assert!(call_builtin_method(&mut interp, list, "get", vec![Value::Int(-1)], Span::default()).is_err());
+    }
+
+    #[test]
+    fn list_set_mutates_in_place_and_rejects_an_out_of_range_index() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        let list = new_list(&interp, vec![Value::Int(10), Value::Int(20)]);
+        assert!(call_builtin_method(&mut interp, list.clone(), "set", vec![Value::Int(0), Value::Int(99)], Span::default()).is_ok());
+        assert!(matches!(
+            call_builtin_method(&mut interp, list.clone(), "get", vec![Value::Int(0)], Span::default()),
+            Ok(Value::Int(99))
+        ));
+        assert!(call_builtin_method(&mut interp, list, "set", vec![Value::Int(5), Value::Int(1)], Span::default()).is_err());
+    }
+
+    #[test]
+    fn list_add_grows_the_list_by_one() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        let list = new_list(&interp, vec![Value::Int(1)]);
+        assert!(call_builtin_method(&mut interp, list.clone(), "add", vec![Value::Int(2)], Span::default()).is_ok());
+        assert!(matches!(
+            call_builtin_method(&mut interp, list, "size", vec![], Span::default()),
+            Ok(Value::Int(2))
+        ));
+    }
+
+    #[test]
+    fn list_remove_at_removes_and_shifts_and_rejects_an_out_of_range_index() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        let list = new_list(&interp, vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        assert!(matches!(
+            call_builtin_method(&mut interp, list.clone(), "removeAt", vec![Value::Int(0)], Span::default()),
+            Ok(Value::Int(10))
+        ));
+        assert!(matches!(
+            call_builtin_method(&mut interp, list.clone(), "size", vec![], Span::default()),
+            Ok(Value::Int(2))
+        ));
+        assert!(matches!(
+            call_builtin_method(&mut interp, list.clone(), "get", vec![Value::Int(0)], Span::default()),
+            Ok(Value::Int(20))
+        ));
+        assert!(call_builtin_method(&mut interp, list, "removeAt", vec![Value::Int(5)], Span::default()).is_err());
+    }
+
+    #[test]
+    fn list_size_reports_the_element_count() {
+        let mut out = Vec::new();
+        let mut interp = Interpreter::new(&mut out);
+        let empty = new_list(&interp, Vec::new());
+        assert!(matches!(call_builtin_method(&mut interp, empty, "size", vec![], Span::default()), Ok(Value::Int(0))));
+        let three = new_list(&interp, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(matches!(call_builtin_method(&mut interp, three, "size", vec![], Span::default()), Ok(Value::Int(3))));
     }
 
     /// The whole point of unifying dispatch through `builtin_classes`'
