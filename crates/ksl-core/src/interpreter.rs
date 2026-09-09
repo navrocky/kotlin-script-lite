@@ -204,8 +204,26 @@ impl<'a> Interpreter<'a> {
     /// see `StackFrame`), then the stack is cleared either way so a
     /// reused `Interpreter` (multiple files via `importer.rs`, or a test
     /// harness) starts the next run with a clean slate.
+    ///
+    /// Also runs `collect_cycles` exactly once, right here, regardless of
+    /// `Ok`/`Err` — `collect_cycles`'s own doc comment requires this to
+    /// only ever happen "between top-level calls," and by the time
+    /// `run_in_env_inner` has returned (however it returned), every `Env`
+    /// created *by this call* that only ever lived as a Rust-local
+    /// variable on the stack has already unwound — nothing from this call
+    /// is still "in flight." This holds even for a *nested* `run_in_env`
+    /// call made while loading a `@file:Import` partway through another
+    /// file's own imports (`importer.rs`'s `load_import`/`run_imports`):
+    /// every file's own imports are always fully loaded *and run* before
+    /// that file's own top-level statements ever execute (`run_top_level`:
+    /// `run_imports` unconditionally before `run_program`, and identically
+    /// in `load_import`'s own recursive structure) — so at the point any
+    /// `run_in_env` call returns, at any import depth, no *outer* file has
+    /// started running its own top-level code yet, and thus has no Rust-
+    /// stack-only state of its own that this could disturb.
     pub fn run_in_env(&mut self, stmts: &[Stmt], env: &Env) -> Result<(), Flow> {
         let result = self.run_in_env_inner(stmts, env);
+        self.collect_cycles();
         match result {
             Err(Flow::Error(mut e)) => {
                 e.stack = std::mem::take(&mut self.call_stack);
@@ -227,7 +245,22 @@ impl<'a> Interpreter<'a> {
     /// implicitly, restricted to exactly the cyclic case that reference
     /// counting alone can't handle. Returns how many `Env`s were reclaimed
     /// this way (0 is the common, expected result — most code creates no
-    /// such cycles).
+    /// such cycles). Called automatically from `run_in_env` (see its own
+    /// doc comment for exactly why that call site is always safe, even
+    /// across nested `@file:Import` loads) — a caller doesn't need to
+    /// remember to call this separately.
+    ///
+    /// This does **not** cover a long-running single top-level call whose
+    /// own loop bodies allocate many *non*-cyclic `Env`s along the way
+    /// (e.g. a real-time game's `while` loop) — `run_in_env` only reaches
+    /// this once, when that whole call finally returns. That specific,
+    /// much more common case (ordinary `Rc` drop already reclaims each
+    /// iteration's own `Env` correctly; only the GC registry's own dead-
+    /// entry bookkeeping needed pruning) is handled separately and
+    /// unconditionally-safely by `gc::GcRegistry::register`'s own self-
+    /// throttling, which needs no reachability analysis at all and so
+    /// isn't restricted to safe call sites the way this is — see its doc
+    /// comment.
     ///
     /// # Only call this between top-level calls into a loaded program
     /// Calling this while a KSL call is still executing on the Rust stack
@@ -241,7 +274,11 @@ impl<'a> Interpreter<'a> {
     /// could clear out the still-running call's own variables mid-
     /// execution, corrupting it rather than merely freeing memory. Safe
     /// call sites: right after `run`/`run_in_env` returns (`Ok` or `Err`),
-    /// before making the next top-level call into the loaded program.
+    /// before making the next top-level call into the loaded program —
+    /// `run_in_env` itself is the one production call site; test code may
+    /// call this directly too, but only between its own top-level `run`/
+    /// `run_in_env`/`run_bypassing_static_check`-style calls, never mid-
+    /// execution.
     pub fn collect_cycles(&mut self) -> usize {
         let live = self.gc.live_nodes();
         if live.is_empty() {
