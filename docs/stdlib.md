@@ -29,7 +29,7 @@ called it).
 ## Output
 
 Lives in `kotlin.io`, auto-imported (see the intro above) — also callable
-as `kotlin.io.println(...)`/`kotlin.io.print(...)`.
+as `kotlin.io.println(...)`/`kotlin.io.print(...)`/`kotlin.io.flush()`.
 
 ### `println(value?)`
 
@@ -47,6 +47,21 @@ println()          // (blank line)
 
 Like `println`, but without the trailing newline. Requires exactly one
 argument.
+
+### `flush()`
+
+Forces any buffered `print()`/`println()` output out to the terminal
+right now. Not part of real Kotlin's portable `kotlin.io` (the JVM has
+`System.out.flush()`, but common Kotlin has no cross-platform
+equivalent) — added here because it's needed: stdout is line-buffered,
+so a `print()` with no trailing newline (drawing a game frame with no
+final `println()`, say) can otherwise sit unseen until something else
+later happens to flush it.
+
+```kotlin
+print("Loading")
+flush()          // shows immediately, even with no newline
+```
 
 ### `readLine(): String?`
 

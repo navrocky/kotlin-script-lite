@@ -1,4 +1,6 @@
-//! `kotlin.io` — `println`/`print`. Auto-imported, matching real Kotlin.
+//! `kotlin.io` — `println`/`print`/`flush`. Auto-imported, matching real
+//! Kotlin (`flush` is a ksl-specific addition — real Kotlin has no portable
+//! one in common `kotlin.io`, only JVM's `System.out.flush()`).
 
 use crate::environment::Env;
 use crate::error::{Flow, RuntimeError, Span};
@@ -28,6 +30,14 @@ pub(super) const PACKAGE: BuiltinPackage = BuiltinPackage {
             variadic_param: None,
             return_type: Type::Unit,
             doc: "Like println, but without the trailing newline.",
+        },
+        BuiltinSymbol {
+            name: "flush",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::Unit,
+            doc: "Forces any buffered output from print()/println() calls out to the terminal right now. Needed after print() calls with no trailing newline — stdout is line-buffered, so output can otherwise sit unseen until a later println() (or process exit) finally flushes it.",
         },
         BuiltinSymbol {
             name: "readLine",
@@ -75,6 +85,14 @@ fn populate(env: &Env) {
             }
             n => return Err(arity_error("print", "1", n, span)),
         }
+        Ok(Value::Unit)
+    });
+
+    register(env, "flush", |interp, args, span| {
+        if !args.is_empty() {
+            return Err(arity_error("flush", "0", args.len(), span));
+        }
+        interp.out.flush().map_err(|e| RuntimeError::new(format!("io error: {e}"), span))?;
         Ok(Value::Unit)
     });
 

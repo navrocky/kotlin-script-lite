@@ -838,6 +838,7 @@ mod tests {
         let expected: &[(&str, &str)] = &[
             ("println", "fun println(value: Any?): Unit"),
             ("print", "fun print(value: Any?): Unit"),
+            ("flush", "fun flush(): Unit"),
             ("readLine", "fun readLine(): Any"),
             ("listOf", "fun listOf(vararg values): List"),
             ("length", "fun length(s: String): Int"),

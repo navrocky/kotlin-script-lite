@@ -2062,6 +2062,26 @@ mod tests {
     }
 
     #[test]
+    fn flush_is_callable_with_no_args_and_does_not_disturb_output() {
+        // Can't observe *buffering* itself through the in-memory `Vec<u8>`
+        // writer these tests run against (no unflushed-vs-flushed
+        // distinction to detect there) — this just proves `flush()` is
+        // callable, returns `Unit`, and doesn't disturb surrounding
+        // output. Its real job — forcing a `print()`-only frame out past
+        // stdout's line-buffering onto a real terminal — is exactly what
+        // motivated adding it; not exercisable through this harness.
+        assert_eq!(run("print(\"a\")\nflush()\nprint(\"b\")\n"), "ab");
+    }
+
+    #[test]
+    fn flush_with_an_argument_is_an_arity_error() {
+        // Matches `readLine(1)`'s identical existing behavior — 0-arg
+        // builtins here report arity mismatches at runtime, not
+        // statically; not something this addition changes.
+        assert!(run_err("flush(1)").contains("flush expects 0 argument"));
+    }
+
+    #[test]
     fn println_on_an_object_uses_a_real_user_defined_to_string() {
         // `this.x`/`this.y` written explicitly here purely for clarity —
         // bare `x`/`y` would resolve identically via implicit `this`
