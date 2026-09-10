@@ -1102,6 +1102,50 @@ impl<'a> Parser<'a> {
             TokenKind::LBrace => self.parse_lambda(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::When => self.parse_when_expr(),
+            // `x ?: return`/`x ?: return 0`, `x ?: break`, `x ?: continue`
+            // — `return`/`break`/`continue` used in expression position,
+            // not just as their own statement (`parse_stmt`'s own
+            // `TokenKind::Return`/`Break`/`Continue` arms handle the
+            // bare-statement form and take priority — this is only ever
+            // reached when one of these appears nested inside a larger
+            // expression). Same value-or-not lookahead `parse_stmt` uses
+            // for the statement form, widened with the tokens that end an
+            // expression *nested* somewhere other than directly in a
+            // statement (a call argument or parenthesized/bracketed
+            // expression) — `x ?: return` (newline next), `x ?: return 5`
+            // (a value follows), `foo(x ?: return)`/`foo(x ?: return, y)`.
+            TokenKind::Return => {
+                self.advance();
+                let value = if matches!(
+                    self.peek_kind(),
+                    TokenKind::Newline
+                        | TokenKind::Semicolon
+                        | TokenKind::RBrace
+                        | TokenKind::Eof
+                        | TokenKind::RParen
+                        | TokenKind::RBracket
+                        | TokenKind::Comma
+                ) {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr()?))
+                };
+                Ok(Expr::new(ExprKind::Return(value), span))
+            }
+            TokenKind::Break => {
+                self.advance();
+                if self.loop_depth == 0 {
+                    return Err(ParseError::new("'break' is only allowed inside a loop", span));
+                }
+                Ok(Expr::new(ExprKind::Break, span))
+            }
+            TokenKind::Continue => {
+                self.advance();
+                if self.loop_depth == 0 {
+                    return Err(ParseError::new("'continue' is only allowed inside a loop", span));
+                }
+                Ok(Expr::new(ExprKind::Continue, span))
+            }
             other => Err(self.err(format!("unexpected token {other:?}"))),
         }
     }
@@ -1505,6 +1549,62 @@ mod tests {
             },
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn elvis_rhs_accepts_a_bare_return() {
+        // `x ?: return` — the bare-statement form is a parse error the
+        // moment `return` appears after `?:` unless `parse_primary` itself
+        // accepts it as an expression (see the doc comment on that arm).
+        let stmts = parse_src("fun f() { val y = x ?: return }");
+        let StmtKind::FunDecl { body: FunBody::Block(body), .. } = &stmts[0].kind else {
+            panic!("expected a fun decl");
+        };
+        match &body[0].kind {
+            StmtKind::ValDecl { init, .. } => match &init.kind {
+                ExprKind::Elvis { rhs, .. } => {
+                    assert!(matches!(rhs.kind, ExprKind::Return(None)), "{:?}", rhs.kind);
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elvis_rhs_accepts_a_return_with_a_value() {
+        let stmts = parse_src("fun f() { val y = x ?: return 0 }");
+        let StmtKind::FunDecl { body: FunBody::Block(body), .. } = &stmts[0].kind else {
+            panic!("expected a fun decl");
+        };
+        match &body[0].kind {
+            StmtKind::ValDecl { init, .. } => match &init.kind {
+                ExprKind::Elvis { rhs, .. } => match &rhs.kind {
+                    ExprKind::Return(Some(v)) => assert!(matches!(v.kind, ExprKind::IntLit(0))),
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elvis_rhs_accepts_break_and_continue_inside_a_loop() {
+        parse_src("while (true) { val y = x ?: break }");
+        parse_src("while (true) { val y = x ?: continue }");
+    }
+
+    #[test]
+    fn elvis_rhs_break_outside_a_loop_is_rejected() {
+        let err = parse_err("val y = x ?: break");
+        assert!(err.message.contains("'break'"), "{}", err.message);
+    }
+
+    #[test]
+    fn elvis_rhs_continue_outside_a_loop_is_rejected() {
+        let err = parse_err("val y = x ?: continue");
+        assert!(err.message.contains("'continue'"), "{}", err.message);
     }
 
     #[test]

@@ -189,6 +189,21 @@ pub enum ExprKind {
         name_span: Span,
         prefix: bool,
     },
+    /// `return`/`return expr` used in *expression* position — e.g. `x ?:
+    /// return` or `x ?: return 0` (`StmtKind::Return` only covers the
+    /// bare-statement form). Evaluates via the same `Flow::Return`
+    /// unwinding `StmtKind::Return` already uses — `eval_expr`'s
+    /// `Result<Value, Flow>` plumbing propagates it with no special
+    /// handling anywhere it appears, including through `Elvis`. Its
+    /// static type is `Type::Nothing` (`resolver.rs`), which is what lets
+    /// `x ?: return` strip the `?` from `x`'s type — Elvis already treats
+    /// a `Nothing`-typed rhs as "never taken", the same general rule
+    /// `if`/`when` LUB uses, not a special case keyed on this variant.
+    Return(Option<Box<Expr>>),
+    /// `break`/`continue` used in expression position — same rationale as
+    /// `Return` above, mirroring `StmtKind::Break`/`StmtKind::Continue`.
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

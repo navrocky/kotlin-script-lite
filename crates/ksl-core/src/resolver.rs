@@ -1363,9 +1363,17 @@ impl<'a> Resolver<'a> {
 
     /// Returns this statement's own "value type" for `walk_stmts`'s
     /// last-statement rule: a bare expression statement yields its
-    /// expression's type; every other statement kind yields `Type::Unit`
-    /// (matching `exec_stmt`'s runtime shape — only `ExprStmt` ever
-    /// contributes a real value to an enclosing block).
+    /// expression's type; `Return`/`Break`/`Continue` yield `Type::Nothing`
+    /// — a block that ends by unconditionally diverging never "falls
+    /// through with a value" the way an ordinary statement does, and
+    /// `Nothing` is what lets `if`/`when` branch LUB (and now `Elvis`, see
+    /// its own doc comment) treat a diverging branch as contributing
+    /// nothing to the join, exactly like real Kotlin's `if (x != null) x
+    /// else return` inferring `x`'s own non-nullable type rather than
+    /// erroring on "incompatible types: T and Unit"; every other statement
+    /// kind yields `Type::Unit` (matching `exec_stmt`'s runtime shape —
+    /// only `ExprStmt` ever contributes a real value to an enclosing
+    /// block).
     fn walk_stmt(&mut self, stmt: &Stmt, scope: usize, following: Span) -> Type {
         self.touch(scope, stmt.span);
         match &stmt.kind {
@@ -1433,7 +1441,16 @@ impl<'a> Resolver<'a> {
                 match self.resolve_symbol(scope, name) {
                     Some(sym) => {
                         let target_ty = sym.ty.clone();
+                        let mutable = sym.mutable;
                         self.resolve_name(scope, name, stmt.span);
+                        // A plain local `val` reassignment was the one case
+                        // missing this check — `FieldAssign`'s own handling
+                        // below and the cross-file-import case further down
+                        // both already have it; only the interpreter caught
+                        // this one, at runtime, not statically.
+                        if !mutable {
+                            self.type_errors.push(RuntimeError::new(format!("cannot reassign val '{name}'"), stmt.span));
+                        }
                         // Compound assignment (`+=` etc.) is out of scope
                         // for v1 — its result type would need the same
                         // widening rules as arithmetic, and isn't a plain
@@ -1797,9 +1814,9 @@ impl<'a> Resolver<'a> {
                     }
                     None => {}
                 }
-                Type::Unit
+                Type::Nothing
             }
-            StmtKind::Break | StmtKind::Continue => Type::Unit,
+            StmtKind::Break | StmtKind::Continue => Type::Nothing,
             StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment } => {
                 self.walk_class_decl(name, *name_span, ctor_params, members, doc_comment.as_deref(), scope, following, stmt.span);
                 Type::Unit
@@ -2546,6 +2563,21 @@ impl<'a> Resolver<'a> {
         expected_param_types: Option<&[Type]>,
     ) -> Vec<Type> {
         if params.is_empty() {
+            // A context that names an exact, zero-length parameter list
+            // (`() -> R` — e.g. a callback parameter typed `onDone: () ->
+            // Unit`) means this lambda genuinely takes no parameters at
+            // all: there's no implicit `it` to infer here, unlike the
+            // single-parameter case below where `it` stands in for the
+            // one expected parameter. Checked as its own case with a
+            // slice pattern, not folded into the `.filter(|p| p.len() ==
+            // 1)` below — that filter alone can't distinguish "exactly
+            // zero expected" from "no information at all" (`None`), and
+            // was wrongly demanding an `it` that a `() -> Unit`-typed
+            // parameter never wanted (`cannot infer type of lambda
+            // parameter 'it'` on a lambda that never even mentions `it`).
+            if matches!(expected_param_types, Some([])) {
+                return Vec::new();
+            }
             let inferred = expected_param_types
                 .filter(|p| p.len() == 1)
                 .map(|p| p[0].clone())
@@ -3856,7 +3888,18 @@ impl<'a> Resolver<'a> {
                         Type::Nullable(inner) => (**inner).clone(),
                         other => other.clone(),
                     };
-                    if unwrapped_l == r {
+                    // `rhs` never actually produces a value (`return`/
+                    // `break`/`continue`, all typed `Nothing` — see
+                    // `ExprKind::Return`/`Break`/`Continue` below) — so the
+                    // elvis can only ever take the `lhs` branch when it's
+                    // reached at all, meaning the whole expression is just
+                    // `lhs`'s own *non-nullable* type. Keyed on `Type::
+                    // Nothing` generally, not on which `ExprKind` produced
+                    // it — the same rule `if`/`when` LUB already applies to
+                    // a branch that unconditionally diverges.
+                    if r == Type::Nothing {
+                        unwrapped_l
+                    } else if unwrapped_l == r {
                         unwrapped_l
                     } else if unwrapped_l == Type::Unknown || r == Type::Unknown {
                         Type::Unknown
@@ -3879,6 +3922,41 @@ impl<'a> Resolver<'a> {
             // member (`class_member_depth`), so reaching here with no
             // `this` in scope is not a real user-facing case.
             ExprKind::This => self.resolve_name(scope, "this", expr.span),
+            // Expression-position `return`/`break`/`continue` — same
+            // return-type checking `StmtKind::Return` already does above,
+            // just yielding `Type::Nothing` as *this expression's own*
+            // type (not `Type::Unit`, which is what the statement form
+            // reports as a block's "value" — a different question). This
+            // is what lets `Elvis` above strip `?` off `x ?: return`'s
+            // type generically, without knowing anything about `return`
+            // specifically.
+            ExprKind::Return(value) => {
+                let ty = match value {
+                    Some(e) => self.walk_expr(e, scope, following),
+                    None => Type::Unit,
+                };
+                match self.return_type_stack.last().cloned() {
+                    Some(ReturnTypeContext::Expected(expected)) => {
+                        if ty != Type::Unknown
+                            && expected != Type::Unknown
+                            && !types::is_assignable(&ty, &expected)
+                        {
+                            self.type_errors.push(RuntimeError::new(
+                                format!("return type mismatch: expected {}, got {}", expected.name(), ty.name()),
+                                expr.span,
+                            ));
+                        }
+                    }
+                    Some(ReturnTypeContext::Collect(_)) => {
+                        if let Some(ReturnTypeContext::Collect(seen)) = self.return_type_stack.last_mut() {
+                            seen.push(ty);
+                        }
+                    }
+                    None => {}
+                }
+                Type::Nothing
+            }
+            ExprKind::Break | ExprKind::Continue => Type::Nothing,
         }
     }
 }
@@ -4445,6 +4523,69 @@ mod tests {
     #[test]
     fn initializer_matching_hint_is_not_a_type_error() {
         let result = resolve_src("val x: Int = 5\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn elvis_with_a_return_rhs_strips_nullable_from_the_result_type() {
+        // `x ?: return 0` — `return`'s own type is `Nothing` (it never
+        // actually produces a value here), so the elvis can only ever take
+        // the `lhs` branch when reached at all: the declared non-nullable
+        // `Int` hint must match with no type error, proving the inferred
+        // type was stripped down from `Int?`, not left `Nullable`.
+        let result = resolve_src("fun f(x: Int?): Int {\n    val y: Int = x ?: return 0\n    return y\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn if_expression_branch_ending_in_return_contributes_nothing_to_lub() {
+        // `walk_stmt`'s block-tail typing for `Return`/`Break`/`Continue`
+        // must be `Type::Nothing`, not `Type::Unit` — otherwise this
+        // reports "branches have incompatible types: String and Unit"
+        // instead of correctly inferring `String` (the `else` branch never
+        // actually produces a value; it diverges).
+        let result = resolve_src(
+            "fun f(x: String?): String {\n\
+             \x20   val v = if (x != null) x else return \"default\"\n\
+             \x20   return v\n\
+             }\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn elvis_with_a_continue_or_break_rhs_also_strips_nullable() {
+        // Same rule, general on `Type::Nothing` — not special-cased to
+        // `return` specifically. `x`'s declared type is `List` here only
+        // to have something with a real `.get`; the actual thing under
+        // test is the `Int? -> Int` narrowing on `item`.
+        let result = resolve_src(
+            "fun f(items: List): Int {\n\
+             \x20   var i = 0\n\
+             \x20   var total = 0\n\
+             \x20   while (i < items.size()) {\n\
+             \x20       val item: Int? = items.get(i)\n\
+             \x20       i = i + 1\n\
+             \x20       val v: Int = item ?: continue\n\
+             \x20       total = total + v\n\
+             \x20   }\n\
+             \x20   return total\n\
+             }\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        let result = resolve_src(
+            "fun f(items: List): Int {\n\
+             \x20   var i = 0\n\
+             \x20   while (i < items.size()) {\n\
+             \x20       val item: Int? = items.get(i)\n\
+             \x20       i = i + 1\n\
+             \x20       val v: Int = item ?: break\n\
+             \x20       return v\n\
+             \x20   }\n\
+             \x20   return -1\n\
+             }\n",
+        );
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 
@@ -5195,6 +5336,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_param_lambda_matching_a_zero_arity_expected_type_needs_no_implicit_it() {
+        // `walk_lambda_params`'s `expected_param_types.filter(|p| p.len()
+        // == 1)` treated "exactly zero expected" the same as "no
+        // information at all" and wrongly demanded an implicit `it` a
+        // `() -> Unit`-typed parameter never wanted. Both positional and
+        // named-argument call syntax go through the same `walk_call_args`
+        // path — covering both here, since a real user file hit this via
+        // named arguments specifically.
+        let result = resolve_src(
+            "fun withCallback(onDone: () -> Unit) {\n    onDone()\n}\n\
+             withCallback({ println(\"hi\") })\n\
+             withCallback(onDone = { println(\"hi\") })\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
     fn lambda_return_type_disagreement_is_a_type_error() {
         let result = resolve_src(
             "val f: (Boolean) -> Int = { b ->\n    if (b) { return 1 }\n    return \"x\"\n}\n",
@@ -5434,6 +5592,26 @@ mod tests {
 
         let wrong_type = resolve_src("class Point(var x: Int)\nval p = Point(1)\nfun f() {\n    p.x = \"nope\"\n}\n");
         assert!(wrong_type.type_errors.iter().any(|e| e.message.contains("cannot assign")), "{:?}", wrong_type.type_errors);
+    }
+
+    #[test]
+    fn reassigning_a_plain_local_val_is_flagged_statically() {
+        // `StmtKind::Assign`'s `Some(sym)` branch (an ordinary local, the
+        // most common case) was missing the `mutable` check entirely —
+        // `field_access_and_assignment_are_checked` above already proves
+        // a `val` *field* is caught, and cross-file `val` reassignment has
+        // its own check further down `walk_stmt`; only this, the most
+        // basic case, silently fell through to a *runtime*-only error
+        // (`decrement_a_val_is_a_runtime_error` etc., interpreter.rs).
+        let top_level = resolve_src("val x = 1\nx = 2\n");
+        assert!(top_level.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'x'")), "{:?}", top_level.type_errors);
+
+        let inside_fun = resolve_src("fun f() {\n    val k = 1\n    k = 2\n    println(k)\n}\n");
+        assert!(inside_fun.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'k'")), "{:?}", inside_fun.type_errors);
+
+        // Regression: a real `var` must stay completely unaffected.
+        let var_is_fine = resolve_src("var x = 1\nx = 2\nprintln(x)\n");
+        assert!(var_is_fine.type_errors.is_empty(), "{:?}", var_is_fine.type_errors);
     }
 
     #[test]

@@ -1143,6 +1143,21 @@ impl<'a> Interpreter<'a> {
             ExprKind::This => env
                 .get("this")
                 .ok_or_else(|| RuntimeError::new("'this' is not bound here", expr.span).into()),
+            // Expression-position `return`/`break`/`continue` (`x ?:
+            // return`) — identical unwinding to `StmtKind::Return`/`Break`/
+            // `Continue`'s own handling above; every `eval_expr` caller
+            // already propagates a `Flow` error through its own `Result`,
+            // so nothing else needs to change for this to work correctly
+            // nested inside `Elvis`, a call argument, etc.
+            ExprKind::Return(value) => {
+                let v = match value {
+                    Some(e) => self.eval_expr(e, env)?,
+                    None => Value::Unit,
+                };
+                Err(Flow::Return(v))
+            }
+            ExprKind::Break => Err(Flow::Break),
+            ExprKind::Continue => Err(Flow::Continue),
         }
     }
 
