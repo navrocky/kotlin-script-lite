@@ -482,9 +482,11 @@ an error (see [Types](#types)). A lambda captures the environment that was
 active where it was written (true lexical closures), not the caller's
 environment.
 
-**Trailing-lambda call syntax** — `foo { ... }`/`obj.method { ... }` —
-omits the parentheses entirely, but only when the lambda is the call's
-*sole* argument:
+**Trailing-lambda call syntax** — `foo { ... }`/`obj.method { ... }` — a
+lambda argument written right after the callee, with no comma before it.
+With no other arguments, the parentheses can be omitted entirely; with
+other arguments already in `(...)` (empty or not), the lambda is appended
+to that same call as one more argument, same as real Kotlin:
 
 ```kotlin
 fun withResult(body: () -> Int): Int = body()
@@ -494,14 +496,23 @@ class Counter(var n: Int) {
     fun update(f: (Int) -> Int) { n = f(n) }
 }
 Counter(5).update { it + 10 }      // 15
+
+fun withLog(label: String, body: () -> Unit) { println(label); body() }
+withLog("start") { println("ran") }   // same as withLog("start", { println("ran") })
 ```
 
-This is purely parser sugar for `foo({ ... })`/`obj.method({ ... })` —
-identical checking and evaluation either way. Real Kotlin also allows a
-trailing lambda *after* an explicit, non-empty `(...)` argument list
-(`foo(a, b) { ... }`) — not supported here yet; `foo(a) { ... }` parses as
-two separate statements (a complete call, then an unrelated bare lambda),
-not one merged call.
+Purely parser sugar for `foo({ ... })`/`foo(a, b, { ... })` — identical
+checking and evaluation either way. A trailing lambda only merges with a
+call immediately to its left, on the same line (or right after that
+call's own closing `)`) — `foo()\n{ ... }`, with a real newline in
+between, parses as two separate statements instead, same as without this
+syntax at all.
+
+A lambda passed where a `() -> Unit` (or any `Unit`-returning function
+type) is expected doesn't need its own body to actually produce `Unit` —
+`runIt { someCall() }` against `fun runIt(block: () -> Unit)` works even
+when `someCall()` returns something else; the value is simply discarded,
+matching real Kotlin's function-literal Unit-coercion.
 
 ## Imports
 

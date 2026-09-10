@@ -927,19 +927,18 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
-        // `foo { ... }` — trailing-lambda call syntax, only when the
-        // lambda is the call's *sole* argument (real Kotlin also allows a
-        // trailing lambda after an explicit, non-empty `(...)` list —
-        // deliberately not supported here, by request). Checked exactly
-        // once, right here before the postfix loop below even starts —
-        // not as another branch inside that loop alongside `LParen` — so
-        // that this only ever fires on `{` immediately after the bare
-        // primary expression itself. Were it a loop branch instead,
-        // `foo() { ... }` would *also* match on the loop's next
-        // iteration (once `LParen` had already built `foo()`), silently
-        // reinterpreting it as calling `foo()`'s *result* with the
-        // lambda — a different, unwanted meaning for exactly the
-        // "other parameters exist" case this feature excludes. A source
+        // `foo { ... }` — trailing-lambda call syntax with *no* `(...)` at
+        // all (the `LParen` branch below handles `foo(a, b) { ... }`,
+        // appending the lambda to an already-parsed argument list instead
+        // — see its own comment). Checked exactly once, right here before
+        // the postfix loop even starts — not as another branch inside
+        // that loop alongside `LParen` — so this only ever fires on `{`
+        // immediately after the bare primary expression itself, never on
+        // a later iteration once some other postfix operator has already
+        // produced a new `expr` (which would silently reinterpret, say,
+        // `foo.bar { }` as calling `foo.bar`'s value with a lambda after
+        // the `Dot` branch already ran, instead of leaving it to that
+        // branch's own `{`-handling, right where it belongs). A source
         // newline between `foo` and `{` already prevents this on its own
         // (`Ident` is in `TokenKind::can_end_statement()`, so it becomes
         // a real `Newline` token, not `LBrace`, here).
@@ -966,7 +965,17 @@ impl<'a> Parser<'a> {
                 // after it — a position `(`'s own single-character span
                 // could never reach.
                 let callee_span = expr.span;
-                let args = self.parse_call_args().map_err(|e| attach_callee_to_call_argument_error(e, &expr))?;
+                let mut args = self.parse_call_args().map_err(|e| attach_callee_to_call_argument_error(e, &expr))?;
+                // `foo(a, b) { ... }` — a trailing lambda immediately
+                // after an explicit (possibly non-empty, possibly empty)
+                // argument list is appended as one more positional `Arg`,
+                // matching real Kotlin — `foo(a, b) { ... }` means the
+                // same thing as `foo(a, b, { ... })`. The no-parens-at-all
+                // case (`foo { ... }`) is handled separately, above this
+                // loop, before `parse_primary`'s result reaches here.
+                if matches!(self.peek_kind(), TokenKind::LBrace) {
+                    args.push(Arg { name: None, name_span: None, value: self.parse_lambda()? });
+                }
                 let span = callee_span.merge(&self.prev_span());
                 expr = Expr::new(
                     ExprKind::Call {
@@ -980,7 +989,13 @@ impl<'a> Parser<'a> {
                 self.advance(); // '.' or '?.'
                 let (member, member_span) = self.expect_ident_spanned(IdentRole::Other)?;
                 expr = if matches!(self.peek_kind(), TokenKind::LParen) {
-                    let args = self.parse_call_args()?;
+                    let mut args = self.parse_call_args()?;
+                    // Same trailing-lambda-after-explicit-parens sugar as
+                    // the bare `Call` case above — `obj.method(a) { ... }`
+                    // appends the lambda as one more positional `Arg`.
+                    if matches!(self.peek_kind(), TokenKind::LBrace) {
+                        args.push(Arg { name: None, name_span: None, value: self.parse_lambda()? });
+                    }
                     // Same reasoning as `Call` above: widened to the real
                     // closing `)`, computed only now that `args` has
                     // actually been consumed — not before, the way
@@ -998,16 +1013,17 @@ impl<'a> Parser<'a> {
                         full_span,
                     )
                 } else if matches!(self.peek_kind(), TokenKind::LBrace) {
-                    // `obj.method { ... }` — same trailing-lambda sugar as
-                    // the bare-callee case above, right here rather than a
-                    // separate loop branch for the same reason: this is
-                    // already exactly the one place that decides between a
-                    // parenthesized method call and a bare field access,
-                    // immediately after the member name and before any
-                    // further postfix operator could apply — `obj.method(a)
-                    // { ... }` (non-empty parens plus a trailing lambda)
-                    // takes the `LParen` branch above instead and is
-                    // untouched, matching the same excluded case.
+                    // `obj.method { ... }` — no-parens-at-all trailing
+                    // lambda, same sugar as the bare-callee case above,
+                    // right here rather than a separate loop branch for
+                    // the same reason: this is already exactly the one
+                    // place that decides between a parenthesized method
+                    // call and a bare field access, immediately after the
+                    // member name and before any further postfix operator
+                    // could apply. `obj.method(a) { ... }` (explicit
+                    // parens plus a trailing lambda) takes the `LParen`
+                    // branch above instead, which appends the lambda to
+                    // `args` there — see its own comment.
                     let lambda = self.parse_lambda()?;
                     let full_span = expr.span.merge(&lambda.span);
                     Expr::new(
@@ -2193,27 +2209,55 @@ mod tests {
     }
 
     #[test]
-    fn trailing_lambda_does_not_merge_after_explicit_parens() {
-        // `foo(a) { x }`/`foo() { x }` — a trailing lambda *after* an
-        // already-parenthesized (even empty) argument list is real Kotlin
-        // too, but deliberately out of scope here: `foo(...)` fully
-        // resolves its own `Call` first, so by the time `{` appears we're
-        // past the one spot (right after `parse_primary`, or right after
-        // a bare member name) this sugar is recognized at — behavior is
-        // unchanged from before this feature existed.
-        let stmts = parse_src("foo(a)");
+    fn trailing_lambda_merges_after_explicit_parens_too() {
+        // `foo(a) { x }`/`foo() { x }` — a trailing lambda immediately
+        // after an already-parenthesized argument list (empty or not) is
+        // appended to that same call's `args`, matching real Kotlin:
+        // `foo(a) { x }` means the same thing as `foo(a, { x })`.
+        let stmts = parse_src("foo(a) { x }");
         match &stmts[0].kind {
             StmtKind::ExprStmt(e) => match &e.kind {
-                ExprKind::Call { args, .. } => assert_eq!(args.len(), 1),
+                ExprKind::Call { args, .. } => {
+                    assert_eq!(args.len(), 2, "{args:?}");
+                    assert!(args[0].name.is_none());
+                    assert!(matches!(args[1].value.kind, ExprKind::Lambda { .. }));
+                }
                 other => panic!("unexpected {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
         }
-        // Same call, immediately followed by `{ x }` on the same line —
-        // parses as *two* statements (the call, then a bare lambda
-        // statement), not one merged call; `parse_src` returning 2
-        // statements here (rather than erroring) is itself the proof.
-        let stmts = parse_src("foo(a) { x }");
+
+        let stmts = parse_src("foo() { x }");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Call { args, .. } => {
+                    assert_eq!(args.len(), 1, "{args:?}");
+                    assert!(matches!(args[0].value.kind, ExprKind::Lambda { .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let stmts = parse_src("obj.method(a) { x }");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::MethodCall { args, .. } => {
+                    assert_eq!(args.len(), 2, "{args:?}");
+                    assert!(matches!(args[1].value.kind, ExprKind::Lambda { .. }));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_lambda_after_parens_does_not_merge_across_a_newline() {
+        // `foo()\n{ x }` — a real newline between `)` and `{` (`RParen`
+        // is in `can_end_statement()`) keeps these as two separate
+        // statements, same as the no-parens case.
+        let stmts = parse_src("foo()\n{ x }");
         assert_eq!(stmts.len(), 2, "{stmts:?}");
         assert!(matches!(&stmts[0].kind, StmtKind::ExprStmt(e) if matches!(e.kind, ExprKind::Call { .. })));
         assert!(matches!(&stmts[1].kind, StmtKind::ExprStmt(e) if matches!(e.kind, ExprKind::Lambda { .. })));

@@ -1,8 +1,10 @@
-// Trailing-lambda call syntax (`foo { ... }`/`obj.method { ... }`) — only
-// when the lambda is the call's sole argument; parentheses are omitted
-// entirely. Desugars at parse time into the same `Call`/`MethodCall` AST
-// a fully-parenthesized `foo({ ... })` would produce, so it's checked and
-// evaluated identically — no separate feature underneath.
+// Trailing-lambda call syntax (`foo { ... }`/`obj.method { ... }`) — with
+// no parentheses at all (the lambda is the call's sole argument) or
+// appended after an already-parenthesized argument list, empty or not
+// (`foo() { ... }`/`foo(a, b) { ... }`). Desugars at parse time into the
+// same `Call`/`MethodCall` AST a fully-parenthesized `foo({ ... })`/
+// `foo(a, b, { ... })` would produce, so it's checked and evaluated
+// identically — no separate feature underneath.
 
 fun withResult(body: () -> Int): Int = body()
 
@@ -26,3 +28,22 @@ println(c2.n)
 
 // Explicit parens still work exactly as before.
 println(withResult({ 100 }))
+
+// A trailing lambda after an explicit argument list, empty or not.
+fun withLog(label: String, body: () -> Unit) {
+    println(label)
+    body()
+}
+withLog("start") { println("ran") }
+
+fun addAndLog(a: Int, b: Int, onDone: () -> Unit): Int {
+    onDone()
+    return a + b
+}
+println(addAndLog(3, 4) { println("adding") })
+
+// Unit-coercion: a trailing lambda's last expression doesn't have to be
+// Unit when the expected type is `() -> Unit` — the value is discarded.
+fun runIt(block: () -> Unit) { block() }
+runIt { 99 }
+println("done")

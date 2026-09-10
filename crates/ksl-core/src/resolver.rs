@@ -2693,7 +2693,23 @@ impl<'a> Resolver<'a> {
                 Type::Unknown
             }
         };
-        Type::Function(param_types, Box::new(inferred_ret))
+        // Unit-coercion: when the surrounding context expects `() ->
+        // Unit` (a callback whose result is never used) but the lambda's
+        // body happens to end in a non-`Unit` expression, real Kotlin
+        // still accepts it — the value is simply discarded, the lambda's
+        // own functional type is treated as `Unit`-returning regardless
+        // of what its last expression actually evaluates to (`test {
+        // someIntReturningCall() }` against `fun test(block: () ->
+        // Unit)`). Only the *final* type reported to the caller is
+        // affected — `inferred_ret`'s own diagnostics above (genuinely
+        // inconsistent `return`s of different types, or a body that
+        // can't be inferred at all) already ran and still apply exactly
+        // as before; this doesn't suppress or affect any of that.
+        let final_ret = match expected {
+            Some(Type::Function(_, r)) if **r == Type::Unit => Type::Unit,
+            _ => inferred_ret,
+        };
+        Type::Function(param_types, Box::new(final_ret))
     }
 
     /// Walks `expr` (recording occurrences/diagnostics as before) and
@@ -5356,6 +5372,38 @@ mod tests {
     fn lambda_return_type_disagreement_is_a_type_error() {
         let result = resolve_src(
             "val f: (Boolean) -> Int = { b ->\n    if (b) { return 1 }\n    return \"x\"\n}\n",
+        );
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("lambda returns both")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn lambda_body_ending_in_a_non_unit_value_still_matches_an_expected_unit_type() {
+        // Real Kotlin's "Unit-coercion" for function literals: a lambda
+        // whose body ends in a non-`Unit` expression still satisfies an
+        // expected `() -> Unit` — the value is simply discarded. Found
+        // via a real callback pattern: `test { someIntReturningCall() }`
+        // against `fun test(block: () -> Unit)`.
+        let result = resolve_src(
+            "fun test(block: () -> Unit) {}\ntest({ 5 })\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        let result = resolve_src(
+            "fun test(block: () -> Unit) {}\ntest { 5 }\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+
+        // Regression: genuinely inconsistent `return`s of different types
+        // inside the lambda body are still a real error, Unit-coercion or
+        // not — this isn't a blanket suppression of lambda type-checking.
+        // A zero-parameter body, matching `() -> Unit`'s own arity, so the
+        // coercion path above is actually what's exercised here.
+        let result = resolve_src(
+            "fun test(block: () -> Unit) {}\ntest({\n    if (true) { return 1 }\n    return \"x\"\n})\n",
         );
         assert!(
             result.type_errors.iter().any(|e| e.message.contains("lambda returns both")),
