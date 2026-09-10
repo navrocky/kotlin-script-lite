@@ -5,3 +5,11 @@ members = ["crates/ksl-core", "crates/ksl-cli", "crates/ksl-lsp"]
 [profile.release]
 lto = true
 strip = true
+
+# Same codegen as release, but keeps debug symbols and doesn't strip —
+# needed for a profiler (valgrind/callgrind, perf, etc.) to resolve
+# function names. Build with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true

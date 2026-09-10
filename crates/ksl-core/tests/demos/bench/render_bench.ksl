@@ -1,0 +1,88 @@
+// Synthetic profiling benchmark: renders the same board-render logic as
+// snake.ksl's game loop, but with a fixed 10-segment snake and fixed
+// food, no terminal/input/sleep dependencies, looped REPEAT times back to
+// back. Meant to be run under a profiler (see README.md in this
+// directory) to find the interpreter's actual hot paths — not a
+// `cargo test` fixture, not meant to be played.
+//
+// Run with stdout discarded so pty/I/O cost doesn't pollute the profile:
+//   cargo run --profile profiling -p ksl-cli -- crates/ksl-core/tests/demos/bench/render_bench.ksl > /dev/null
+
+@file:Import("../tui.ksl")
+
+class Point(val x: Int, val y: Int)
+
+val FENCE_CHAR = "%"
+val GRASS_CHAR = "."
+val SNAKE_CHAR = "@"
+val FOOD_CHAR = "O"
+
+val KIND_NONE = -1
+val KIND_GRASS = 0
+val KIND_SNAKE = 1
+val KIND_FOOD = 2
+
+val REPEAT = 150
+
+fun main() {
+    val width = 60
+    val height = 30
+
+    val snake = listOf(
+        Point(20, 15), Point(21, 15), Point(22, 15), Point(23, 15), Point(24, 15),
+        Point(25, 15), Point(26, 15), Point(27, 15), Point(28, 15), Point(29, 15)
+    )
+    val foods = listOf(Point(5, 5), Point(50, 25), Point(10, 20), Point(45, 8))
+
+    var frame = 0
+    while (frame < REPEAT) {
+        moveCursor(1, 1)
+
+        var fenceLine = style(COLOR_WHITE) + FENCE_CHAR
+        for (fcol in 1..width + 1) {
+            fenceLine += FENCE_CHAR
+        }
+        fenceLine += resetColor()
+        println(fenceLine)
+
+        for (row in 0..height - 1) {
+            var line = style(COLOR_WHITE) + FENCE_CHAR
+            var currentKind = KIND_NONE
+            for (col in 0..width - 1) {
+                var ch = GRASS_CHAR
+                var kind = KIND_GRASS
+                for (f in foods) {
+                    if (f.x == col && f.y == row) {
+                        ch = FOOD_CHAR
+                        kind = KIND_FOOD
+                    }
+                }
+                for (s in snake) {
+                    if (s.x == col && s.y == row) {
+                        ch = SNAKE_CHAR
+                        kind = KIND_SNAKE
+                    }
+                }
+                if (kind != currentKind) {
+                    if (kind == KIND_GRASS) {
+                        line += style(COLOR_GREEN)
+                    } else if (kind == KIND_SNAKE) {
+                        line += style(COLOR_BRIGHT_YELLOW)
+                    } else if (kind == KIND_FOOD) {
+                        line += styleBold(COLOR_BRIGHT_RED)
+                    }
+                    currentKind = kind
+                }
+                line += ch
+            }
+            line += style(COLOR_WHITE) + FENCE_CHAR + resetColor()
+            println(line)
+        }
+        println(fenceLine)
+        println("score: 9   (benchmark frame ${frame})")
+
+        frame = frame + 1
+    }
+}
+
+main()

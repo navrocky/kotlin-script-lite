@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::gc::{GcHandle, GcRef, GcRegistry, Trace};
@@ -19,8 +18,19 @@ struct Binding {
     declared_type: Type,
 }
 
+// A flat `Vec<(String, Binding)>`, scanned linearly, not a `HashMap` — a
+// scope almost always holds only a handful of bindings (loop variables,
+// a couple of locals), and `Env::child()` runs once per loop iteration
+// and once per function call, so it's on the hottest path in the whole
+// interpreter. Profiling `snake.ksl`'s render loop (2026-09) showed
+// string hashing for these tiny `HashMap`s costing over 30% of total
+// instructions — far more than every other interpreter cost combined —
+// with hash-table rehashing/allocation adding still more on top. A
+// linear scan over 1-3 entries beats hashing outright, and a `Vec`'s
+// bookkeeping is far cheaper to allocate/free than a hash table's bucket
+// array.
 struct EnvData {
-    vars: HashMap<String, Binding>,
+    vars: Vec<(String, Binding)>,
     parent: Option<Env>,
 }
 
@@ -29,7 +39,7 @@ impl Trace for EnvData {
         if let Some(p) = &self.parent {
             out.push(p.handle());
         }
-        for binding in self.vars.values() {
+        for (_, binding) in &self.vars {
             value::value_refs(&binding.value, out);
         }
     }
@@ -55,21 +65,26 @@ pub enum AssignError {
 
 impl Env {
     pub fn new() -> Self {
-        Env(GcRef::new(GcRegistry::new(), EnvData { vars: HashMap::new(), parent: None }))
+        Env(GcRef::new(GcRegistry::new(), EnvData { vars: Vec::new(), parent: None }))
     }
 
     pub fn child(&self) -> Self {
-        Env(GcRef::new(self.0.registry(), EnvData { vars: HashMap::new(), parent: Some(self.clone()) }))
+        Env(GcRef::new(self.0.registry(), EnvData { vars: Vec::new(), parent: Some(self.clone()) }))
     }
 
     /// `declared_type` is `Type::Unknown` for every binding except a
     /// `val`/`var` with an explicit type-hint annotation — see
-    /// `Binding::declared_type`'s doc comment.
+    /// `Binding::declared_type`'s doc comment. Matches `HashMap::insert`'s
+    /// old semantics: redeclaring a name already in *this* scope
+    /// overwrites its binding in place rather than appending a shadow
+    /// entry.
     pub fn define(&self, name: &str, value: Value, mutable: bool, declared_type: Type) {
-        self.0
-            .borrow_mut()
-            .vars
-            .insert(name.to_string(), Binding { value, mutable, declared_type });
+        let mut data = self.0.borrow_mut();
+        let binding = Binding { value, mutable, declared_type };
+        match data.vars.iter_mut().find(|(k, _)| k == name) {
+            Some((_, b)) => *b = binding,
+            None => data.vars.push((name.to_string(), binding)),
+        }
     }
 
     /// Every name defined directly on this scope — not inherited from a
@@ -84,8 +99,8 @@ impl Env {
 
     pub fn get(&self, name: &str) -> Option<Value> {
         let data = self.0.borrow();
-        match data.vars.get(name) {
-            Some(b) => Some(b.value.clone()),
+        match data.vars.iter().find(|(k, _)| k == name) {
+            Some((_, b)) => Some(b.value.clone()),
             None => data.parent.as_ref().and_then(|p| p.get(name)),
         }
     }
@@ -97,12 +112,12 @@ impl Env {
     /// same-named binding exists somewhere further out" (irrelevant
     /// shadowing, not a reason to group).
     pub fn get_own(&self, name: &str) -> Option<Value> {
-        self.0.borrow().vars.get(name).map(|b| b.value.clone())
+        self.0.borrow().vars.iter().find(|(k, _)| k == name).map(|(_, b)| b.value.clone())
     }
 
     pub fn assign(&self, name: &str, value: Value) -> Result<(), AssignError> {
         let mut data = self.0.borrow_mut();
-        if let Some(b) = data.vars.get_mut(name) {
+        if let Some((_, b)) = data.vars.iter_mut().find(|(k, _)| k == name) {
             if !b.mutable {
                 return Err(AssignError::NotMutable);
             }

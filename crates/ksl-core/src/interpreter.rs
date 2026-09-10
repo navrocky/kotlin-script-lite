@@ -407,6 +407,30 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Resolves a `FieldAccess`/`MethodCall`'s receiver: `Ok(v)` for an
+    /// ordinary value (the overwhelming common case — `s.x`, not
+    /// `kotlin.random.x`), `Err(path)` when it should instead be treated
+    /// as an unresolved package-qualified reference (see
+    /// `dotted_path_if_unresolved`'s doc comment for why). A bare
+    /// local-name receiver is resolved with exactly one `Env::get` call
+    /// and no allocation — going through `dotted_path_if_unresolved`
+    /// alone would do a second, wasted `Env::get` (the caller was about
+    /// to redo the same lookup via `eval_expr` anyway) plus a
+    /// `flatten_dotted_chain` allocation, on every single field/method
+    /// access, including the ones inside a hot loop.
+    fn eval_receiver(&mut self, receiver: &Expr, env: &Env) -> Result<Result<Value, Vec<String>>, Flow> {
+        if let ExprKind::Name(name) = &receiver.kind {
+            return Ok(match env.get(name) {
+                Some(v) => Ok(v),
+                None => Err(vec![name.clone()]),
+            });
+        }
+        match self.dotted_path_if_unresolved(receiver, env) {
+            Some(path) => Ok(Err(path)),
+            None => self.eval_expr(receiver, env).map(Ok),
+        }
+    }
+
     /// Evaluates a call's argument list in order, pairing each with its
     /// (optional) name — shared by `ExprKind::Call` and the "receiver
     /// wasn't a package reference" branch of `MethodCall`.
@@ -719,7 +743,7 @@ impl<'a> Interpreter<'a> {
     /// undefined.
     fn implicit_this_field(&self, env: &Env, name: &str) -> Option<Value> {
         match env.get("this") {
-            Some(Value::Object(o)) => o.borrow().fields.get(name).cloned(),
+            Some(Value::Object(o)) => o.borrow().get_field(name).cloned(),
             _ => None,
         }
     }
@@ -751,7 +775,7 @@ impl<'a> Interpreter<'a> {
             )
             .into());
         }
-        o.borrow_mut().fields.insert(field.to_string(), new_val);
+        o.borrow_mut().set_field(field, new_val);
         Ok(())
     }
 
@@ -776,8 +800,7 @@ impl<'a> Interpreter<'a> {
             let class = o.borrow().class.clone();
             let cur = o
                 .borrow()
-                .fields
-                .get(field)
+                .get_field(field)
                 .cloned()
                 .ok_or_else(|| RuntimeError::new(format!("'{}' has no field '{field}'", class.name), span))?;
             let rhs = self.eval_expr(value, env)?;
@@ -819,12 +842,14 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span).into()),
             },
             ExprKind::FieldAccess { receiver, field, safe, .. } => {
-                if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
-                    let mut full_path = path;
-                    full_path.push(field.clone());
-                    return self.resolve_qualified(&full_path, expr.span).map_err(Into::into);
-                }
-                let recv = self.eval_expr(receiver, env)?;
+                let recv = match self.eval_receiver(receiver, env)? {
+                    Err(path) => {
+                        let mut full_path = path;
+                        full_path.push(field.clone());
+                        return self.resolve_qualified(&full_path, expr.span).map_err(Into::into);
+                    }
+                    Ok(v) => v,
+                };
                 if *safe && matches!(recv, Value::Null) {
                     return Ok(Value::Null);
                 }
@@ -846,7 +871,7 @@ impl<'a> Interpreter<'a> {
                 }
                 if let Value::Object(o) = &recv {
                     let data = o.borrow();
-                    return match data.fields.get(field) {
+                    return match data.get_field(field) {
                         Some(v) => Ok(v.clone()),
                         None => {
                             // `type_name()` can't carry a dynamic class
@@ -866,14 +891,16 @@ impl<'a> Interpreter<'a> {
                 .into())
             }
             ExprKind::MethodCall { receiver, method, args, safe, .. } => {
-                if let Some(path) = self.dotted_path_if_unresolved(receiver, env) {
-                    let mut full_path = path;
-                    full_path.push(method.clone());
-                    let callee = self.resolve_qualified(&full_path, expr.span)?;
-                    let arg_values = self.eval_args(args, env)?;
-                    return self.call_value(callee, arg_values, expr.span);
-                }
-                let recv = self.eval_expr(receiver, env)?;
+                let recv = match self.eval_receiver(receiver, env)? {
+                    Err(path) => {
+                        let mut full_path = path;
+                        full_path.push(method.clone());
+                        let callee = self.resolve_qualified(&full_path, expr.span)?;
+                        let arg_values = self.eval_args(args, env)?;
+                        return self.call_value(callee, arg_values, expr.span);
+                    }
+                    Ok(v) => v,
+                };
                 if *safe && matches!(recv, Value::Null) {
                     return Ok(Value::Null);
                 }
@@ -969,8 +996,7 @@ impl<'a> Interpreter<'a> {
                         };
                         let cur = o
                             .borrow()
-                            .fields
-                            .get(name)
+                            .get_field(name)
                             .cloned()
                             .ok_or_else(|| RuntimeError::new(format!("undefined name '{name}'"), expr.span))?;
                         let new_val = apply_binary(&self.gc, bop, cur.clone(), Value::Int(1), expr.span)?;
@@ -1429,7 +1455,7 @@ impl<'a> Interpreter<'a> {
             match step {
                 crate::class::ConstructorStep::Property { name, init, .. } => {
                     let v = self.eval_expr(init, &ctor_env)?;
-                    object.borrow_mut().fields.insert(name.clone(), v);
+                    object.borrow_mut().set_field(name.clone(), v);
                 }
                 crate::class::ConstructorStep::Init(stmts) => {
                     let init_env = ctor_env.child();
@@ -1829,8 +1855,8 @@ mod tests {
             interp.gc.clone(),
             crate::class::ObjectData { class, fields: std::collections::HashMap::new() },
         );
-        a.borrow_mut().fields.insert("friend".to_string(), crate::value::Value::Object(b.clone()));
-        b.borrow_mut().fields.insert("friend".to_string(), crate::value::Value::Object(a.clone()));
+        a.borrow_mut().set_field("friend", crate::value::Value::Object(b.clone()));
+        b.borrow_mut().set_field("friend", crate::value::Value::Object(a.clone()));
 
         // Weak handles only, past this point -- nothing but the a<->b
         // cycle itself keeps either one alive.

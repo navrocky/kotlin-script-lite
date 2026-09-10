@@ -20,9 +20,27 @@ use crate::value::{value_refs, Value};
 /// The payload a `Value::Object`'s `GcRef` wraps — named to mirror
 /// `environment.rs`'s `EnvData` (both name "the thing a `GcRef` wraps",
 /// not a user-facing type; there is no separate `pub struct ObjectValue`).
+///
+/// Kept as a `HashMap`, unlike `environment.rs`'s `EnvData::vars` (which
+/// switched to a linearly-scanned `Vec` after profiling showed it as the
+/// dominant cost) — a *scope* is reliably tiny (a handful of locals), but
+/// a user class's field count has no such guarantee (could reasonably run
+/// into the tens/hundreds for a large class), where linear scan would
+/// lose to hashing. `get_field`/`set_field` below keep call sites
+/// decoupled from which container this actually is.
 pub struct ObjectData {
     pub class: Rc<ClassValue>,
     pub fields: HashMap<String, Value>,
+}
+
+impl ObjectData {
+    pub fn get_field(&self, name: &str) -> Option<&Value> {
+        self.fields.get(name)
+    }
+
+    pub fn set_field(&mut self, name: impl Into<String>, value: Value) {
+        self.fields.insert(name.into(), value);
+    }
 }
 
 /// An object's field map is itself a GC-tracked node — for exactly the

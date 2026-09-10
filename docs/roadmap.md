@@ -2133,6 +2133,19 @@ validate). At minimum, once implemented: `resolver.rs` arms for
 lockstep rule as every other phase, just necessarily decided after the
 spike rather than up front.
 
+**Tech debt this phase should also fix:** `for (i in a..b)` is
+needlessly eager today — `ExprKind::Range` eagerly materializes the whole
+range into a real `Vec<Value::Int>` (`interpreter.rs`, the `Range` eval
+arm), and then `for`'s own `iterate()` helper clones that `Vec` a second
+time before looping (`interpreter.rs::iterate`, `Value::List(items) =>
+items.borrow().clone()`) — two full allocations or a large loop bound,
+neither of which should exist for what's conceptually just a counter.
+Found while profiling `snake.ksl`'s render loop (2026-09, see git log
+around that date for the benchmark). Once `sequence {}`/lazy iteration
+exists, `for` should iterate a real lazy sequence instead of a
+materialized `Vec` — fixing this properly needs that machinery, so it's
+tracked here rather than patched ad hoc beforehand.
+
 ---
 
 ## Cross-cutting rules for every phase
