@@ -54,6 +54,20 @@ pub enum SymbolKind {
     /// same reason (only reachable through `this.name(...)`/
     /// `obj.name(...)`, never as a bare call).
     Method,
+    /// A `typealias` declaration's own name — see `StmtKind::TypeAlias`.
+    /// Registered for hover/goto-definition only; the alias's target
+    /// substitution itself happens earlier, in `resolve_with_imports`'s own
+    /// predpass (`Resolver::known_type_aliases`), not when this variant's
+    /// `Symbol` is defined.
+    TypeAlias,
+    /// A top-level `fun ReceiverType.name(...)` declaration's own name —
+    /// synthesized via `define_extension_function`, not `define` (never a
+    /// bare, scope-visible name — only reachable through
+    /// `receiver.name(...)`, same rationale as `Field`/`Method` above) and
+    /// not `define_class_member` either (not a class member — no
+    /// `class_info`/`current_class` involvement). See `Resolver::
+    /// extension_functions`.
+    ExtensionFun,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +341,16 @@ pub struct SymbolTable {
     /// Resolver`'s private `class_info` (which doesn't survive past
     /// resolution) — see `class_members`.
     class_members: HashMap<String, Vec<usize>>,
+    /// Every top-level extension function's own symbol, keyed by its
+    /// (canonicalized) receiver type name only — several different
+    /// extension methods (and overloads of the same name) declared on the
+    /// same receiver type all share one entry, mirroring `class_members`'s
+    /// exact shape/rationale. Lets a caller (`ksl-lsp`'s completion, post-`.`)
+    /// enumerate every extension declared for a receiver type without
+    /// needing `Resolver`'s own private, non-surviving `extension_functions`
+    /// map (which is additionally keyed by method name, for lookup rather
+    /// than enumeration). See `extension_functions_for`.
+    extension_functions: HashMap<String, Vec<usize>>,
     /// Every expression's own span, paired with its statically computed
     /// `Type` — populated once, generically, by `Resolver::
     /// walk_expr_expected`'s thin wrapper (see its own doc comment), for
@@ -418,6 +442,16 @@ impl SymbolTable {
     /// suggestions on a `Type::Class` receiver.
     pub fn class_members(&self, class_name: &str) -> impl Iterator<Item = &Symbol> {
         self.class_members.get(class_name).into_iter().flatten().map(|&idx| &self.symbols[idx])
+    }
+
+    /// Every extension function declared directly for `receiver_type_name`
+    /// (not walking an ancestor chain itself — a caller wanting `fun
+    /// Any.foo()` to show up for a `String` receiver, say, calls this once
+    /// per name in the receiver's own ancestor chain, exactly like
+    /// `ksl-lsp`'s `builtin_method_completions` already walks
+    /// `stdlib::builtin_type_chain` for the analogous builtin-method case).
+    pub fn extension_functions_for(&self, receiver_type_name: &str) -> impl Iterator<Item = &Symbol> {
+        self.extension_functions.get(receiver_type_name).into_iter().flatten().map(|&idx| &self.symbols[idx])
     }
 
     /// The static `Type` of whichever recorded expression ends closest to
@@ -650,6 +684,7 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
             named_arg_labels: Vec::new(),
             dangling_ifs: Vec::new(),
             class_members: HashMap::new(),
+            extension_functions: HashMap::new(),
             expr_types: Vec::new(),
         },
         diagnostics,
@@ -679,6 +714,8 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
                 _ => None,
             })
             .collect(),
+        known_type_aliases: HashMap::new(),
+        extension_functions: HashMap::new(),
         class_info: HashMap::new(),
         current_class: None,
         return_type_stack: Vec::new(),
@@ -686,6 +723,29 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
         possibly_reassigned: HashSet::new(),
         bool_alias_narrowing: HashMap::new(),
     };
+    // A second, order-sensitive predpass (see `known_type_aliases`'s own
+    // doc comment for why this can't just be collected in one shot the way
+    // `known_classes` above is): each top-level `typealias`'s target is
+    // resolved here, in file order, against everything accumulated so far
+    // — so a later alias can build on an earlier one, but not the reverse.
+    //
+    // Diagnosed right here too (`diagnose_unknown_names`, not deferred to
+    // `walk_stmt`'s own `StmtKind::TypeAlias` handling): this is the one
+    // point where `r.known_type_aliases` genuinely reflects "everything
+    // declared *before* this alias" — by the time the main `walk_stmts`
+    // pass below reaches this same statement, the predpass has already
+    // finished and every alias in the file (including ones declared
+    // later) is already in the map, which would silently swallow a
+    // forward-reference that's supposed to be an error (the exact same
+    // ordering constraint this predpass exists to enforce in the first
+    // place).
+    for stmt in &program.stmts {
+        if let StmtKind::TypeAlias { name, target, .. } = &stmt.kind {
+            r.diagnose_unknown_names(target);
+            let ty = types::resolve_type_annotation(target, &r.generic_params, &r.known_classes, &r.known_type_aliases);
+            r.known_type_aliases.insert(Rc::from(name.as_str()), ty);
+        }
+    }
     let global = r.push_scope(None, 0, FILE_SPAN, ScopeKind::Other);
     r.walk_stmts(&program.stmts, global, FILE_END);
     let imported_symbols = r.imports.by_name.into_values().flatten().collect();
@@ -787,6 +847,29 @@ struct Resolver<'a> {
     /// declaration is parsed yet; see `types::resolve_type_hint`'s doc
     /// comment.
     known_classes: HashSet<Rc<str>>,
+    /// Every top-level `typealias`'s name, mapped to its already-resolved
+    /// target `Type` — built by a predpass (`build`, below) that walks
+    /// `StmtKind::TypeAlias` statements in file order, resolving each
+    /// against everything accumulated so far. This is a genuine ordering
+    /// constraint (unlike `known_classes`, which collects every class name
+    /// up front regardless of order): an alias may reference an
+    /// earlier-declared alias, but not one declared later in the same file
+    /// — real mutual recursion between aliases isn't supported, matching
+    /// the same accepted, already-established compromise this session made
+    /// for `fun` (no forward-hoisting). See `types::resolve_type_hint`,
+    /// which checks this map after `PRIMITIVE_TYPES`/`generic_params` but
+    /// before `known_classes`.
+    known_type_aliases: HashMap<Rc<str>, Type>,
+    /// Every top-level `fun ReceiverType.name(...)` declared so far in this
+    /// file (in textual order — no forward-reference predpass, matching
+    /// ordinary top-level `fun`'s own no-hoisting rule), keyed by
+    /// `(canonicalized receiver type name, method name)` — several indices
+    /// per key when overloaded. The resolver's own side of `Interpreter::
+    /// extension_functions`; `SymbolTable::extension_functions` is the
+    /// public, LSP-facing counterpart (keyed by receiver name only, for
+    /// enumeration rather than lookup). See `define_extension_function`/
+    /// `extension_method_signature`.
+    extension_functions: HashMap<(Rc<str>, String), Vec<usize>>,
     /// Every `class` declared in this file's own static shape (fields'/
     /// methods' real, checkable signatures) — see `ClassInfo`'s own doc
     /// comment. Populated as each `ClassDecl` is walked (`walk_class_decl`),
@@ -1166,7 +1249,7 @@ impl<'a> Resolver<'a> {
     fn resolve_type_annotation_here(&mut self, ann: Option<&TypeAnnotation>) -> Type {
         let Some(ann) = ann else { return Type::Unknown };
         self.diagnose_unknown_names(ann);
-        types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes)
+        types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes, &self.known_type_aliases)
     }
 
     /// Walks `ann`, pushing an "unknown type" diagnostic for every `Named`
@@ -1177,7 +1260,7 @@ impl<'a> Resolver<'a> {
     fn diagnose_unknown_names(&mut self, ann: &TypeAnnotation) {
         match ann {
             TypeAnnotation::Named(name, span) => {
-                let ty = types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes);
+                let ty = types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes, &self.known_type_aliases);
                 if ty == Type::Unknown {
                     self.type_errors.push(RuntimeError::new(format!("unknown type '{name}'"), *span));
                 }
@@ -1690,7 +1773,7 @@ impl<'a> Resolver<'a> {
                 }
                 Type::Unit
             }
-            StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment } => {
+            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body, doc_comment } => {
                 // Parsed once, up front: `fun_doc` (the function's own
                 // hover doc, summary + an optional `**Returns:**` line) is
                 // consumed right here at `define()`; `parsed_doc` itself
@@ -1737,7 +1820,7 @@ impl<'a> Resolver<'a> {
                 let param_types: Vec<Type> = params
                     .iter()
                     .map(|p| match &p.type_annotation {
-                        Some(ann) => types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes),
+                        Some(ann) => types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes, &self.known_type_aliases),
                         None => Type::Unknown,
                     })
                     .collect();
@@ -1765,22 +1848,72 @@ impl<'a> Resolver<'a> {
                 // meantime, never a false rejection, just no check for that
                 // one call.
                 let has_return_annotation = return_type.is_some();
-                let idx = self.define(
-                    scope,
-                    name,
-                    SymbolKind::Fun,
-                    *name_span,
-                    false,
-                    format!("fun {name}({})", param_list(params)),
-                    Type::Function(param_types.clone(), Box::new(ret_ty.clone())),
-                    ret_ty.clone(),
-                    param_types.clone(),
-                    param_names,
-                    param_docs,
-                    param_has_default,
-                    fun_doc,
-                );
+                // `receiver_ty`, once known, is the resolved type of an
+                // extension function's own receiver — computed once here
+                // (reused both for the storage key below and for `this`'s
+                // own bound type once `fn_scope` exists) via the same
+                // `resolve_type_annotation_here` every other annotation
+                // goes through, so a typo'd receiver name (`fun Bogus.foo()`)
+                // gets a real "unknown type" diagnostic for free, and a
+                // receiver written through a `typealias` (`fun Age.foo()`)
+                // canonicalizes to its real target name, exactly matching
+                // what a real `Int` receiver's ancestor-chain lookup at the
+                // call site expects (see `extension_method_signature`).
+                let receiver_ty = receiver.as_ref().map(|(rname, rspan)| {
+                    self.resolve_type_annotation_here(Some(&TypeAnnotation::Named(rname.clone(), *rspan)))
+                });
+                let idx = match receiver {
+                    None => self.define(
+                        scope,
+                        name,
+                        SymbolKind::Fun,
+                        *name_span,
+                        false,
+                        format!("fun {name}({})", param_list(params)),
+                        Type::Function(param_types.clone(), Box::new(ret_ty.clone())),
+                        ret_ty.clone(),
+                        param_types.clone(),
+                        param_names,
+                        param_docs,
+                        param_has_default,
+                        fun_doc,
+                    ),
+                    Some((rname, _)) => self.define_extension_function(
+                        &receiver_ty.as_ref().unwrap().name(),
+                        name,
+                        *name_span,
+                        format!("fun {rname}.{name}({})", param_list(params)),
+                        Type::Function(param_types.clone(), Box::new(ret_ty.clone())),
+                        ret_ty.clone(),
+                        param_types.clone(),
+                        param_names,
+                        param_docs,
+                        param_has_default,
+                        fun_doc,
+                    ),
+                };
                 let fn_scope = self.open_scope(scope, stmt.span, following, ScopeKind::FunctionBoundary);
+                if let Some((_, rspan)) = receiver {
+                    // Same shape `walk_class_method` already uses to bind a
+                    // method's own `this` — see that function's identical
+                    // `self.define(fn_scope, "this", SymbolKind::Val, ...)`
+                    // call.
+                    self.define(
+                        fn_scope,
+                        "this",
+                        SymbolKind::Val,
+                        *rspan,
+                        false,
+                        format!("this: {}", receiver_ty.as_ref().unwrap().name()),
+                        receiver_ty.clone().unwrap(),
+                        Type::Unknown,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    );
+                }
                 self.walk_params(params, fn_scope, following, parsed_doc.as_ref());
                 self.return_type_stack.push(if has_return_annotation {
                     ReturnTypeContext::Expected(ret_ty.clone())
@@ -1862,9 +1995,13 @@ impl<'a> Resolver<'a> {
                 // type" case (`Unit` is shown explicitly, same as anywhere
                 // else) — mirrors `ValDecl`'s identical bare-vs-typed
                 // signature choice for a hint-less `val`.
+                let name_prefix = match receiver {
+                    Some((rname, _)) => format!("{rname}."),
+                    None => String::new(),
+                };
                 self.table.symbols[idx].signature = match &final_ret_ty {
-                    Type::Unknown => format!("fun {name}({})", param_list(params)),
-                    t => format!("fun {name}({}): {}", param_list(params), t.name()),
+                    Type::Unknown => format!("fun {name_prefix}{name}({})", param_list(params)),
+                    t => format!("fun {name_prefix}{name}({}): {}", param_list(params), t.name()),
                 };
                 self.table.symbols[idx].return_type = final_ret_ty;
                 Type::Unit
@@ -1994,6 +2131,37 @@ impl<'a> Resolver<'a> {
                 }
                 Type::Unit
             }
+            // The target was already resolved *and* diagnosed by the
+            // predpass in `resolve_with_imports` (`known_type_aliases`) —
+            // deliberately not repeated here via `diagnose_unknown_names`:
+            // by the time this main walk reaches this statement, the
+            // predpass has already finished for the *whole* file, so
+            // re-resolving `target` here would see every alias (including
+            // ones declared later) as already known, silently masking the
+            // one diagnostic (`typealias_referencing_a_later_declared_
+            // alias_is_unknown`, below in this module's own tests) the
+            // predpass's order-sensitive resolution exists to produce.
+            // This arm only registers a `Symbol` for hover/goto-definition.
+            StmtKind::TypeAlias { name, name_span, target: _ } => {
+                let ty = self.known_type_aliases.get(name.as_str()).cloned().unwrap_or(Type::Unknown);
+                let sig = format!("typealias {name} = {}", ty.name());
+                self.define(
+                    scope,
+                    name,
+                    SymbolKind::TypeAlias,
+                    *name_span,
+                    false,
+                    sig,
+                    ty,
+                    Type::Unknown,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
+                Type::Unit
+            }
         }
     }
 
@@ -2086,6 +2254,63 @@ impl<'a> Resolver<'a> {
         idx
     }
 
+    /// Synthesizes a `Symbol` for a top-level `fun ReceiverType.name(...)`
+    /// — never registered into `scope.names` (mirrors `define_class_member`:
+    /// an extension function is never bare-callable, only reachable
+    /// through `receiver.name(...)`), instead keyed into
+    /// `self.extension_functions`/`self.table.extension_functions` by
+    /// `(receiver_type_name, name)`. Overloading is allowed — several
+    /// entries may share one key — mirroring `define`'s own "all_fun"
+    /// branch exactly (every entry under this key is always an extension
+    /// function by construction, so there's no separate "kind mismatch"
+    /// case to check the way `define` has to): only an exact `param_types`
+    /// collision against an already-declared entry is a real conflict.
+    #[allow(clippy::too_many_arguments)]
+    fn define_extension_function(
+        &mut self,
+        receiver_type_name: &str,
+        name: &str,
+        def_span: Span,
+        signature: String,
+        ty: Type,
+        return_type: Type,
+        param_types: Vec<Type>,
+        param_names: Vec<String>,
+        param_docs: Vec<Option<String>>,
+        param_has_default: Vec<bool>,
+        doc: Option<String>,
+    ) -> usize {
+        let key = (Rc::<str>::from(receiver_type_name), name.to_string());
+        let existing = self.extension_functions.get(&key).cloned().unwrap_or_default();
+        if existing.iter().any(|&i| self.table.symbols[i].param_types == param_types) {
+            self.diagnostics.push(RuntimeError::new(
+                format!(
+                    "conflicting overload of extension function '{receiver_type_name}.{name}': a function with this exact signature is already declared in this file"
+                ),
+                def_span,
+            ));
+        }
+        let idx = self.table.symbols.len();
+        self.table.symbols.push(Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::ExtensionFun,
+            def_span,
+            mutable: false,
+            signature,
+            ty,
+            return_type,
+            param_types,
+            param_names,
+            param_docs,
+            param_has_default,
+            doc,
+        });
+        self.table.occurrences.push((def_span, idx));
+        self.extension_functions.entry(key).or_default().push(idx);
+        self.table.extension_functions.entry(receiver_type_name.to_string()).or_default().push(idx);
+        idx
+    }
+
     /// Real static integration for a `class` declaration (this phase's
     /// plan, §4/§6 step 5) — the class's own name (a bare-visible `Symbol`,
     /// kind `Class`), then its full static shape into `self.class_info` in
@@ -2154,7 +2379,7 @@ impl<'a> Resolver<'a> {
                     .param
                     .type_annotation
                     .as_ref()
-                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                     .unwrap_or(Type::Unknown);
                 // `symbol_idx` is a placeholder here — patched below, once
                 // the ctor param's own real `Symbol` is defined into
@@ -2167,7 +2392,7 @@ impl<'a> Resolver<'a> {
             if let ClassMember::Property { name: fname, type_annotation, mutable, .. } = m {
                 let ty = type_annotation
                     .as_ref()
-                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                     .unwrap_or(Type::Unknown);
                 // Patched below too, once `define_class_member` runs for
                 // this property in Phase 2.
@@ -2180,14 +2405,14 @@ impl<'a> Resolver<'a> {
                 if let StmtKind::FunDecl { name: mname, return_type, params, .. } = &method_stmt.kind {
                     let ret_ty = return_type
                         .as_ref()
-                        .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                        .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                         .unwrap_or(Type::Unknown);
                     let param_types = params
                         .iter()
                         .map(|p| {
                             p.type_annotation
                                 .as_ref()
-                                .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                                .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                                 .unwrap_or(Type::Unknown)
                         })
                         .collect();
@@ -2213,7 +2438,7 @@ impl<'a> Resolver<'a> {
                 cp.param
                     .type_annotation
                     .as_ref()
-                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes))
+                    .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                     .unwrap_or(Type::Unknown)
             })
             .collect();
@@ -2385,7 +2610,7 @@ impl<'a> Resolver<'a> {
     /// once known, mirroring `FunDecl`'s identical patch of its own
     /// symbol.
     fn walk_class_method(&mut self, stmt: &Stmt, class_name: &str, scope: usize, following: Span) {
-        let StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment } = &stmt.kind else {
+        let StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment, receiver: _ } = &stmt.kind else {
             return;
         };
         let parsed_doc = doc_comment.as_deref().map(crate::doc_comment::parse);
@@ -2414,7 +2639,7 @@ impl<'a> Resolver<'a> {
         let param_types: Vec<Type> = params
             .iter()
             .map(|p| match &p.type_annotation {
-                Some(ann) => types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes),
+                Some(ann) => types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes, &self.known_type_aliases),
                 None => Type::Unknown,
             })
             .collect();
@@ -2589,6 +2814,68 @@ impl<'a> Resolver<'a> {
         builtin_method_signature_as_call_signature(&name, method)
     }
 
+    /// `t`'s own ancestor chain by name (own type first), mirroring
+    /// `class::lookup_method`'s runtime walk: `stdlib::builtin_type_chain`
+    /// for a real builtin receiver, or `[name, "Any"]` for a user/imported
+    /// class — every class today has exactly one hop to `Any` (Phase 7,
+    /// real inheritance, isn't implemented yet), matching `ClassInfo`'s own
+    /// doc comment. Used only by extension-function lookup — every other
+    /// existing receiver-type dispatch (`class_method_signature`) already
+    /// has its own equivalent two-tier fallback inline.
+    fn type_ancestor_chain(&self, t: &Type) -> Vec<String> {
+        let name = t.name();
+        let builtin_chain = crate::stdlib::builtin_type_chain(&name);
+        if !builtin_chain.is_empty() {
+            builtin_chain.into_iter().map(String::from).collect()
+        } else {
+            vec![name, "Any".to_string()]
+        }
+    }
+
+    /// Every extension-function candidate matching `t.method(...)`, tried
+    /// as a fallback **only** once `class_method_signature` has already
+    /// come back `None` for the same `(t, method)` — see the `MethodCall`
+    /// arm's own call site, which is the entire implementation of "member
+    /// always wins over extension": no separate precedence flag anywhere,
+    /// just call-site ordering. Stops at the first ancestor-chain level
+    /// with any match at all (never merges overloads declared at two
+    /// different levels of the chain into one candidate set — real Kotlin
+    /// doesn't either). `None` for a receiver with no extension anywhere
+    /// in its chain, or an `Unknown`/unresolvable receiver (same
+    /// deferred-not-error treatment `class_method_signature` already
+    /// gives those).
+    fn extension_method_signature(&self, t: &Type, method: &str) -> Option<Vec<(CallSignature, usize)>> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        if *t == Type::Unknown {
+            return None;
+        }
+        for ancestor in self.type_ancestor_chain(t) {
+            if let Some(indices) = self.extension_functions.get(&(Rc::from(ancestor.as_str()), method.to_string())) {
+                let candidates = indices
+                    .iter()
+                    .map(|&idx| {
+                        let s = &self.table.symbols[idx];
+                        (
+                            (
+                                s.return_type.clone(),
+                                s.param_types.clone(),
+                                s.param_names.clone(),
+                                s.param_docs.clone(),
+                                s.param_has_default.clone(),
+                            ),
+                            idx,
+                        )
+                    })
+                    .collect();
+                return Some(candidates);
+            }
+        }
+        None
+    }
+
     /// `(field's type, mutable)` for `t.field`/`t.field = ...` — same-file
     /// `class_info` first, then an imported class's own shape via
     /// `self.packages.find_class` (see `class_method_signature`'s
@@ -2600,6 +2887,18 @@ impl<'a> Resolver<'a> {
             other => other,
         };
         let name = t.name();
+        // `Exception`/`RuntimeException` — real builtin classes
+        // (`class::builtin_classes`) with no `class_info` entry at all
+        // (that map is only ever populated from an AST `ClassDecl` —
+        // `walk_class_decl` — and neither of these has one). Their one
+        // field, `message`, is set directly by `stdlib::exceptions::
+        // make_exception`, not through any AST-driven field declaration
+        // this map is otherwise built from — without this, `catch (e:
+        // Exception) { e.message }` would falsely report "'Exception' has
+        // no field 'message'".
+        if types::is_throwable_class(&name) && field == "message" {
+            return Some((Type::String, false));
+        }
         if let Some(info) = self.class_info.get(name.as_str()) {
             return info.fields.iter().find(|f| f.name == field).map(|f| (f.ty.clone(), f.mutable));
         }
@@ -3186,6 +3485,51 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Same idea as `resolve_user_overload`, for a call resolving to more
+    /// than one extension-function overload sharing `(receiver_type,
+    /// method)` — see `extension_method_signature`. Returns the resolved
+    /// return type and, only on a `Unique` match, the chosen candidate's
+    /// own `Symbol` index (for a real `occurrences` entry at the call
+    /// site — same as a single, non-overloaded extension match already
+    /// gets, see the `MethodCall` arm).
+    fn resolve_extension_overload(
+        &mut self,
+        name: &str,
+        candidates: &[(CallSignature, usize)],
+        arg_infos: &[(Option<String>, Type)],
+        span: Span,
+    ) -> (Type, Option<usize>) {
+        let arg_types: Vec<Type> = arg_infos.iter().map(|(_, t)| t.clone()).collect();
+        let candidate_params: Vec<&[Type]> = candidates.iter().map(|((_, p, ..), _)| p.as_slice()).collect();
+        match types::resolve_overload(&candidate_params, &arg_types) {
+            types::OverloadResolution::Unique(i) => {
+                let (sig, idx) = &candidates[i];
+                (sig.0.clone(), Some(*idx))
+            }
+            types::OverloadResolution::Ambiguous(is) => {
+                let first_ret = candidates[is[0]].0.0.clone();
+                if is.iter().all(|&i| candidates[i].0.0 == first_ret) { (first_ret, None) } else { (Type::Unknown, None) }
+            }
+            types::OverloadResolution::ArityMismatch => {
+                self.type_errors.push(RuntimeError::new(
+                    format!("no overload of extension function '{name}' accepts {} argument(s)", arg_types.len()),
+                    span,
+                ));
+                (Type::Unknown, None)
+            }
+            types::OverloadResolution::NoMatch => {
+                if arg_types.iter().all(|t| *t != Type::Unknown) {
+                    let arg_list = arg_types.iter().map(Type::name).collect::<Vec<_>>().join(", ");
+                    self.type_errors.push(RuntimeError::new(
+                        format!("no overload of extension function '{name}' matches argument types ({arg_list})"),
+                        span,
+                    ));
+                }
+                (Type::Unknown, None)
+            }
+        }
+    }
+
     /// Like `walk_expr`, but with an optional "expected type" for `expr`
     /// itself — used only by a `Lambda` at this exact position to infer its
     /// parameter types when it has no explicit annotation of its own (see
@@ -3421,17 +3765,51 @@ impl<'a> Resolver<'a> {
                 // method call).
                 let class_method_signature: Option<CallSignature> =
                     recv_ty.as_ref().and_then(|t| self.class_method_signature(t, method));
+                // Extension-function fallback — tried *only* when no real
+                // class/builtin method matched (the entire "member always
+                // wins" rule, enforced purely by this ordering, no separate
+                // precedence flag anywhere). `extension_candidates` keeps
+                // every overload (if any) around for `use_extension_overload_
+                // resolution` below; `class_method_signature` is then
+                // shadowed with the single-candidate case so every existing
+                // downstream use of that name (named-arg checking via
+                // `signature`, the "has no method" diagnostic,
+                // `check_call_signature`) picks up a lone extension match
+                // with zero further changes — only the genuinely-overloaded
+                // case needs its own branch, in `result_ty` below.
+                let extension_candidates: Option<Vec<(CallSignature, usize)>> = if class_method_signature.is_none() {
+                    recv_ty.as_ref().and_then(|t| self.extension_method_signature(t, method))
+                } else {
+                    None
+                };
+                let use_extension_overload_resolution =
+                    extension_candidates.as_ref().map(|c| c.len() > 1).unwrap_or(false);
+                let class_method_signature: Option<CallSignature> = class_method_signature.or_else(|| {
+                    if use_extension_overload_resolution {
+                        None
+                    } else {
+                        extension_candidates.as_ref().and_then(|c| c.first().map(|(sig, _)| sig.clone()))
+                    }
+                });
                 // A real user-defined method (not `Any`'s native
                 // fallback, which has no resolver-side `Symbol` to point
                 // at — see `class_method_symbol_idx`'s doc comment) gets a
                 // real `occurrences` entry at its own call-site span, the
-                // same way any other declared symbol's use does.
+                // same way any other declared symbol's use does. A single-
+                // candidate extension match gets the same treatment; an
+                // overloaded one records its occurrence later, once
+                // `resolve_extension_overload` (below) has actually picked
+                // one.
                 if let Some(idx) = recv_ty.as_ref().and_then(|t| self.class_method_symbol_idx(t, method)) {
                     self.table.occurrences.push((*method_span, idx));
                 } else if let Some(cross_ref) =
                     recv_ty.as_ref().and_then(|t| self.class_method_cross_file_ref(t, method))
                 {
                     self.cross_file_refs.insert(*method_span, cross_ref);
+                } else if !use_extension_overload_resolution {
+                    if let Some(idx) = extension_candidates.as_ref().and_then(|c| c.first().map(|(_, idx)| *idx)) {
+                        self.table.occurrences.push((*method_span, idx));
+                    }
                 }
                 let signature = if use_overload_resolution {
                     None
@@ -3499,13 +3877,23 @@ impl<'a> Resolver<'a> {
                             // matches Kotlin's own safe-call semantics),
                             // covering both a real builtin receiver and a
                             // user class (falling through to `Any`).
-                            if class_method_signature.is_none() {
-                                self.type_errors.push(RuntimeError::new(
-                                    format!("'{}' has no method '{method}'", t.name()),
-                                    *method_span,
-                                ));
+                            if use_extension_overload_resolution {
+                                let candidates = extension_candidates.as_ref().unwrap();
+                                let (ty, idx) =
+                                    self.resolve_extension_overload(method, candidates, &arg_infos, *method_span);
+                                if let Some(idx) = idx {
+                                    self.table.occurrences.push((*method_span, idx));
+                                }
+                                ty
+                            } else {
+                                if class_method_signature.is_none() {
+                                    self.type_errors.push(RuntimeError::new(
+                                        format!("'{}' has no method '{method}'", t.name()),
+                                        *method_span,
+                                    ));
+                                }
+                                self.check_call_signature(&arg_infos, class_method_signature, *method_span)
                             }
-                            self.check_call_signature(&arg_infos, class_method_signature, *method_span)
                         }
                         // The qualified-path case (`kotlin.test.assertFalse(...)`,
                         // or a real user package's `a.b.c(...)`): `signature`/
@@ -4117,6 +4505,98 @@ impl<'a> Resolver<'a> {
                 Type::Nothing
             }
             ExprKind::Break | ExprKind::Continue => Type::Nothing,
+            ExprKind::Throw(inner) => {
+                let ty = self.walk_expr(inner, scope, following);
+                // `Type::Any` is tolerated here alongside `Type::Unknown` —
+                // `Exception(...)`/`RuntimeException(...)`'s own declared
+                // `BuiltinSymbol.return_type` is `Type::Any`, not a precise
+                // `Type::Class` (see `stdlib::exceptions`'s own doc comment
+                // for why: `Type::Class(Rc::from("Exception"))` isn't
+                // `const`-constructible), so `throw Exception("x")` itself
+                // would otherwise be a false positive here — the same
+                // accepted imprecision `List.get()`'s `Type::Unknown`
+                // return already has elsewhere, just surfacing as `Any`
+                // instead since that's what a genuinely *known*, over-
+                // approximated type looks like.
+                if !matches!(ty, Type::Unknown | Type::Any) && !matches!(&ty, Type::Class(n) if types::is_throwable_class(n)) {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("can only throw an Exception, found {}", ty.name()),
+                        inner.span,
+                    ));
+                }
+                // Same identity-of-the-join rule `Return`/`Break`/
+                // `Continue` above already use: `throw`, like them, never
+                // produces a value normally, so `if (cond) 1 else throw
+                // Foo()` type-checks as `Int` through the exact same `if`/
+                // `when`/`Elvis` `Nothing`-is-identity handling, no special
+                // case for `Throw` anywhere else needed.
+                Type::Nothing
+            }
+            ExprKind::Try { body, catches, finally } => {
+                let body_ty = self.walk_block(body, scope, expr.span, following, ScopeKind::Other);
+                let mut acc = body_ty;
+                for catch in catches {
+                    // Param shares one scope with the catch body (not a
+                    // nested child of it) — same convention `walk_params`
+                    // uses for an ordinary function's own parameters.
+                    let child = self.open_scope(scope, expr.span, following, ScopeKind::Other);
+                    let catch_ty = self.resolve_type_annotation_here(Some(&catch.param_type));
+                    if catch_ty != Type::Unknown && !matches!(&catch_ty, Type::Class(n) if types::is_throwable_class(n)) {
+                        self.type_errors.push(RuntimeError::new(
+                            format!("cannot catch '{}': not an Exception type", catch_ty.name()),
+                            catch.param_type.span(),
+                        ));
+                    }
+                    let sig = format!("param {}: {}", catch.param_name, catch_ty.name());
+                    self.define(
+                        child,
+                        &catch.param_name,
+                        SymbolKind::Param,
+                        catch.param_name_span,
+                        false,
+                        sig,
+                        catch_ty,
+                        Type::Unknown,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    );
+                    let catch_ty = self.walk_stmts(&catch.body, child, following);
+                    acc = self.join_branch_types(acc, catch_ty, expr.span);
+                }
+                // `finally`'s own value is always discarded (see
+                // `ExprKind::Try`'s doc comment in `ast.rs`) — walked only
+                // for its own diagnostics/narrowing scope, never folded
+                // into `acc`.
+                if let Some(finally_body) = finally {
+                    self.walk_block(finally_body, scope, expr.span, following, ScopeKind::Other);
+                }
+                acc
+            }
+        }
+    }
+
+    /// Folds `next` into `acc` using the same `Nothing`-is-the-join-identity
+    /// rule `If`/`When` (above) each already apply inline to their own two/
+    /// several branches — shared here since `ExprKind::Try` folds across an
+    /// arbitrary number of catch clauses (`body`, then each `catch` in
+    /// turn) rather than just two sides, so the fold needs to run in a
+    /// loop instead of one inline `if`/`else`.
+    fn join_branch_types(&mut self, acc: Type, next: Type, span: Span) -> Type {
+        if acc == Type::Nothing {
+            next
+        } else if next == Type::Nothing || acc == next {
+            acc
+        } else {
+            if is_primitive(&acc) && is_primitive(&next) {
+                self.type_errors.push(RuntimeError::new(
+                    format!("try/catch branches have incompatible types: {} and {}", acc.name(), next.name()),
+                    span,
+                ));
+            }
+            Type::Unknown
         }
     }
 }
@@ -6049,6 +6529,194 @@ mod tests {
         // resolver sees a normal declaration in that case, not a parse
         // failure).
         let result = resolve_src("val init = 5\nprintln(init)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    // ---- try/catch/finally, throw ----
+
+    #[test]
+    fn throwing_a_real_exception_type_is_never_flagged() {
+        let result = resolve_src("throw Exception(\"boom\")\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        let result = resolve_src("throw RuntimeException(\"boom\")\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn throwing_a_non_exception_type_is_a_static_error() {
+        let result = resolve_src("throw \"not an exception\"\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("can only throw an Exception")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn catch_clause_declaring_a_non_exception_type_is_a_static_error() {
+        let result = resolve_src("try {\n} catch (e: Int) {\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("cannot catch")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn catch_param_is_bound_with_its_declared_type_inside_the_catch_body() {
+        // `e.message` type-checks as `String` — see `class_field_type`'s
+        // own `is_throwable_class` special case, needed since `Exception`/
+        // `RuntimeException` have no `class_info` entry the way an
+        // AST-declared class would.
+        let result = resolve_src(
+            "try {\n} catch (e: Exception) {\n    val m: String = e.message\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn try_as_an_expression_infers_the_join_of_body_and_catches() {
+        let result = resolve_src(
+            "val x: Int = try {\n    1\n} catch (e: Exception) {\n    2\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn try_bodys_nothing_typed_throw_lets_the_catch_type_win() {
+        // Same identity-of-the-join rule `if`/`when` already use: a `try`
+        // body that always throws contributes no type of its own, so the
+        // whole `try` just takes the catch's type.
+        let result = resolve_src(
+            "val x: Int = try {\n    throw Exception(\"x\")\n} catch (e: Exception) {\n    2\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn try_with_mismatched_primitive_branches_is_a_type_error() {
+        let result = resolve_src(
+            "try {\n    1\n} catch (e: Exception) {\n    \"two\"\n}\n",
+        );
+        assert!(result.type_errors.iter().any(|e| e.message.contains("incompatible types")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn finallys_own_type_error_is_reported_but_never_joined() {
+        let result = resolve_src(
+            "try {\n    1\n} finally {\n    val x: Int = \"nope\"\n}\n",
+        );
+        assert!(result.type_errors.iter().any(|e| e.message.contains("type mismatch")), "{:?}", result.type_errors);
+    }
+
+    // ---- typealias ----
+
+    #[test]
+    fn typealias_to_a_primitive_is_usable_in_a_param_type() {
+        let result = resolve_src("typealias Age = Int\nfun f(a: Age): Int = a\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn typealias_to_a_class_declared_later_in_the_file_resolves() {
+        let result = resolve_src("typealias P = Point\nclass Point(val x: Int)\nfun f(p: P): Int = p.x\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn typealias_to_a_function_type_resolves() {
+        let result = resolve_src("typealias IntPredicate = (Int) -> Boolean\nfun f(p: IntPredicate): Boolean = p(1)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn typealias_chain_resolves_through_an_earlier_alias() {
+        let result = resolve_src("typealias Age = Int\ntypealias Years = Age\nfun f(y: Years): Int = y\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn typealias_referencing_a_later_declared_alias_is_unknown() {
+        // Same accepted, already-established compromise this session made
+        // for `fun` (no forward-hoisting): an alias may build on an
+        // earlier one, never a later one.
+        let result = resolve_src("typealias Years = Age\ntypealias Age = Int\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("unknown type 'Age'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn typealias_to_an_unknown_name_is_flagged_at_its_own_declaration() {
+        let result = resolve_src("typealias Bogus = Frobnicator\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("unknown type 'Frobnicator'")), "{:?}", result.type_errors);
+    }
+
+    // ---- extension functions ----
+
+    #[test]
+    fn extension_call_resolves_with_a_real_occurrence_at_its_declaration() {
+        let result = resolve_src("fun String.shout(): String = this\n\"hi\".shout()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        let decl = result.table.symbol_at(1, 12).expect("shout's own declaration should resolve");
+        assert_eq!(decl.kind, SymbolKind::ExtensionFun);
+        let use_site = result.table.symbol_at(2, 6).expect("the call site should resolve");
+        assert!(std::ptr::eq(decl, use_site));
+    }
+
+    #[test]
+    fn a_class_method_wins_over_a_same_named_extension() {
+        // The member returns `Int`; the extension returns `String` — this
+        // only type-checks if the *member*'s `Int` won the dispatch.
+        let result = resolve_src(
+            "class Greeter {\n    fun hello(): Int = 1\n}\nfun Greeter.hello(): String = \"extension\"\nval g = Greeter()\nval x: Int = g.hello()\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn extension_on_any_and_number_is_found_for_concrete_subtypes() {
+        let result = resolve_src(
+            "fun Any.tag(): String = \"tag\"\nfun Number.half(): Double = 1.0\nval a: String = 5.tag()\nval b: String = \"s\".tag()\nval c: Double = 5.half()\nval d: Double = 5.5.half()\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_plain_fun_and_an_extension_sharing_a_name_do_not_conflict() {
+        let result = resolve_src("fun shout(s: String): String = s\nfun String.shout(): String = this\n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn overloaded_extension_functions_resolve_by_argument_type() {
+        let result = resolve_src(
+            "fun String.combine(a: Int): String = this\nfun String.combine(a: String): String = this\nval x: String = \"s\".combine(5)\nval y: String = \"s\".combine(\"t\")\n",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn exact_duplicate_extension_signature_is_a_conflicting_overload_diagnostic() {
+        let result = resolve_src("fun Int.dup(): Int = this\nfun Int.dup(): Int = this\n");
+        assert!(
+            result.diagnostics.iter().any(|e| e.message.contains("conflicting overload of extension function")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn calling_an_extension_before_its_own_declaration_is_unresolved() {
+        // Same no-hoisting rule ordinary top-level `fun` already has.
+        let result = resolve_src("val x: Int = 5.late()\nfun Int.late(): Int = this\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("has no method 'late'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn extension_receiver_written_through_a_typealias_is_found_for_the_real_type() {
+        let result = resolve_src("typealias Age = Int\nfun Age.isAdult(): Boolean = this >= 18\nval x: Boolean = 20.isAdult()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn named_argument_in_an_extension_call_resolves_by_name_not_position() {
+        // If positional-only binding were used instead, `b = "hi"` would
+        // land on `a: Int` and `a = 5` on `b: String` — a real type
+        // mismatch this test would catch.
+        let result = resolve_src("fun String.pair(a: Int, b: String): String = b + a.toString()\nval x: String = \"s\".pair(b = \"hi\", a = 5)\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 }

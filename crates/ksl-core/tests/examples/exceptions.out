@@ -1,0 +1,9 @@
+caught: something went wrong
+caught via ancestor: ancestor match
+specific handler: specific
+body ran
+finally ran (no throw)
+caught: with finally
+finally ran (after catch)
+result: 42
+recovered: -1

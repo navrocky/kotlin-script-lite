@@ -204,6 +204,47 @@ pub enum ExprKind {
     /// `Return` above, mirroring `StmtKind::Break`/`StmtKind::Continue`.
     Break,
     Continue,
+    /// `throw expr` — always has an operand (unlike `return`, `throw` alone
+    /// is never legal). Its static type is `Type::Nothing` (`resolver.rs`),
+    /// the same identity-of-the-join rule `Return`/`Break`/`Continue`
+    /// above already use — `if (cond) 1 else throw Foo()` type-checks as
+    /// `Int` through the exact same mechanism, no special case for `Throw`
+    /// specifically. Evaluates via a new `Flow::Throw(Value)` (`error.rs`)
+    /// — a *different* unwinding path from `Flow::Error` (an internal
+    /// `RuntimeError`, which stays fatal/uncatchable): only a `throw`n
+    /// value is ever catchable by `Try` below.
+    Throw(Box<Expr>),
+    /// `try { body } catch (e: T) { ... } finally { ... }`, usable as an
+    /// expression exactly like `If`/`When` — its value is `body`'s value,
+    /// or whichever `catch` matched, joined the same Nothing-aware way
+    /// `If`/`When`'s own branches are (`resolver.rs`). `finally`'s own
+    /// value is always discarded — it runs for side effects only, and
+    /// (see `interpreter.rs`'s `Try` handling) unconditionally, even while
+    /// a `Return`/`Break`/`Continue`/another `Throw` is propagating
+    /// through `body` or a matched `catch` — a `finally` that itself
+    /// exits abnormally overrides whatever was propagating before it,
+    /// matching real Kotlin/Java. At least one of `catches`/`finally` is
+    /// required (enforced at parse time) — a bare `try { }` alone isn't
+    /// legal, same as Kotlin.
+    Try {
+        body: Vec<Stmt>,
+        catches: Vec<CatchClause>,
+        finally: Option<Vec<Stmt>>,
+    },
+}
+
+/// One `catch (param_name: param_type) { body }` clause of a `Try` — see
+/// `ExprKind::Try`. Mirrors `WhenArm`'s shape (a per-arm condition/binding
+/// plus its own body), just with a typed binding instead of a boolean
+/// condition.
+#[derive(Debug, Clone)]
+pub struct CatchClause {
+    pub param_name: String,
+    /// Span of just the bound name, for hover/goto-definition — same
+    /// convention as every other declared-name span in this file.
+    pub param_name_span: Span,
+    pub param_type: TypeAnnotation,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +393,14 @@ pub enum StmtKind {
         name: String,
         /// Span of just the function name, used for hover/goto-definition.
         name_span: Span,
+        /// `fun ReceiverType.name(...)` — the receiver type's bare name and
+        /// its own span, or `None` for an ordinary function. v1 grammar
+        /// only: a plain named type (`Ident`), never `T?` or a function
+        /// type — see `Parser::parse_fun_decl`. Always `None` for a
+        /// `ClassMember::Method` (the parser rejects a receiver prefix
+        /// while `class_member_depth > 0` — extension functions are
+        /// top-level only).
+        receiver: Option<(String, Span)>,
         params: Vec<Param>,
         /// Raw return-type annotation (`fun f(): Int`), if any — resolved
         /// into a real `types::Type` by the resolver/interpreter, not here.
@@ -408,6 +457,19 @@ pub enum StmtKind {
         field_span: Span,
         op: AssignOp,
         value: Expr,
+    },
+    /// `typealias Name = TypeAnnotation` — top-level only, same as
+    /// `ClassDecl`. Pure resolver/type-system sugar: `target` is resolved
+    /// once, in file order, by a resolver predpass (mirroring
+    /// `known_classes`) before the main `walk_stmts`, so this variant itself
+    /// re-resolves nothing when walked — it only registers a `Symbol` for
+    /// hover/goto-definition. Erased entirely by runtime; the interpreter
+    /// never sees this variant.
+    TypeAlias {
+        name: String,
+        /// Span of just the alias name, used for hover/goto-definition.
+        name_span: Span,
+        target: TypeAnnotation,
     },
 }
 

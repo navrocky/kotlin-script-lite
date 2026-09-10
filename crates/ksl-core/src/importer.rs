@@ -268,6 +268,19 @@ fn run_stmts_in(interp: &mut Interpreter, stmts: &[Stmt], env: &Env) -> Result<(
             "'break'/'continue' used outside of a loop",
             Span::default(),
         ))),
+        // A `throw` no `try`/`catch` anywhere caught, all the way up to the
+        // top of the program — real Kotlin's own uncaught-exception
+        // behavior, just reported through `InterpError` rather than a
+        // native stack trace. `value_to_display_string` dispatches through
+        // the thrown value's own `toString()` (`Exception`'s own override,
+        // see `stdlib::exceptions`, prints `"ClassName: message"`); a
+        // secondary error from that call itself (defensive only — nothing
+        // in this codebase throws a value whose `toString()` can fail)
+        // falls back to `Value`'s plain `Display`.
+        Err(Flow::Throw(v)) => {
+            let message = interp.value_to_display_string(&v, Span::default()).unwrap_or_else(|_| v.to_string());
+            Err(InterpError::Runtime(RuntimeError::new(format!("uncaught exception: {message}"), Span::default())))
+        }
     }
 }
 

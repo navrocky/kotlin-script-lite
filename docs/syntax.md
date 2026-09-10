@@ -609,8 +609,9 @@ name`, the same as referencing any other name that needs an import first.
 `import kotlin.test.*` (a common convention, including in JetBrains's own
 compiler test suite — see `docs/roadmap.md`'s Phase 0.5) run under ksl
 unmodified. Importing a member ksl doesn't actually implement (e.g.
-`kotlin.test.assertFailsWith`, which needs `throw` — see "Not supported")
-is likewise a plain `undefined name` error.
+`kotlin.test.assertFailsWith`, not yet implemented even though `throw`
+itself exists now — see "[Exceptions](#exceptions)") is likewise a plain
+`undefined name` error.
 
 `a.b.c` in expression position is genuinely ambiguous between a
 package-qualified name and `.` member access on a value (see "Methods"
@@ -728,6 +729,135 @@ for the full builtin list. `.field` access with no call is also legal
 syntax — real on a class instance (again, see [Classes](#classes)); a
 runtime error on anything else, which has no fields.
 
+## Extension functions
+
+```kotlin
+fun String.shout(): String = uppercase(this) + "!"
+println("hi".shout())   // HI!
+
+fun Int.double(): Int = this * 2
+println(5.double())     // 10
+```
+
+A top-level `fun ReceiverType.name(...)` declares an **extension
+function** — callable with `.` syntax on any value of `ReceiverType` (or a
+subtype: `fun Any.tag()` is callable on every value; `fun Number.tag()` is
+callable on `Int`/`Double`), exactly as if it were a real method, but
+declared outside any `class`. `this` inside the body refers to the
+receiver — there is no other implicit-receiver sugar (unlike a class
+method's own body, a bare name inside an extension's body never falls
+back to an implicit `this.name`; write `this.name` explicitly).
+
+**A real class or built-in method with the same name always wins** — an
+extension function is only ever consulted once no matching method exists
+on the receiver's own type or any of its ancestors, matching Kotlin's own
+"member always beats extension" rule:
+
+```kotlin
+class Greeter { fun hello() = "member" }
+fun Greeter.hello() = "extension"
+println(Greeter().hello())   // "member" — the extension is never reached
+```
+
+An extension function is **never callable on its own** — `shout("hi")` is
+not legal, only `"hi".shout()` — and, unlike an ordinary top-level `fun`,
+its own name and a same-named plain `fun`/another extension declared on a
+*different* receiver type coexist without conflict (they live in separate
+namespaces, keyed by receiver type):
+
+```kotlin
+fun shout(s: String) = s.uppercase()   // ordinary fun
+fun String.shout() = this.uppercase()  // extension fun — no conflict
+```
+
+Extension functions can be overloaded, resolved by argument type exactly
+like an ordinary `fun`:
+
+```kotlin
+fun String.combine(a: Int): String = this + a.toString()
+fun String.combine(a: String): String = this + a
+```
+
+Like an ordinary top-level `fun`, an extension function must be declared
+before it's called in the same file — no forward reference/hoisting.
+
+**Not supported yet**: a nullable receiver (`fun String?.orEmpty()`), a
+function-type receiver, an extension declared inside a `class` body
+("member extensions"), extension *properties* (only functions), and
+calling an extension declared in a different file (single-file only
+today — a real asymmetry with ordinary cross-file `fun` visibility, which
+already works via `package`/`import`).
+
+## Exceptions
+
+```kotlin
+fun divide(a: Int, b: Int): Int {
+    if (b == 0) {
+        throw RuntimeException("division by zero")
+    }
+    return a / b
+}
+
+try {
+    println(divide(10, 0))
+} catch (e: RuntimeException) {
+    println("failed: ${e.message}")
+} finally {
+    println("done")
+}
+```
+
+`Exception` and `RuntimeException` are real, built-in classes (`RuntimeException`
+extends `Exception`, which extends `Any`) — there's no user-defined exception
+hierarchy yet (no `class MyError : Exception(...)`), so `throw` only accepts
+an `Exception`/`RuntimeException` instance, constructed the same way as any
+other class: `Exception("message")`/`RuntimeException("message")`. The
+message is readable as `e.message` inside a `catch`.
+
+`catch (e: Exception)` matches an instance of `Exception` **or any of its
+subclasses** — a real superclass walk, so it also catches a thrown
+`RuntimeException`. A `try` can have any number of `catch` clauses, tried in
+order (first match wins), plus an optional `finally` — at least one of the
+two is required (a bare `try { }` with neither isn't legal, matching real
+Kotlin). `finally` always runs, whatever happened in the `try`/matched
+`catch` — including when nothing was thrown at all, when the exception
+wasn't caught by any clause and keeps propagating, and when a `return`/
+`break`/`continue` is passing through. If `finally` itself throws/returns/
+breaks/continues, that overrides whatever was already propagating.
+
+Like `if`/`when`, `try` is an expression — its value is whichever of
+`body`/the matched `catch`'s block ran last (`finally`'s own value is
+always discarded, it only ever runs for side effects):
+
+```kotlin
+val result = try {
+    divide(10, 0)
+} catch (e: Exception) {
+    -1
+}
+```
+
+An exception that reaches the top of the program with no `try`/`catch`
+around it anywhere prints a message and exits with a non-zero status, the
+same way any other uncaught runtime error does.
+
+## Type aliases
+
+```kotlin
+typealias Age = Int
+typealias Predicate = (Int) -> Boolean
+
+fun isAdult(age: Age): Boolean = age >= 18
+```
+
+`typealias Name = <type>` gives an existing type an additional name — a
+primitive, a class, or a function type — usable anywhere a real type
+annotation is: a parameter, a `val`/`var`, or a return type. It's pure
+naming, erased entirely by the resolver; there's no new runtime concept
+behind it. An alias may reference an earlier-declared alias in the same
+file (`typealias Years = Age`), but not one declared later — no forward
+reference/mutual recursion between aliases.
+
 ## Not supported
 
 Deliberately out of scope for now: interfaces, inheritance (`:`
@@ -737,5 +867,8 @@ either — build a list with [`listOf(...)`](stdlib.md#listof); a `{k: v}`
 map literal doesn't exist in real Kotlin at all), collection indexing
 (`list[i]`, including on a user class) — deferred until generics,
 properties, and `operator fun get`/`set` exist, so it can be real
-operator overloading rather than a special case — `try`/`catch`,
-coroutines, extension functions, and network imports.
+operator overloading rather than a special case — user-defined exception
+classes (only the built-in `Exception`/`RuntimeException` exist), `is`/`as`
+casts, coroutines, and network imports. See
+[Extension functions](#extension-functions) above for that feature's own,
+narrower list of not-yet-supported cases.

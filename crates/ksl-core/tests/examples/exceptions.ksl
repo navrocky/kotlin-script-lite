@@ -1,0 +1,65 @@
+// Exceptions (Phase 5): throw, try/catch/finally, catching a subclass
+// through its ancestor type, and try as a value-producing expression.
+
+fun mightFail(fail: Boolean): Int {
+    if (fail) {
+        throw RuntimeException("something went wrong")
+    }
+    return 42
+}
+
+// Basic catch.
+try {
+    val r = mightFail(true)
+    println("no exception, result: $r")
+} catch (e: Exception) {
+    println("caught: ${e.message}")
+}
+
+// `RuntimeException` is caught through its ancestor `Exception` — a real
+// superclass walk, not string matching.
+try {
+    throw RuntimeException("ancestor match")
+} catch (e: Exception) {
+    println("caught via ancestor: ${e.message}")
+}
+
+// Multiple catch clauses, tried in order; the first matching one wins.
+try {
+    throw RuntimeException("specific")
+} catch (e: RuntimeException) {
+    println("specific handler: ${e.message}")
+} catch (e: Exception) {
+    println("general handler: ${e.message}")
+}
+
+// `finally` always runs, whether or not an exception was thrown/caught.
+try {
+    println("body ran")
+} finally {
+    println("finally ran (no throw)")
+}
+
+try {
+    throw Exception("with finally")
+} catch (e: Exception) {
+    println("caught: ${e.message}")
+} finally {
+    println("finally ran (after catch)")
+}
+
+// `try` is a real expression: its value is the body's, or whichever catch
+// matched.
+val result = try {
+    mightFail(false)
+} catch (e: Exception) {
+    -1
+}
+println("result: $result")
+
+val recovered = try {
+    mightFail(true)
+} catch (e: Exception) {
+    -1
+}
+println("recovered: $recovered")

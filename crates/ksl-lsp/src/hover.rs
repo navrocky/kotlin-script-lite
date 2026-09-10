@@ -155,6 +155,8 @@ fn build_hover(symbol: &Symbol, range_span: Option<Span>, is_current: bool, pack
         SymbolKind::Class => "class",
         SymbolKind::Field => "field",
         SymbolKind::Method => "method",
+        SymbolKind::TypeAlias => "typealias",
+        SymbolKind::ExtensionFun => "extension function",
     };
     let signature = match package {
         Some(pkg) if !pkg.is_empty() => qualify_signature(&symbol.signature, &symbol.name, pkg),
@@ -538,6 +540,20 @@ mod tests {
         // "p." is 2 chars, so "bark" starts at column 3.
         let h = hover_at(text, 5, 3).expect("method use should hover");
         assert!(markdown_value(&h).contains("fun bark(): String"), "{}", markdown_value(&h));
+    }
+
+    #[test]
+    fn hover_on_an_extension_functions_call_site_shows_its_receiver_qualified_signature() {
+        // Requires no extra hover code at all — the resolver now records a
+        // real `occurrences` entry for a resolved extension call
+        // (`resolver.rs`'s `MethodCall` arm), so `occurrence_at` (checked
+        // before any builtin-method-specific fallback) already finds it.
+        let text = "fun String.shout(): String = this\n\"hi\".shout()\n";
+        // `"hi".` is 5 chars, so "shout" starts at column 6.
+        let h = hover_at(text, 2, 6).expect("extension call use should hover");
+        let md = markdown_value(&h);
+        assert!(md.contains("fun String.shout(): String"), "{md}");
+        assert!(md.contains("*extension function*"), "{md}");
     }
 
     /// Cross-file counterpart of `hover_on_a_promoted_field_use_shows_its_ctor_params_declaration`

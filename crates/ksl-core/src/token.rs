@@ -35,6 +35,11 @@ pub enum TokenKind {
     Null,
     Class,
     This,
+    Try,
+    Catch,
+    Finally,
+    Throw,
+    Typealias,
 
     // Punctuation
     LParen,
@@ -109,6 +114,11 @@ pub const KEYWORDS: &[(&str, TokenKind)] = &[
     ("null", TokenKind::Null),
     ("class", TokenKind::Class),
     ("this", TokenKind::This),
+    ("try", TokenKind::Try),
+    ("catch", TokenKind::Catch),
+    ("finally", TokenKind::Finally),
+    ("throw", TokenKind::Throw),
+    ("typealias", TokenKind::Typealias),
     ("true", TokenKind::Bool(true)),
     ("false", TokenKind::Bool(false)),
 ];

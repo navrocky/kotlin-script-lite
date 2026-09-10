@@ -189,6 +189,17 @@ pub enum Flow {
     Return(Value),
     Break,
     Continue,
+    /// `throw <value>` — a *separate* unwinding path from `Error` above:
+    /// `Error` wraps an internal `RuntimeError` and stays fatal/uncatchable
+    /// (no `try`/`catch` in this language catches it), while `Throw` wraps
+    /// a real, catchable ksl value (always a `Value::Object` of `Exception`/
+    /// `RuntimeException` or a subclass, in practice — nothing stops a
+    /// script from evaluating a `throw` operand to some other `Value`, but
+    /// `resolver.rs`'s `ExprKind::Throw` handling flags anything else as a
+    /// static error). See `interpreter.rs`'s `ExprKind::Try` handling for
+    /// where this is caught, and `importer.rs` for how one that reaches the
+    /// top of a program uncaught is reported.
+    Throw(Value),
 }
 
 impl From<RuntimeError> for Flow {

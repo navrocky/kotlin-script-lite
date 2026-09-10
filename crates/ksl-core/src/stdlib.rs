@@ -25,6 +25,7 @@ use crate::value::{NativeValue, Value};
 
 mod assertions;
 mod collections;
+mod exceptions;
 mod io;
 mod math;
 mod random;
@@ -188,6 +189,7 @@ pub const STDLIB_PACKAGES: &[BuiltinPackage] = &[
     assertions::PACKAGE,
     random::PACKAGE,
     terminal::PACKAGE,
+    exceptions::PACKAGE,
 ];
 
 /// The combined symbols of every `default_imported` package — every stdlib
@@ -547,6 +549,24 @@ pub const BUILTIN_METHODS: &[BuiltinMethod] = &[
         },
         call: any_equals,
     },
+    // Overrides `Any.toString`'s identity-format default (`"Exception@..."`)
+    // with `"ClassName: message"` — real `Throwable.toString()`'s own
+    // format — so an uncaught `throw` (`importer.rs`'s top-level `Flow::
+    // Throw` handling) prints something a user can actually read.
+    // `RuntimeException` inherits this via the ordinary `superclass` walk
+    // (`class::lookup_method`), no separate entry needed.
+    BuiltinMethod {
+        receiver: "Exception",
+        symbol: BuiltinSymbol {
+            name: "toString",
+            kind: SymbolKind::Fun,
+            params: &[],
+            variadic_param: None,
+            return_type: Type::String,
+            doc: "\"ClassName: message\".",
+        },
+        call: exception_to_string,
+    },
 ];
 
 /// The static ancestor chain (own type name first, then each supertype in
@@ -568,6 +588,8 @@ pub fn builtin_type_chain(receiver_type: &str) -> Vec<&'static str> {
         "Unit" => "Unit",
         "Number" => "Number",
         "Any" => "Any",
+        "Exception" => "Exception",
+        "RuntimeException" => "RuntimeException",
         _ => return Vec::new(),
     };
     let mut chain = vec![canonical];
@@ -575,6 +597,7 @@ pub fn builtin_type_chain(receiver_type: &str) -> Vec<&'static str> {
     while current != "Any" {
         current = match current {
             "Int" | "Double" => "Number",
+            "RuntimeException" => "Exception",
             _ => "Any",
         };
         chain.push(current);
@@ -742,6 +765,21 @@ fn any_to_string(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span:
     Ok(Value::str(this.to_string()))
 }
 
+/// `Exception.toString()` (and, via inheritance, `RuntimeException`'s) —
+/// see `BUILTIN_METHODS`'s entry for this. Falls back to `Any`'s identity
+/// format if `this` somehow isn't a real `Value::Object` (defensive only —
+/// nothing but `stdlib::exceptions::make_exception` ever builds an
+/// `Exception`/`RuntimeException` instance, and both always set `message`).
+fn exception_to_string(_interp: &mut Interpreter, this: Value, args: Vec<Value>, span: Span) -> Result<Value, Flow> {
+    expect_no_args("toString", &args, span)?;
+    let Value::Object(o) = &this else {
+        return Ok(Value::str(this.to_string()));
+    };
+    let obj = o.borrow();
+    let message = obj.get_field("message").map(|v| v.to_string()).unwrap_or_default();
+    Ok(Value::str(format!("{}: {message}", obj.class.name)))
+}
+
 /// `Any.hashCode()`'s default — identity (the object's own `GcRef` address)
 /// for a `Value::Object`, a real structural hash (see `value_hash`) for
 /// everything else. Consistent with `any_equals`: equal values (by
@@ -868,6 +906,8 @@ mod tests {
             ("terminalHeight", "fun terminalHeight(): Int"),
             ("sleep", "fun sleep(millis: Int): Unit"),
             ("currentTimeMillis", "fun currentTimeMillis(): Int"),
+            ("Exception", "fun Exception(message: String): Any"),
+            ("RuntimeException", "fun RuntimeException(message: String): Any"),
         ];
         let actual: Vec<(&str, String)> = STDLIB_PACKAGES
             .iter()
@@ -1011,6 +1051,14 @@ mod tests {
                 // slot to hit instead of always failing out-of-range.
                 "List" => Value::List(crate::gc::GcRef::new(interp.gc.clone(), vec![Value::Int(0)])),
                 "Any" => Value::Int(1),
+                "Exception" => {
+                    let mut fields = std::collections::HashMap::new();
+                    fields.insert("message".to_string(), Value::str("boom"));
+                    Value::Object(crate::gc::GcRef::new(
+                        interp.gc.clone(),
+                        crate::class::ObjectData { class: interp.builtin_classes["Exception"].clone(), fields },
+                    ))
+                }
                 other => panic!("add a receiver-type-appropriate value above for '{other}'"),
             };
             let args = match m.symbol.name {
@@ -1021,7 +1069,29 @@ mod tests {
                 "removeAt" => vec![Value::Int(0)],
                 _ => vec![],
             };
-            let result = call_builtin_method(&mut interp, receiver, m.symbol.name, args, Span::default());
+            // `call_builtin_method` dispatches purely off `Value::type_name()`
+            // (`"Object"` for *every* `Value::Object`, whatever its real
+            // class — see that function's own doc comment), so it can never
+            // find an `Exception`-keyed `BUILTIN_METHODS` entry. That's not
+            // a gap: a real `Value::Object` receiver is dispatched through
+            // `class::lookup_method` directly (`interpreter.rs`'s own
+            // `MethodCall` handling), never through `call_builtin_method` at
+            // all — mirrored here instead of routing through that function.
+            let result = match &receiver {
+                Value::Object(o) => {
+                    let class = o.borrow().class.clone();
+                    match crate::class::lookup_method(&class, m.symbol.name) {
+                        Some((_, crate::class::MethodImpl::Native(native))) => {
+                            (native)(&mut interp, receiver.clone(), args, Span::default())
+                        }
+                        Some((_, crate::class::MethodImpl::UserDefined(_))) => {
+                            unreachable!("builtin classes only ever register Native methods")
+                        }
+                        None => Err(RuntimeError::new(format!("'{}' has no method '{}'", class.name, m.symbol.name), Span::default()).into()),
+                    }
+                }
+                _ => call_builtin_method(&mut interp, receiver, m.symbol.name, args, Span::default()),
+            };
             assert!(result.is_ok(), "'{}' on '{}' listed in BUILTIN_METHODS but not dispatchable: {:?}", m.symbol.name, m.receiver, result.err().map(|_| ()));
         }
     }

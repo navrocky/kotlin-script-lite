@@ -1,0 +1,31 @@
+// Extension functions: `fun ReceiverType.name(...)`, callable as
+// `receiver.name(...)` on any value of that type (or a subtype). `this`
+// inside the body is the receiver.
+
+fun String.shout(): String = uppercase(this) + "!"
+fun Int.double(): Int = this * 2
+fun Any.describe(): String = "value: $this"
+
+class Point(val x: Int, val y: Int) {
+    fun length(): Int = x * x + y * y
+}
+fun Point.magnitude(): Int = this.length()
+
+// A real class member always wins over a same-named extension.
+class Greeter {
+    fun hello() = "member"
+}
+fun Greeter.hello() = "extension"
+
+// Extension functions can be overloaded, resolved by argument type.
+fun String.combine(a: Int): String = this + a.toString()
+fun String.combine(a: String): String = this + a
+
+println("hi".shout())
+println(5.double())
+println(5.describe())
+println("text".describe())
+println(Point(3, 4).magnitude())
+println(Greeter().hello())
+println("x".combine(5))
+println("x".combine("y"))

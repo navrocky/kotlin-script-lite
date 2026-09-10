@@ -420,6 +420,7 @@ impl<'a> Parser<'a> {
             TokenKind::Do => self.parse_do_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Class => self.parse_class_decl(),
+            TokenKind::Typealias => self.parse_type_alias_decl(),
             TokenKind::Return => {
                 self.advance();
                 let value = if matches!(
@@ -502,10 +503,36 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// `fun name(...)`, or `fun ReceiverType.name(...)` — an **extension
+    /// function** (see `StmtKind::FunDecl::receiver`'s own doc comment).
+    /// The receiver form is recognized by a 2-token lookahead right after
+    /// `fun` (`Ident` immediately followed by `Dot`) — no ambiguity/
+    /// backtracking needed, since an ordinary `fun name(...)` never has a
+    /// `.` right after its own name's position. `class_member_depth` is
+    /// bumped for the rest of this declaration when a receiver was found
+    /// — the same field (and thus the same `this`-legality rule) a class
+    /// method's own body already gets via its caller (`parse_class_decl`),
+    /// just scoped to this one declaration instead of a whole class body —
+    /// this is the entire mechanism that makes `this` legal inside an
+    /// extension function's body (and its own parameter defaults) with no
+    /// change needed to `parse_primary`'s `TokenKind::This` arm at all.
     fn parse_fun_decl(&mut self) -> Result<Stmt, ParseError> {
         let span = self.span();
         let doc_comment = self.doc_comments.remove(&span.line);
         self.advance(); // fun
+        let receiver = if matches!(self.peek_kind(), TokenKind::Ident(_)) && matches!(self.peek_at(1), TokenKind::Dot) {
+            if self.class_member_depth > 0 {
+                return Err(self.err("extension functions are not allowed inside a class body"));
+            }
+            let (rname, rspan) = self.expect_ident_spanned(IdentRole::TypeName)?;
+            self.expect(TokenKind::Dot, "'.'")?;
+            Some((rname, rspan))
+        } else {
+            None
+        };
+        if receiver.is_some() {
+            self.class_member_depth += 1;
+        }
         let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
         let params = self.parse_params()?;
         self.skip_newlines();
@@ -519,8 +546,11 @@ impl<'a> Parser<'a> {
             self.parse_block_stmts().map(FunBody::Block)
         };
         self.loop_depth = saved_loop_depth;
+        if receiver.is_some() {
+            self.class_member_depth -= 1;
+        }
         Ok(Stmt::new(
-            StmtKind::FunDecl { name, name_span, params, return_type, body: body?, doc_comment },
+            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body: body?, doc_comment },
             span,
         ))
     }
@@ -562,6 +592,16 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
         Ok(Stmt::new(StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment }, span))
+    }
+
+    /// `typealias Name = TypeAnnotation` — see `StmtKind::TypeAlias`.
+    fn parse_type_alias_decl(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.span();
+        self.advance(); // typealias
+        let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
+        self.expect(TokenKind::Assign, "'='")?;
+        let target = self.parse_type_annotation()?;
+        Ok(Stmt::new(StmtKind::TypeAlias { name, name_span, target }, span))
     }
 
     /// Same shape as `parse_params`, plus an optional leading `val`/`var`
@@ -1166,6 +1206,14 @@ impl<'a> Parser<'a> {
             TokenKind::LBrace => self.parse_lambda(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::When => self.parse_when_expr(),
+            TokenKind::Try => self.parse_try_expr(),
+            // Unlike `return`, `throw` always requires an operand — `throw`
+            // alone is never legal, so no value-or-not lookahead is needed.
+            TokenKind::Throw => {
+                self.advance();
+                let value = self.parse_expr()?;
+                Ok(Expr::new(ExprKind::Throw(Box::new(value)), span))
+            }
             // `x ?: return`/`x ?: return 0`, `x ?: break`, `x ?: continue`
             // — `return`/`break`/`continue` used in expression position,
             // not just as their own statement (`parse_stmt`'s own
@@ -1329,15 +1377,27 @@ impl<'a> Parser<'a> {
 
     /// Allows `if (..) { .. }\nelse { .. }` by tolerating a newline before `else`.
     fn skip_separators_if_else_follows(&mut self) {
+        self.skip_newlines_if_followed_by(&TokenKind::Else);
+    }
+
+    /// Skips a run of newlines only if `kind` immediately follows them —
+    /// used wherever a continuation clause (`else`, `catch`, `finally`) is
+    /// allowed to start on its own line without being mistaken for the end
+    /// of the enclosing construct. Leaves the position untouched (including
+    /// when `kind` follows with zero newlines in between — the common case)
+    /// and returns whether `kind` was found.
+    fn skip_newlines_if_followed_by(&mut self, kind: &TokenKind) -> bool {
         let start = self.pos;
         let mut pos = self.pos;
         while matches!(self.tokens.get(pos).map(|t| &t.kind), Some(TokenKind::Newline)) {
             pos += 1;
         }
-        if matches!(self.tokens.get(pos).map(|t| &t.kind), Some(TokenKind::Else)) {
+        if self.tokens.get(pos).map(|t| std::mem::discriminant(&t.kind) == std::mem::discriminant(kind)).unwrap_or(false) {
             self.pos = pos;
+            true
         } else {
             self.pos = start;
+            false
         }
     }
 
@@ -1396,6 +1456,52 @@ impl<'a> Parser<'a> {
             is_else: false,
             body,
         })
+    }
+
+    /// `try { body } (catch (name: Type) { ... })* (finally { ... })?` — at
+    /// least one `catch` or a `finally` is required, matching real Kotlin (a
+    /// bare `try { }` with neither is a parse error there too). Unlike
+    /// `if`/`when`'s own branches (`parse_branch`), the body and each clause
+    /// always require an explicit `{ }` block — Kotlin has no braceless
+    /// single-statement form for `try`.
+    fn parse_try_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.span();
+        self.advance(); // try
+        self.skip_newlines();
+        let body = self.parse_block_stmts()?;
+        let mut catches = Vec::new();
+        while self.skip_newlines_if_followed_by(&TokenKind::Catch) {
+            catches.push(self.parse_catch_clause()?);
+        }
+        let finally = if self.skip_newlines_if_followed_by(&TokenKind::Finally) {
+            self.advance(); // finally
+            self.skip_newlines();
+            Some(self.parse_block_stmts()?)
+        } else {
+            None
+        };
+        if catches.is_empty() && finally.is_none() {
+            return Err(self.err("'try' must be followed by at least one 'catch' or a 'finally' block"));
+        }
+        // Widened to the real closing `}` of whichever clause was parsed
+        // last — same reasoning as `parse_lambda`'s own widening.
+        let end = self.prev_span();
+        Ok(Expr::new(
+            ExprKind::Try { body, catches, finally },
+            Span::with_end(span.line, span.col, end.end_line, end.end_col),
+        ))
+    }
+
+    fn parse_catch_clause(&mut self) -> Result<CatchClause, ParseError> {
+        self.advance(); // catch
+        self.expect(TokenKind::LParen, "'('")?;
+        let (param_name, param_name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
+        self.expect(TokenKind::Colon, "':'")?;
+        let param_type = self.parse_type_annotation()?;
+        self.expect(TokenKind::RParen, "')'")?;
+        self.skip_newlines();
+        let body = self.parse_block_stmts()?;
+        Ok(CatchClause { param_name, param_name_span, param_type, body })
     }
 }
 
@@ -2503,5 +2609,143 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ---- try/catch/finally, throw ----
+
+    #[test]
+    fn throw_requires_an_operand() {
+        let stmts = parse_src("throw Exception(\"boom\")\n");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => assert!(matches!(&e.kind, ExprKind::Throw(_))),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_with_a_single_catch_parses() {
+        let stmts = parse_src("try {\n    1\n} catch (e: Exception) {\n    2\n}\n");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Try { body, catches, finally } => {
+                    assert_eq!(body.len(), 1);
+                    assert_eq!(catches.len(), 1);
+                    assert_eq!(catches[0].param_name, "e");
+                    assert!(finally.is_none());
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_allows_multiple_catches_and_a_finally() {
+        let stmts = parse_src(
+            "try {\n    1\n} catch (e: RuntimeException) {\n    2\n} catch (e: Exception) {\n    3\n} finally {\n    4\n}\n",
+        );
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Try { catches, finally, .. } => {
+                    assert_eq!(catches.len(), 2);
+                    assert!(finally.is_some());
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_with_only_a_finally_parses() {
+        let stmts = parse_src("try {\n    1\n} finally {\n    2\n}\n");
+        match &stmts[0].kind {
+            StmtKind::ExprStmt(e) => match &e.kind {
+                ExprKind::Try { catches, finally, .. } => {
+                    assert!(catches.is_empty());
+                    assert!(finally.is_some());
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_with_neither_catch_nor_finally_is_a_parse_error() {
+        parse_err("try {\n    1\n}\n");
+    }
+
+    #[test]
+    fn a_trys_span_covers_its_own_closing_brace() {
+        let stmts = parse_src("try {\n    1\n} catch (e: Exception) {\n    2\n}\n");
+        let span = stmts[0].span;
+        assert_eq!((span.end_line, span.end_col), (5, 2));
+    }
+
+    // ---- typealias ----
+
+    #[test]
+    fn typealias_parses_name_and_target() {
+        let stmts = parse_src("typealias Age = Int\n");
+        match &stmts[0].kind {
+            StmtKind::TypeAlias { name, target, .. } => {
+                assert_eq!(name, "Age");
+                assert!(matches!(target, TypeAnnotation::Named(n, _) if n == "Int"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // ---- extension functions ----
+
+    #[test]
+    fn fun_with_a_receiver_prefix_parses_as_an_extension() {
+        let stmts = parse_src("fun String.shout(): String = this\n");
+        match &stmts[0].kind {
+            StmtKind::FunDecl { name, receiver, .. } => {
+                assert_eq!(name, "shout");
+                assert!(matches!(receiver, Some((r, _)) if r == "String"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_fun_still_has_no_receiver() {
+        let stmts = parse_src("fun shout(s: String): String = s\n");
+        match &stmts[0].kind {
+            StmtKind::FunDecl { name, receiver, .. } => {
+                assert_eq!(name, "shout");
+                assert!(receiver.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn this_is_legal_inside_an_extension_functions_body() {
+        parse_src("fun Int.twice(): Int = this * 2\n");
+    }
+
+    #[test]
+    fn this_is_legal_inside_an_extension_functions_own_parameter_default() {
+        parse_src("fun Int.addSelf(n: Int = this): Int = n\n");
+    }
+
+    #[test]
+    fn extension_function_inside_a_class_body_is_a_parse_error() {
+        let e = parse_err("class Foo {\n    fun Int.bar(): Int = this\n}\n");
+        assert!(e.message.contains("extension functions are not allowed inside a class body"), "{}", e.message);
+    }
+
+    #[test]
+    fn nullable_receiver_type_is_not_supported() {
+        parse_err("fun String?.foo(): Int = 1\n");
+    }
+
+    #[test]
+    fn function_type_receiver_is_not_supported() {
+        parse_err("fun (Int) -> Int.foo(): Int = 1\n");
     }
 }

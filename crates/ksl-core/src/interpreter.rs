@@ -80,6 +80,31 @@ pub struct Interpreter<'a> {
     /// reports "unknown type" here — an accepted limitation, not fixed
     /// this phase.
     pub(crate) known_classes: HashSet<Rc<str>>,
+    /// Every `typealias` whose declaration has actually executed so far,
+    /// mapping its name to its already-resolved target `Type` — the
+    /// interpreter's own sequential counterpart of `resolver::Resolver`'s
+    /// same-named field (see `known_classes`'s doc comment for why the two
+    /// build up differently). Read by `check_type`, so a `val`/parameter/
+    /// return-type annotation naming an alias (declared before, per the
+    /// same ordering constraint the resolver enforces statically) resolves
+    /// to its real target instead of "unknown type" — without this,
+    /// `typealias` would statically type-check but fail every runtime type
+    /// check, since `check_type` works from the raw `TypeAnnotation`, not
+    /// the resolver's already-substituted `Type`.
+    pub(crate) known_type_aliases: HashMap<Rc<str>, crate::types::Type>,
+    /// Every top-level `fun ReceiverType.name(...)` whose declaration has
+    /// actually executed so far, keyed by `(canonicalized receiver type
+    /// name, method name)` — the interpreter's own sequential counterpart
+    /// of `resolver::Resolver::extension_functions` (see `known_classes`'s
+    /// doc comment for why the resolver/interpreter build the equivalent
+    /// map differently: one predpass vs. as-executed). Holds a real
+    /// `Value` (`Function` or `Overload`, exactly like a name stored in an
+    /// `Env` would) so overloaded extension functions reuse `call_value`'s
+    /// existing `Overload` handling unchanged, just with `this` bound
+    /// first — see `call_extension`. Never registered into any `Env` —
+    /// this is the entire mechanism that keeps an extension function
+    /// permanently non-bare-callable, at runtime as well as statically.
+    pub(crate) extension_functions: HashMap<(Rc<str>, String), Value>,
     /// `stdlib::random`'s own PRNG state (a splitmix64 generator, see that
     /// module) — one plain field, mutated directly by `kotlin.random`'s
     /// native closures the same way every other native function already
@@ -156,6 +181,8 @@ impl<'a> Interpreter<'a> {
             gc,
             builtin_classes: crate::class::builtin_classes(),
             known_classes: HashSet::new(),
+            known_type_aliases: HashMap::new(),
+            extension_functions: HashMap::new(),
             // Any nonzero seed works for splitmix64; system time is just a
             // convenient, cheap source of per-process variation, not a
             // cryptographic requirement (`kotlin.random`'s doc comment).
@@ -531,9 +558,14 @@ impl<'a> Interpreter<'a> {
                     .into(),
                 })
             }
-            StmtKind::FunDecl { name, name_span, params, return_type, body, .. } => {
+            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body, .. } => {
                 let new_fn = Rc::new(FunctionValue {
-                    name: Some(name.clone()),
+                    name: Some(match receiver {
+                        // Readable stack-trace/debug text, e.g. "String.shout"
+                        // — never parsed back, just display.
+                        Some((r, _)) => format!("{r}.{name}"),
+                        None => name.clone(),
+                    }),
                     params: params.clone(),
                     return_type: return_type.clone(),
                     body: body.clone(),
@@ -547,22 +579,61 @@ impl<'a> Interpreter<'a> {
                     decl_span: *name_span,
                     resolved_calls: self.current_resolved.clone(),
                 });
-                // Real overloading: a sibling `fun` already sharing this
-                // exact name *in this same scope* (never a parent's — see
-                // `Env::get_own`) groups with it into `Value::Overload`
-                // instead of silently overwriting it, matching the
-                // resolver's own `ScopeData::names` (which already allowed
-                // this statically — see its doc comment).
-                let f = match env.get_own(name) {
-                    Some(Value::Function(old)) => Value::Overload(Rc::new(vec![old, new_fn])),
-                    Some(Value::Overload(old_group)) => {
-                        let mut group = (*old_group).clone();
-                        group.push(new_fn);
-                        Value::Overload(Rc::new(group))
+                match receiver {
+                    Some((receiver_name, receiver_span)) => {
+                        // Canonicalize exactly like the resolver does
+                        // (`walk_stmt`'s `FunDecl` arm) — critical so `fun
+                        // Age.foo()` (where `Age` is a `typealias` for
+                        // `Int`) keys under "Int", matching what a real
+                        // `Int` receiver's ancestor-chain lookup
+                        // (`lookup_extension_function`) expects, and
+                        // mirroring `StmtKind::TypeAlias`'s own identical
+                        // resolve-at-execution-time pattern above.
+                        let receiver_ty_name = crate::types::resolve_type_annotation(
+                            &TypeAnnotation::Named(receiver_name.clone(), *receiver_span),
+                            &[],
+                            &self.known_classes,
+                            &self.known_type_aliases,
+                        )
+                        .name();
+                        let key = (Rc::from(receiver_ty_name.as_str()), name.clone());
+                        // Same `Value::Overload` grouping as an ordinary
+                        // top-level `fun` gets (below), just keyed into
+                        // `self.extension_functions` instead of `env` —
+                        // never `env.define`d, which is the entire
+                        // mechanism that keeps an extension function
+                        // permanently non-bare-callable, at runtime too.
+                        let f = match self.extension_functions.get(&key) {
+                            Some(Value::Function(old)) => Value::Overload(Rc::new(vec![old.clone(), new_fn])),
+                            Some(Value::Overload(old_group)) => {
+                                let mut group = (**old_group).clone();
+                                group.push(new_fn);
+                                Value::Overload(Rc::new(group))
+                            }
+                            _ => Value::Function(new_fn),
+                        };
+                        self.extension_functions.insert(key, f);
                     }
-                    _ => Value::Function(new_fn),
-                };
-                env.define(name, f, false, crate::types::Type::Unknown);
+                    None => {
+                        // Real overloading: a sibling `fun` already sharing
+                        // this exact name *in this same scope* (never a
+                        // parent's — see `Env::get_own`) groups with it
+                        // into `Value::Overload` instead of silently
+                        // overwriting it, matching the resolver's own
+                        // `ScopeData::names` (which already allowed this
+                        // statically — see its doc comment).
+                        let f = match env.get_own(name) {
+                            Some(Value::Function(old)) => Value::Overload(Rc::new(vec![old, new_fn])),
+                            Some(Value::Overload(old_group)) => {
+                                let mut group = (*old_group).clone();
+                                group.push(new_fn);
+                                Value::Overload(Rc::new(group))
+                            }
+                            _ => Value::Function(new_fn),
+                        };
+                        env.define(name, f, false, crate::types::Type::Unknown);
+                    }
+                }
                 Ok(())
             }
             StmtKind::While { cond, body } => {
@@ -641,6 +712,17 @@ impl<'a> Interpreter<'a> {
                 };
                 self.assign_object_field(o, field, *op, value, env, stmt.span)
             }
+            // Erased entirely at runtime (see `known_type_aliases`'s doc
+            // comment) — resolving `target` here (rather than once, up
+            // front) mirrors `ClassDecl`'s own sequential, as-executed
+            // registration into `known_classes`, so an alias built from an
+            // already-declared class/earlier alias (the same ordering the
+            // resolver enforces statically) resolves correctly.
+            StmtKind::TypeAlias { name, target, .. } => {
+                let ty = crate::types::resolve_type_annotation(target, &[], &self.known_classes, &self.known_type_aliases);
+                self.known_type_aliases.insert(Rc::from(name.as_str()), ty);
+                Ok(())
+            }
         }
     }
 
@@ -656,7 +738,7 @@ impl<'a> Interpreter<'a> {
         env: &Env,
     ) -> Result<(), Flow> {
         let resolve_ty = |ann: &TypeAnnotation| {
-            crate::types::resolve_type_annotation(ann, &[], &std::collections::HashSet::new())
+            crate::types::resolve_type_annotation(ann, &[], &std::collections::HashSet::new(), &HashMap::new())
         };
 
         let mut fields = Vec::new();
@@ -936,8 +1018,36 @@ impl<'a> Interpreter<'a> {
                             let arg_values: Vec<Value> = named_arg_values.into_iter().map(|(_, v)| v).collect();
                             (native)(self, recv.clone(), arg_values, expr.span)
                         }
-                        None => Err(RuntimeError::new(format!("'{}' has no method '{method}'", class.name), expr.span).into()),
+                        // Extension-function fallback — tried only when no
+                        // real class/builtin method matched (the entire
+                        // "member always wins" rule, enforced purely by
+                        // this ordering). Named arguments are preserved
+                        // here (not yet flattened) so `obj.myExt(label =
+                        // 1)` still binds by name.
+                        None => match self.lookup_extension_function(&class, method) {
+                            Some(f) => self.call_extension(&f, recv.clone(), named_arg_values, expr.span),
+                            None => Err(RuntimeError::new(format!("'{}' has no method '{method}'", class.name), expr.span).into()),
+                        },
                     };
+                }
+                // Same extension-function fallback for a primitive
+                // receiver — checked cheaply (no closure invoked) before
+                // `call_builtin_method` is reached, so a real builtin
+                // method still wins, and named arguments survive for an
+                // extension call on a primitive (`5.myExt(label = 1)`)
+                // exactly like they do for a real object receiver above;
+                // `call_builtin_method` itself only ever accepts a
+                // positional `Vec<Value>`, so it would silently lose
+                // named-argument matching for an extension routed through
+                // it directly — this is why the check happens here, before
+                // flattening, rather than inside that function.
+                let receiver_type = recv.type_name();
+                if let Some(class) = self.builtin_classes.get(receiver_type).cloned() {
+                    if crate::class::lookup_method(&class, method).is_none() {
+                        if let Some(f) = self.lookup_extension_function(&class, method) {
+                            return self.call_extension(&f, recv, named_arg_values, expr.span);
+                        }
+                    }
                 }
                 let arg_values: Vec<Value> = named_arg_values.into_iter().map(|(_, v)| v).collect();
                 crate::stdlib::call_builtin_method(self, recv, method, arg_values, expr.span)
@@ -1158,7 +1268,94 @@ impl<'a> Interpreter<'a> {
             }
             ExprKind::Break => Err(Flow::Break),
             ExprKind::Continue => Err(Flow::Continue),
+            ExprKind::Throw(inner) => {
+                let v = self.eval_expr(inner, env)?;
+                Err(Flow::Throw(v))
+            }
+            ExprKind::Try { body, catches, finally } => self.eval_try(body, catches, finally.as_deref(), env),
         }
+    }
+
+    /// `try { body } catch (...) { ... } finally { ... }` — see
+    /// `ExprKind::Try`'s doc comment (`ast.rs`) for the full contract this
+    /// implements, in particular that `finally` runs unconditionally, even
+    /// while a `Return`/`Break`/`Continue`/`Error`/another `Throw` is
+    /// propagating through `body` or a matched `catch` — and that a
+    /// `finally` which itself exits abnormally overrides whatever was
+    /// propagating before it (the `if let Err(finally_flow) = ... { return
+    /// ... }` below, executed unconditionally after `result` is already
+    /// decided either way).
+    fn eval_try(
+        &mut self,
+        body: &[Stmt],
+        catches: &[CatchClause],
+        finally: Option<&[Stmt]>,
+        env: &Env,
+    ) -> Result<Value, Flow> {
+        let result = {
+            let child = env.child();
+            self.exec_block(body, &child)
+        };
+        let result = match result {
+            Err(Flow::Throw(v)) => match self.find_matching_catch(&v, catches) {
+                Some(catch) => {
+                    let child = env.child();
+                    let catch_ty = crate::types::resolve_type_annotation(
+                        &catch.param_type,
+                        &[],
+                        &self.known_classes,
+                        &self.known_type_aliases,
+                    );
+                    child.define(&catch.param_name, v, false, catch_ty);
+                    self.exec_block(&catch.body, &child)
+                }
+                // No catch clause's declared type matches (by exact class
+                // or any ancestor via `superclass` — see
+                // `find_matching_catch`) — re-propagate the same `Throw`
+                // unchanged, letting an enclosing `try` (or the top of the
+                // program, see `importer.rs`) have the next chance at it.
+                None => Err(Flow::Throw(v)),
+            },
+            // `Ok(_)`, or any other `Err(Flow::_)` (`Return`/`Break`/
+            // `Continue`/`Error`) — passes through `body`'s own result
+            // untouched; only a `Throw` is ever this `try`'s to handle.
+            other => other,
+        };
+        if let Some(finally_body) = finally {
+            let child = env.child();
+            // `finally`'s own `Err` (a `Return`/`Break`/`Continue`/`Error`/
+            // `Throw` propagating out of `finally` itself) overrides
+            // whatever `result` already held — `?` here does exactly that:
+            // it returns early with `finally`'s own `Flow`, never reaching
+            // `result` below, precisely when `finally` itself diverges.
+            self.exec_block(finally_body, &child)?;
+        }
+        result
+    }
+
+    /// The first `catches` entry (in order) whose declared type names
+    /// `thrown`'s own runtime class, or any ancestor of it — a real IS-A
+    /// walk over `ClassValue.superclass`, the same chain
+    /// `class::lookup_method` already walks for method dispatch. `thrown`
+    /// not being a `Value::Object` at all (defensive only — see
+    /// `resolver.rs`'s `ExprKind::Throw` static check, which rejects
+    /// throwing anything but a real `Exception`/`RuntimeException`) matches
+    /// no catch.
+    fn find_matching_catch<'c>(&self, thrown: &Value, catches: &'c [CatchClause]) -> Option<&'c CatchClause> {
+        let Value::Object(o) = thrown else { return None };
+        let thrown_class = o.borrow().class.clone();
+        catches.iter().find(|c| {
+            let catch_ty = crate::types::resolve_type_annotation(
+                &c.param_type,
+                &[],
+                &self.known_classes,
+                &self.known_type_aliases,
+            );
+            match catch_ty {
+                crate::types::Type::Class(name) => class_is_or_extends(&thrown_class, &name),
+                _ => false,
+            }
+        })
     }
 
     fn eval_when(&mut self, subject: Option<&Expr>, arms: &[WhenArm], env: &Env) -> Result<Value, Flow> {
@@ -1299,6 +1496,66 @@ impl<'a> Interpreter<'a> {
         span: Span,
     ) -> Result<Value, Flow> {
         self.call_function_with_this(f, Some(this), args, span)
+    }
+
+    /// Walks `class`, then its own superclass chain, returning the first
+    /// declared extension function found (as a real `Value` — `Function`
+    /// or `Overload`) — mirrors `class::lookup_method`'s exact shape, just
+    /// checking `self.extension_functions` at each step instead of
+    /// `class.methods`. Works uniformly for a real user object's class
+    /// chain *and* a builtin primitive's chain (`self.builtin_classes`
+    /// entries are real `ClassValue`s too — see `class::builtin_classes`),
+    /// so both call sites in `ExprKind::MethodCall`'s own handling share
+    /// this one implementation, and it's automatically forward-compatible
+    /// with real multi-level inheritance once Phase 7 lands (the chain
+    /// just gets longer — no change needed here then).
+    fn lookup_extension_function(&self, class: &Rc<crate::class::ClassValue>, method: &str) -> Option<Value> {
+        let mut current = Some(class.clone());
+        while let Some(c) = current {
+            if let Some(v) = self.extension_functions.get(&(c.name.clone(), method.to_string())) {
+                return Some(v.clone());
+            }
+            current = c.superclass.clone();
+        }
+        None
+    }
+
+    /// Calls `v` (a `Value::Function`/`Value::Overload` found via
+    /// `lookup_extension_function`) with `this` bound first — the
+    /// extension-function counterpart of `call_value`, reusing
+    /// `call_method` (not `call_function`) so `this` is bound exactly the
+    /// same way a real class method's own `MethodImpl::UserDefined`
+    /// dispatch already binds it. Real overload resolution (`Value::
+    /// Overload`) reuses the exact same `types::resolve_overload` core
+    /// `call_overload` already uses — `call_overload` itself can't be
+    /// reused unchanged since it has no `this` to bind at all.
+    fn call_extension(&mut self, v: &Value, this: Value, args: Vec<(Option<String>, Value)>, span: Span) -> Result<Value, Flow> {
+        match v {
+            Value::Function(f) => self.call_method(f, this, args, span),
+            Value::Overload(group) => {
+                let name = group[0].name.as_deref().unwrap_or("<extension>");
+                let arg_types: Vec<crate::types::Type> = args.iter().map(|(_, v)| crate::types::Type::from_value(v)).collect();
+                let candidate_param_types: Vec<Vec<crate::types::Type>> =
+                    group.iter().map(|f| crate::types::function_signature_types(f).0).collect();
+                let candidate_params: Vec<&[crate::types::Type]> = candidate_param_types.iter().map(Vec::as_slice).collect();
+                match crate::types::resolve_overload(&candidate_params, &arg_types) {
+                    crate::types::OverloadResolution::Unique(i) => self.call_method(&group[i], this, args, span),
+                    crate::types::OverloadResolution::ArityMismatch => Err(RuntimeError::new(
+                        format!("no overload of '{name}' accepts {} argument(s)", arg_types.len()),
+                        span,
+                    )
+                    .into()),
+                    crate::types::OverloadResolution::NoMatch => {
+                        let arg_list = arg_types.iter().map(crate::types::Type::name).collect::<Vec<_>>().join(", ");
+                        Err(RuntimeError::new(format!("no overload of '{name}' matches argument types ({arg_list})"), span).into())
+                    }
+                    crate::types::OverloadResolution::Ambiguous(_) => {
+                        Err(RuntimeError::new(format!("ambiguous call to overloaded extension function '{name}'"), span).into())
+                    }
+                }
+            }
+            other => Err(RuntimeError::new(format!("'{}' is not callable", other.type_name()), span).into()),
+        }
     }
 
     /// Renders `v` for `println`/`print`/string-interpolation — matches
@@ -1537,12 +1794,18 @@ fn iterate(v: Value, span: Span) -> Result<Vec<Value>, Flow> {
 /// precisely (see `resolve_type_annotation_here`).
 impl<'a> Interpreter<'a> {
     fn check_type(&self, annotation: &TypeAnnotation, v: &Value, span: Span) -> Result<crate::types::Type, Flow> {
-        check_type(annotation, v, span, &self.known_classes)
+        check_type(annotation, v, span, &self.known_classes, &self.known_type_aliases)
     }
 }
 
-fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span, known_classes: &HashSet<Rc<str>>) -> Result<crate::types::Type, Flow> {
-    let expected = crate::types::resolve_type_annotation(annotation, &[], known_classes);
+fn check_type(
+    annotation: &TypeAnnotation,
+    v: &Value,
+    span: Span,
+    known_classes: &HashSet<Rc<str>>,
+    known_type_aliases: &HashMap<Rc<str>, crate::types::Type>,
+) -> Result<crate::types::Type, Flow> {
+    let expected = crate::types::resolve_type_annotation(annotation, &[], known_classes, known_type_aliases);
     if let Some(name) = top_level_named_name(annotation) {
         let unresolved = match &expected {
             crate::types::Type::Unknown => true,
@@ -1562,6 +1825,27 @@ fn check_type(annotation: &TypeAnnotation, v: &Value, span: Span, known_classes:
             span,
         )
         .into())
+    }
+}
+
+/// Whether `class` itself, or any class it transitively extends (walking
+/// `ClassValue.superclass`), is named `name` — the real IS-A check
+/// `Interpreter::find_matching_catch` uses to match a thrown value's
+/// runtime class against a `catch` clause's declared type, e.g.
+/// `RuntimeException` walks to `Exception` on its second step, so
+/// `catch (e: Exception)` catches a thrown `RuntimeException` too. Same
+/// walk shape as `class::lookup_method`, just comparing names instead of
+/// looking up a method.
+fn class_is_or_extends(class: &Rc<crate::class::ClassValue>, name: &str) -> bool {
+    let mut current = class;
+    loop {
+        if current.name.as_ref() == name {
+            return true;
+        }
+        match &current.superclass {
+            Some(s) => current = s,
+            None => return false,
+        }
     }
 }
 
@@ -2703,5 +2987,181 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
     fn increment_an_undefined_name_is_a_runtime_error() {
         let err = run_err("x++\n");
         assert!(err.contains("undefined name 'x'"), "{err}");
+    }
+
+    // ---- try/catch/finally, throw ----
+
+    #[test]
+    fn a_thrown_exception_is_caught_by_its_own_exact_class() {
+        let src = "try {\n    throw Exception(\"boom\")\n} catch (e: Exception) {\n    println(e.message)\n}\n";
+        assert_eq!(run(src), "boom\n");
+    }
+
+    #[test]
+    fn a_thrown_runtime_exception_is_caught_by_the_ancestor_exception_type() {
+        // Real IS-A via `ClassValue.superclass`, not string comparison —
+        // `RuntimeException`'s superclass is `Exception` (`class::
+        // builtin_classes`).
+        let src = "try {\n    throw RuntimeException(\"oops\")\n} catch (e: Exception) {\n    println(e.message)\n}\n";
+        assert_eq!(run(src), "oops\n");
+    }
+
+    #[test]
+    fn a_thrown_exception_that_matches_no_catch_propagates_past_the_try() {
+        // `RuntimeException` does NOT catch a plain `Exception` — the
+        // superclass walk only goes one direction.
+        let src = "fun f() {\n    try {\n        throw Exception(\"boom\")\n    } catch (e: RuntimeException) {\n        println(\"never\")\n    }\n}\nf()\n";
+        let err = run_err(src);
+        assert!(err.contains("uncaught exception"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn catches_are_tried_in_order_first_match_wins() {
+        let src = "try {\n    throw RuntimeException(\"x\")\n} catch (e: RuntimeException) {\n    println(\"specific\")\n} catch (e: Exception) {\n    println(\"general\")\n}\n";
+        assert_eq!(run(src), "specific\n");
+    }
+
+    #[test]
+    fn try_is_usable_as_a_value_producing_expression() {
+        let src = "val x = try {\n    1\n} catch (e: Exception) {\n    2\n}\nprintln(x)\n";
+        assert_eq!(run(src), "1\n");
+
+        let src2 = "val x = try {\n    throw Exception(\"x\")\n} catch (e: Exception) {\n    2\n}\nprintln(x)\n";
+        assert_eq!(run(src2), "2\n");
+    }
+
+    #[test]
+    fn finally_runs_when_the_try_body_throws_and_is_caught() {
+        let src = "try {\n    throw Exception(\"x\")\n} catch (e: Exception) {\n    println(\"caught\")\n} finally {\n    println(\"finally\")\n}\n";
+        assert_eq!(run(src), "caught\nfinally\n");
+    }
+
+    #[test]
+    fn finally_runs_when_no_exception_is_thrown_at_all() {
+        let src = "try {\n    println(\"body\")\n} finally {\n    println(\"finally\")\n}\n";
+        assert_eq!(run(src), "body\nfinally\n");
+    }
+
+    #[test]
+    fn finally_runs_even_when_no_catch_matches_and_the_exception_keeps_propagating() {
+        let src = "fun f() {\n    try {\n        throw Exception(\"boom\")\n    } catch (e: RuntimeException) {\n        println(\"never\")\n    } finally {\n        println(\"finally\")\n    }\n}\nf()\n";
+        let mut out = Vec::new();
+        let result = crate::run_source(src, &mut out, std::path::Path::new("."), None);
+        assert!(result.is_err(), "expected the uncaught exception to still propagate");
+        assert_eq!(String::from_utf8(out).unwrap(), "finally\n");
+    }
+
+    #[test]
+    fn finally_runs_when_a_return_propagates_through_the_try() {
+        let src = "fun f(): Int {\n    try {\n        return 1\n    } finally {\n        println(\"finally\")\n    }\n}\nprintln(f())\n";
+        assert_eq!(run(src), "finally\n1\n");
+    }
+
+    #[test]
+    fn finally_runs_when_break_propagates_through_the_try() {
+        let src = "for (i in listOf(1)) {\n    try {\n        break\n    } finally {\n        println(\"finally\")\n    }\n}\nprintln(\"after\")\n";
+        assert_eq!(run(src), "finally\nafter\n");
+    }
+
+    #[test]
+    fn a_finally_that_itself_throws_overrides_the_original_exception() {
+        let src = "fun f() {\n    try {\n        throw Exception(\"original\")\n    } finally {\n        throw Exception(\"from finally\")\n    }\n}\nf()\n";
+        let err = run_err(src);
+        assert!(err.contains("from finally"), "{err}");
+        assert!(!err.contains("original"), "{err}");
+    }
+
+    #[test]
+    fn an_uncaught_exception_at_the_top_level_reports_class_name_and_message() {
+        let err = run_err("throw RuntimeException(\"kaboom\")\n");
+        assert!(err.contains("uncaught exception"), "{err}");
+        assert!(err.contains("RuntimeException: kaboom"), "{err}");
+    }
+
+    // ---- extension functions ----
+
+    #[test]
+    fn an_extension_function_executes_and_returns_its_value() {
+        let src = "fun String.shout(): String = uppercase(this) + \"!\"\nprintln(\"hi\".shout())\n";
+        assert_eq!(run(src), "HI!\n");
+    }
+
+    #[test]
+    fn calling_an_extension_functions_bare_name_is_undefined() {
+        // Same, pre-existing "undefined bare name surfaces only as a
+        // runtime error" behavior an ordinary conflicting-overload
+        // declaration already has (the resolver's own diagnostic for this
+        // lives in `diagnostics`, not the execution-blocking `type_errors`
+        // — see `resolve_name`) — not something specific to extensions.
+        let src = "fun String.shout(): String = uppercase(this) + \"!\"\nprintln(shout(\"hi\"))\n";
+        let err = run_err(src);
+        assert!(err.contains("undefined name 'shout'"), "{err}");
+    }
+
+    #[test]
+    fn a_class_method_wins_over_a_same_named_extension_at_runtime() {
+        let src = "class Greeter {\n    fun hello() = \"member\"\n}\nfun Greeter.hello() = \"extension\"\nprintln(Greeter().hello())\n";
+        assert_eq!(run(src), "member\n");
+    }
+
+    #[test]
+    fn extension_dispatches_via_the_shared_ancestor_chain_walk_on_any_receiver_kind() {
+        // `Any`: works on every kind of value at all (a real object here).
+        let src_any = "class Foo\nfun Any.describe(): String = \"any\"\nprintln(Foo().describe())\n";
+        assert_eq!(run(src_any), "any\n");
+
+        // `Number`: works on both `Int` and `Double`.
+        let src_number = "fun Number.half(): Double = 1.0\nprintln(5.half())\nprintln(5.5.half())\n";
+        assert_eq!(run(src_number), "1\n1\n");
+
+        // Declared directly on `String`.
+        let src_string = "fun String.shout(): String = this + \"!\"\nprintln(\"hi\".shout())\n";
+        assert_eq!(run(src_string), "hi!\n");
+
+        // Declared directly on a user class.
+        let src_class = "class Point(val x: Int, val y: Int)\nfun Point.sum(): Int = x + y\nprintln(Point(3, 4).sum())\n";
+        assert_eq!(run(src_class), "7\n");
+    }
+
+    #[test]
+    fn overloaded_extension_call_dispatches_by_runtime_argument_type() {
+        let src = "fun String.combine(a: Int): String = this + a.toString()\nfun String.combine(a: String): String = this + a\nprintln(\"x\".combine(5))\nprintln(\"x\".combine(\"y\"))\n";
+        assert_eq!(run(src), "x5\nxy\n");
+    }
+
+    #[test]
+    fn named_argument_in_an_extension_call_on_a_primitive_binds_by_name() {
+        let src = "fun Int.between(low: Int, high: Int): Boolean = this >= low && this <= high\nprintln(5.between(high = 10, low = 0))\n";
+        assert_eq!(run(src), "true\n");
+    }
+
+    /// Guards the same trial-deletion correctness `collect_cycles_does_not_
+    /// clear_a_function_still_reachable_from_globals` already covers for an
+    /// ordinary top-level `fun`, but for `Interpreter::extension_functions`
+    /// — a plain `HashMap`, not an `Env`, so nothing traces *into* it the
+    /// way `EnvData::vars` is traced; each stored closure's own `Env`
+    /// handle is only ever "externally" held (from this map, off the
+    /// tracked graph, exactly like `self.globals` itself already is), which
+    /// is what the count-based (`Rc::strong_count`) trial-deletion
+    /// algorithm already treats correctly with no special-casing needed —
+    /// this test is the regression guard for that reasoning.
+    #[test]
+    fn collect_cycles_does_not_clear_an_extension_function_still_reachable() {
+        let src = "fun Int.double(): Int { return this * 2 }\n";
+        let program = crate::parse_only(src).expect("valid syntax");
+        let mut out = Vec::new();
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+
+        interp.collect_cycles();
+
+        let f = interp
+            .extension_functions
+            .get(&(std::rc::Rc::from("Int"), "double".to_string()))
+            .cloned()
+            .expect("double is defined");
+        let result = interp.call_extension(&f, crate::value::Value::Int(21), Vec::new(), crate::error::Span::default());
+        assert!(matches!(result, Ok(crate::value::Value::Int(42))), "double() should still work after collect_cycles");
     }
 }

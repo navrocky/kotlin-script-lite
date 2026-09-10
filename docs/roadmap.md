@@ -100,6 +100,117 @@ Decisions already made that shape this plan:
   design (6.7) the same conversation surfaced as a separate, later,
   explicitly-deferred want.
 
+## Features to support
+
+Based on Kotlin's [keyword and operator reference](https://kotlinlang.org/docs/keyword-reference.html).
+`Partial` means that only the described ksl use is supported.
+
+| keyword | supported | short description |
+|---|---|---|
+| `as` | No | Cast or import alias |
+| `as?` | No | Safe cast |
+| `break` | Yes | Exit loop |
+| `class` | Yes | Declare class |
+| `continue` | Yes | Next loop iteration |
+| `do` | Yes | Postcondition loop |
+| `else` | Yes | Fallback branch |
+| `false` | Yes | Boolean false |
+| `for` | Yes | Iteration loop |
+| `fun` | Yes | Declare function |
+| `if` | Yes | Conditional expression |
+| `in` | Partial | `for` loop separator |
+| `!in` | No | Non-membership test |
+| `interface` | No | Declare interface |
+| `is` | No | Type test |
+| `!is` | No | Negated type test |
+| `null` | Yes | Null value |
+| `object` | No | Declare object |
+| `package` | Yes | Declare package |
+| `return` | Yes | Return from function |
+| `super` | No | Superclass reference |
+| `this` | Yes | Current receiver |
+| `throw` | Yes | Throw exception |
+| `true` | Yes | Boolean true |
+| `try` | Yes | Handle exceptions |
+| `typealias` | Yes | Declare type alias |
+| `typeof` | No | Reserved keyword |
+| `val` | Yes | Read-only binding |
+| `var` | Yes | Mutable binding |
+| `when` | Yes | Multi-branch expression |
+| `while` | Yes | Precondition loop |
+| `by` | No | Delegation |
+| `catch` | Yes | Catch exception |
+| `constructor` | No | Explicit constructor |
+| `delegate` | No | Annotation target |
+| `dynamic` | Not planned | Dynamic JS type |
+| `field` | No | Backing field |
+| `file` | Partial | `@file:Import` target |
+| `finally` | Yes | Finalization block |
+| `get` | No | Property getter |
+| `import` | Yes | Import declaration |
+| `init` | Yes | Initializer block |
+| `param` | No | Annotation target |
+| `property` | No | Annotation target |
+| `receiver` | No | Annotation target |
+| `set` | No | Property setter |
+| `setparam` | No | Annotation target |
+| `value` | No | Value class |
+| `where` | No | Generic constraints |
+| `abstract` | No | Abstract declaration |
+| `actual` | Not planned | Platform implementation |
+| `annotation` | No | Annotation class |
+| `companion` | No | Companion object |
+| `const` | No | Compile-time constant |
+| `crossinline` | Not planned | Forbid non-local return |
+| `data` | No | Data class |
+| `enum` | No | Enum class |
+| `expect` | Not planned | Expected declaration |
+| `external` | No | External implementation |
+| `final` | No | Forbid overriding |
+| `infix` | No | Infix call syntax |
+| `inline` | No | Inline function |
+| `inner` | No | Inner class |
+| `internal` | No | Module visibility |
+| `lateinit` | No | Deferred initialization |
+| `noinline` | No | Disable lambda inlining |
+| `open` | No | Allow inheritance |
+| `operator` | No | Operator overload |
+| `out` | No | Covariant parameter |
+| `override` | No | Override member |
+| `private` | No | Private visibility |
+| `protected` | No | Protected visibility |
+| `public` | No | Public visibility |
+| `reified` | No | Runtime type parameter |
+| `sealed` | No | Sealed hierarchy |
+| `suspend` | No | Suspending declaration |
+| `tailrec` | No | Tail recursion hint |
+| `vararg` | No | Variable arguments |
+| `it` | Yes | Implicit lambda parameter |
+| `+`, `-`, `*`, `/`, `%` | Yes | Arithmetic operators |
+| `*` (spread) | No | Spread argument |
+| `=` | Yes | Assignment or default |
+| `+=`, `-=`, `*=`, `/=`, `%=` | Yes | Augmented assignment |
+| `++`, `--` | Yes | Increment or decrement |
+| `&&`, `\|\|`, `!` | Yes | Logical operators |
+| `==`, `!=` | Yes | Structural equality |
+| `===`, `!==` | No | Referential equality |
+| `<`, `>`, `<=`, `>=` | Yes | Comparison operators |
+| `[`, `]` | No | Indexed access |
+| `!!` | Yes | Non-null assertion |
+| `?.` | Yes | Safe call |
+| `?:` | Yes | Elvis operator |
+| `::` | No | Callable reference |
+| `.` | Partial | Members and qualified names |
+| `..` | Yes | Closed range |
+| `..<` | No | Half-open range |
+| `:` | Yes | Type separator |
+| `?` | Yes | Nullable type |
+| `->` | Yes | Lambda, type, or branch |
+| `@` | Partial | File import annotation |
+| `;` | Yes | Statement separator |
+| `$` | Yes | String template |
+| `_` | No | Unused binding |
+
 ## Dependency order
 
 ```
@@ -128,8 +239,11 @@ Phase 4: null-safety (Value::Null, ?, ?., ?:, !!)   [DONE]
 Phase 4.5: Any & Nothing (top/bottom types) [DONE]  <-- needs only Phase 2 (types.rs); no classes/interfaces required
    |
    v
-Phase 5: try/catch (Flow::Throw, minimal Value::Error)  <-- Throw's type is Phase 4.5's Type::Nothing
-   |
+Phase 5: try/catch/finally, throw [DONE]  <-- Throw's type is Phase 4.5's Type::Nothing.
+   |    Implemented AFTER Phase 6 (classes) despite this graph position —
+   |    see Phase 5's own section for why: `Exception`/`RuntimeException`
+   |    ended up as real builtin classes (`Value::Object`), not the
+   |    original `Value::Error` design, once Phase 6 already existed.
    v
 Phase 6: classes/objects [DONE]  <-- needs Phase 1 (+ Phase 2 reserves Type::Class for it)
    |
@@ -147,8 +261,10 @@ Phase 6.5: interfaces  <-- needs Phase 6 (classes to implement them, class.rs to
 Phase 7: inheritance  <-- needs Phase 6 (+ extends Phase 2's is_assignable for subtyping,
    |    now also covering Phase 6.5's interface-conformance subtyping)
    v
-Phase 8: extension functions  <-- needs Phase 1 (+ benefits from Phase 6's call_method path)
-   |
+Phase 8: extension functions [DONE]  <-- needs Phase 1 (+ benefits from Phase 6's call_method path).
+   |    Implemented ahead of 6.5 (interfaces)/7 (inheritance) despite this
+   |    graph position — neither is a real prerequisite, just where this
+   |    phase was originally sequenced; see Phase 8's own section.
    v
 Phase 9: generics (statically parameterized, runtime-erased — revised, see
    Phase 9's own section; Phase 2 reserves Type::Generic for it)
@@ -1598,7 +1714,26 @@ Foo()` type-checks as `Int` with no errors.
 
 ---
 
-## Phase 5 — `try`/`catch`
+## Phase 5 — `try`/`catch` [DONE]
+
+**Implementation note (post-Phase-6 divergence from the text below):** by
+the time this phase was actually implemented, Phase 6 (classes) had
+already shipped, so the design below's own "minimal `Value::Error`" plan
+was superseded before being built. `Exception`/`RuntimeException` ended up
+as **real builtin classes** (`class::builtin_classes`, `Value::Object`
+instances built by native constructors in `stdlib::exceptions` — not
+`construct_object`, since builtin classes have no
+`constructor_params`/`constructor_body`), giving `catch` a real, free
+superclass-chain IS-A match (`interpreter.rs`'s `find_matching_catch`)
+instead of the hard-coded string comparison described below — exactly the
+"Phase 6 can later reimplement as sugar over `Value::Object`" escape hatch
+this text already called for, just done immediately instead of in two
+steps. `Flow::Throw(Value)` and everything else below (the `Nothing`
+typing, the `finally`-always-runs contract, `Flow::Error` staying separate
+and uncatchable) was implemented exactly as designed. `typealias` was
+added in the same pass, at the user's request — see `docs/syntax.md`'s
+"Type aliases" section; it's unrelated to `try`/`catch` (pure
+resolver/type-system, no runtime changes) and isn't covered further here.
 
 Requires Phase 4.5 (`Type::Nothing` is `throw`'s real static type — see
 below; without it this phase would have nowhere correct to put that type
@@ -1977,7 +2112,22 @@ override dispatch (always the *runtime* class's method wins),
 
 ---
 
-## Phase 8 — Extension functions
+## Phase 8 — Extension functions [DONE]
+
+**Implementation note:** built exactly as designed below, with two
+resolutions the original text left open. **Overloading**: extension
+functions support real overloading (`fun String.foo(a: Int)`/`fun
+String.foo(a: String)` both legal, resolved by argument type), reusing
+`types::resolve_overload` — the storage keyed `(receiver_type_name,
+method_name) -> Vec<Symbol index>` (resolver) / `-> Value` (interpreter,
+`Value::Function`/`Value::Overload`, the same shape an ordinary top-level
+`fun` already uses). **`semantic_tokens.rs`**: deliberately left
+unchanged — every type-annotation identifier (e.g. `Int` in `val x: Int`)
+is already unclassified, generic `Ident` text (`token_type_index`'s
+`Ident(_) => return None`), so leaving an extension's own receiver-type
+prefix unclassified too is consistency with existing behavior, not a
+regression; special-casing just this one identifier position would have
+been the actual inconsistency.
 
 Requires Phase 1 (dot-call syntax is the extension-function call site);
 benefits from Phase 6's `call_method`-style `this`-binding path, which is

@@ -18,7 +18,7 @@
 //! to start populating a registry (`known_classes`/`generic_params`) rather
 //! than redesign this enum or `resolve_type_hint`'s signature.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::TypeAnnotation;
@@ -152,16 +152,17 @@ impl Type {
 pub fn function_signature_types(f: &crate::value::FunctionValue) -> (Vec<Type>, Type) {
     let empty_params: Vec<String> = Vec::new();
     let empty_classes: HashSet<Rc<str>> = HashSet::new();
+    let empty_aliases: HashMap<Rc<str>, Type> = HashMap::new();
     let param_types = f
         .params
         .iter()
         .map(|p| match &p.type_annotation {
-            Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
+            Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes, &empty_aliases),
             None => Type::Unknown,
         })
         .collect();
     let ret_ty = match &f.return_type {
-        Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes),
+        Some(ann) => resolve_type_annotation(ann, &empty_params, &empty_classes, &empty_aliases),
         None => Type::Unknown,
     };
     (param_types, ret_ty)
@@ -205,7 +206,12 @@ pub const PRIMITIVE_TYPES: &[(&str, Type)] = &[
     ("Nothing", Type::Nothing),
 ];
 
-fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &HashSet<Rc<str>>) -> Type {
+fn resolve_type_hint(
+    hint: &str,
+    generic_params: &[String],
+    known_classes: &HashSet<Rc<str>>,
+    known_type_aliases: &HashMap<Rc<str>, Type>,
+) -> Type {
     // `Number` sits between `Any` and `Int`/`Double` in the real builtin
     // class hierarchy (`class::builtin_classes`) but, unlike the rest of
     // `PRIMITIVE_TYPES`, has no dedicated `Type` variant of its own — it's
@@ -217,16 +223,41 @@ fn resolve_type_hint(hint: &str, generic_params: &[String], known_classes: &Hash
     if hint == "Number" {
         return Type::Class(Rc::from("Number"));
     }
+    // `Exception`/`RuntimeException` — real builtin classes
+    // (`class::builtin_classes`) with no AST `class` declaration to
+    // populate `known_classes` from, same barrier as `"Number"` just
+    // above. See `is_throwable_class`, just below, for the one place this
+    // distinction actually matters (validating a `throw`'s operand type).
+    if hint == "Exception" || hint == "RuntimeException" {
+        return Type::Class(Rc::from(hint));
+    }
     if let Some((_, ty)) = PRIMITIVE_TYPES.iter().find(|(name, _)| *name == hint) {
         return ty.clone();
     }
     if generic_params.iter().any(|p| p == hint) {
         return Type::Generic(hint.into());
     }
+    // Checked before `known_classes`: an alias's own name never collides
+    // with a real class name (the resolver's predpass/`define` would flag
+    // that as "already declared"), so the order here is only load-bearing
+    // in that it's *some* fixed order — see `resolve_type_annotation`'s
+    // doc comment.
+    if let Some(ty) = known_type_aliases.get(hint) {
+        return ty.clone();
+    }
     if known_classes.contains(hint) {
         return Type::Class(hint.into());
     }
     Type::Unknown
+}
+
+/// Whether `name` is a class `throw` may legally throw an instance of —
+/// today, a fixed allowlist of exactly the two builtin throwable classes
+/// (`class::builtin_classes`), since ksl has no `class Foo : Exception()`
+/// inheritance syntax yet for a user-defined subclass to widen this set
+/// with. Used by `resolver.rs`'s `ExprKind::Throw` handling.
+pub fn is_throwable_class(name: &str) -> bool {
+    matches!(name, "Exception" | "RuntimeException")
 }
 
 /// Resolves a full `TypeAnnotation` tree (a plain name, or a function type
@@ -241,18 +272,24 @@ pub fn resolve_type_annotation(
     ann: &TypeAnnotation,
     generic_params: &[String],
     known_classes: &HashSet<Rc<str>>,
+    known_type_aliases: &HashMap<Rc<str>, Type>,
 ) -> Type {
     match ann {
-        TypeAnnotation::Named(name, _) => resolve_type_hint(name, generic_params, known_classes),
+        TypeAnnotation::Named(name, _) => resolve_type_hint(name, generic_params, known_classes, known_type_aliases),
         TypeAnnotation::Function(params, ret, _) => {
-            let param_types =
-                params.iter().map(|p| resolve_type_annotation(p, generic_params, known_classes)).collect();
-            let ret_ty = resolve_type_annotation(ret, generic_params, known_classes);
+            let param_types = params
+                .iter()
+                .map(|p| resolve_type_annotation(p, generic_params, known_classes, known_type_aliases))
+                .collect();
+            let ret_ty = resolve_type_annotation(ret, generic_params, known_classes, known_type_aliases);
             Type::Function(param_types, Box::new(ret_ty))
         }
-        TypeAnnotation::Nullable(inner, _) => {
-            Type::Nullable(Box::new(resolve_type_annotation(inner, generic_params, known_classes)))
-        }
+        TypeAnnotation::Nullable(inner, _) => Type::Nullable(Box::new(resolve_type_annotation(
+            inner,
+            generic_params,
+            known_classes,
+            known_type_aliases,
+        ))),
     }
 }
 
@@ -384,6 +421,10 @@ pub fn resolve_overload(candidate_params: &[&[Type]], arg_types: &[Type]) -> Ove
 mod tests {
     use super::*;
 
+    fn empty_aliases() -> HashMap<Rc<str>, Type> {
+        HashMap::new()
+    }
+
     #[test]
     fn resolve_type_hint_known_primitives() {
         let empty_params: Vec<String> = Vec::new();
@@ -396,7 +437,7 @@ mod tests {
             ("Unit", Type::Unit),
             ("List", Type::List),
         ] {
-            assert_eq!(resolve_type_hint(hint, &empty_params, &empty_classes), expected);
+            assert_eq!(resolve_type_hint(hint, &empty_params, &empty_classes, &empty_aliases()), expected);
         }
     }
 
@@ -412,7 +453,7 @@ mod tests {
         let empty_params: Vec<String> = Vec::new();
         let empty_classes: HashSet<Rc<str>> = HashSet::new();
         for (name, expected_ty) in PRIMITIVE_TYPES {
-            let ty = resolve_type_hint(name, &empty_params, &empty_classes);
+            let ty = resolve_type_hint(name, &empty_params, &empty_classes, &empty_aliases());
             assert_eq!(&ty, expected_ty, "{name} should resolve to {expected_ty:?}");
         }
     }
@@ -421,7 +462,7 @@ mod tests {
     fn resolve_type_hint_unrecognized_name_is_unknown() {
         let empty_params: Vec<String> = Vec::new();
         let empty_classes: HashSet<Rc<str>> = HashSet::new();
-        assert_eq!(resolve_type_hint("Frobnicator", &empty_params, &empty_classes), Type::Unknown);
+        assert_eq!(resolve_type_hint("Frobnicator", &empty_params, &empty_classes, &empty_aliases()), Type::Unknown);
     }
 
     /// Forward-compat contract for the not-yet-implemented classes/generics
@@ -431,7 +472,7 @@ mod tests {
     fn resolve_type_hint_generic_param_in_scope() {
         let params = vec!["T".to_string()];
         let classes: HashSet<Rc<str>> = HashSet::new();
-        assert_eq!(resolve_type_hint("T", &params, &classes), Type::Generic("T".into()));
+        assert_eq!(resolve_type_hint("T", &params, &classes, &empty_aliases()), Type::Generic("T".into()));
     }
 
     #[test]
@@ -439,7 +480,30 @@ mod tests {
         let params: Vec<String> = Vec::new();
         let mut classes: HashSet<Rc<str>> = HashSet::new();
         classes.insert("Dog".into());
-        assert_eq!(resolve_type_hint("Dog", &params, &classes), Type::Class("Dog".into()));
+        assert_eq!(resolve_type_hint("Dog", &params, &classes, &empty_aliases()), Type::Class("Dog".into()));
+    }
+
+    #[test]
+    fn resolve_type_hint_known_type_alias() {
+        let params: Vec<String> = Vec::new();
+        let classes: HashSet<Rc<str>> = HashSet::new();
+        let mut aliases: HashMap<Rc<str>, Type> = HashMap::new();
+        aliases.insert("Age".into(), Type::Int);
+        assert_eq!(resolve_type_hint("Age", &params, &classes, &aliases), Type::Int);
+    }
+
+    #[test]
+    fn resolve_type_hint_type_alias_takes_priority_over_known_classes() {
+        // An alias may itself name a class — the order between the two
+        // checks only matters in that it's consistent, but this locks in
+        // that a `typealias` entry is always consulted (see
+        // `resolve_type_hint`'s own doc comment on ordering).
+        let params: Vec<String> = Vec::new();
+        let mut classes: HashSet<Rc<str>> = HashSet::new();
+        classes.insert("Dog".into());
+        let mut aliases: HashMap<Rc<str>, Type> = HashMap::new();
+        aliases.insert("Pet".into(), Type::Class("Dog".into()));
+        assert_eq!(resolve_type_hint("Pet", &params, &classes, &aliases), Type::Class("Dog".into()));
     }
 
     #[test]
@@ -536,8 +600,8 @@ mod tests {
     fn resolve_type_hint_any_and_nothing() {
         let empty_params: Vec<String> = Vec::new();
         let empty_classes: HashSet<Rc<str>> = HashSet::new();
-        assert_eq!(resolve_type_hint("Any", &empty_params, &empty_classes), Type::Any);
-        assert_eq!(resolve_type_hint("Nothing", &empty_params, &empty_classes), Type::Nothing);
+        assert_eq!(resolve_type_hint("Any", &empty_params, &empty_classes, &empty_aliases()), Type::Any);
+        assert_eq!(resolve_type_hint("Nothing", &empty_params, &empty_classes, &empty_aliases()), Type::Nothing);
     }
 
     #[test]
@@ -657,7 +721,7 @@ mod tests {
         let empty_params: Vec<String> = Vec::new();
         let empty_classes: HashSet<Rc<str>> = HashSet::new();
         let ann = TypeAnnotation::Named("Int".to_string(), crate::error::Span::default());
-        assert_eq!(resolve_type_annotation(&ann, &empty_params, &empty_classes), Type::Int);
+        assert_eq!(resolve_type_annotation(&ann, &empty_params, &empty_classes, &empty_aliases()), Type::Int);
     }
 
     #[test]
@@ -670,7 +734,7 @@ mod tests {
             Box::new(TypeAnnotation::Named("Boolean".to_string(), span)),
             span,
         );
-        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes, &empty_aliases());
         assert_eq!(resolved, Type::Function(vec![Type::Int, Type::String], Box::new(Type::Bool)));
     }
 
@@ -684,7 +748,7 @@ mod tests {
             Box::new(TypeAnnotation::Named("Int".to_string(), span)),
             span,
         );
-        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes, &empty_aliases());
         assert_eq!(resolved, Type::Function(vec![Type::Unknown], Box::new(Type::Int)));
     }
 
@@ -695,7 +759,7 @@ mod tests {
         let span = crate::error::Span::default();
         let ann =
             TypeAnnotation::Nullable(Box::new(TypeAnnotation::Named("String".to_string(), span)), span);
-        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes, &empty_aliases());
         assert_eq!(resolved, Type::Nullable(Box::new(Type::String)));
     }
 
@@ -710,7 +774,7 @@ mod tests {
             span,
         );
         let ann = TypeAnnotation::Nullable(Box::new(fn_ann), span);
-        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes);
+        let resolved = resolve_type_annotation(&ann, &empty_params, &empty_classes, &empty_aliases());
         assert_eq!(
             resolved,
             Type::Nullable(Box::new(Type::Function(vec![Type::Int], Box::new(Type::String))))

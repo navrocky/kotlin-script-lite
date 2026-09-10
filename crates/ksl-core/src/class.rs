@@ -167,7 +167,16 @@ pub fn builtin_classes() -> HashMap<&'static str, Rc<ClassValue>> {
     map.insert("Boolean", make("Boolean", Some(any.clone()), Vec::new()));
     map.insert("String", make("String", Some(any.clone()), vec!["CharSequence", "Comparable"]));
     map.insert("List", make("List", Some(any.clone()), Vec::new()));
-    map.insert("Unit", make("Unit", Some(any), Vec::new()));
+    map.insert("Unit", make("Unit", Some(any.clone()), Vec::new()));
+    // `Exception`/`RuntimeException` — see `stdlib::exceptions` for their
+    // real, native-function constructors (not `construct_object`, since
+    // neither has a `constructor_params`/`constructor_body` — see this
+    // function's own doc comment) and `interpreter.rs`'s `ExprKind::Try`
+    // handling for how `catch` walks this same `superclass` chain to match
+    // a thrown value against a catch clause's declared type.
+    let exception = make("Exception", Some(any), Vec::new());
+    map.insert("Exception", exception.clone());
+    map.insert("RuntimeException", make("RuntimeException", Some(exception), Vec::new()));
     map
 }
 

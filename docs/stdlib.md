@@ -157,12 +157,44 @@ println("  Loud  ".trim().uppercase())   // "LOUD" — methods chain
 above, which unlike these have no bare-function form at all (`get`/`set`/
 `add`/`size()` are never callable as plain `get(xs, 0)`, matching real
 Kotlin's own `MutableList`). Every user-declared `class` has real
-fields/methods too (`docs/syntax.md`'s "Classes"). Nothing else has
-methods — a bare `receiver.name` is otherwise
-ambiguous with a package-qualified reference (`util.math.square`, see
-`syntax.md`'s "Packages"); this is resolved by trying `receiver` as a
-local value first and only falling back to a package lookup if it isn't
-one — so a local variable always wins over a same-named package.
+fields/methods too (`docs/syntax.md`'s "Classes"), and so does `Exception`/
+`RuntimeException` (see [Exceptions](#exceptions) below). A bare
+`receiver.name` is otherwise ambiguous with a package-qualified reference
+(`util.math.square`, see `syntax.md`'s "Packages"); this is resolved by
+trying `receiver` as a local value first and only falling back to a
+package lookup if it isn't one — so a local variable always wins over a
+same-named package.
+
+## Exceptions
+
+`Exception(message: String)` and `RuntimeException(message: String)` are
+real, built-in classes, in package `kotlin` (so, like `println`,
+auto-imported and usable unqualified with no `import` at all) —
+`RuntimeException` extends `Exception`, which extends `Any`:
+
+```kotlin
+val e = RuntimeException("oops")
+println(e.message)     // "oops"
+println(e)              // "RuntimeException: oops" — a real toString() override
+```
+
+`e.message` is a real, readable field holding the constructor argument.
+`toString()` is overridden on `Exception` (inherited by `RuntimeException`)
+to print `"ClassName: message"` instead of `Any`'s default identity format
+— what makes an uncaught `throw` print something readable. See
+[`syntax.md`](syntax.md#exceptions) for `throw`/`try`/`catch`/`finally`
+itself. There's no user-defined exception hierarchy yet (no
+`class MyError : Exception(...)`) — these two are the only throwable
+classes.
+
+Unlike a user-thrown `Exception`, every error a **stdlib** function itself
+raises (an out-of-bounds `List.get`, `sqrt` of a negative number, and
+every other case described throughout this document) is a plain internal
+runtime error, not a `throw` — it can't be caught by a `try`/`catch`, only
+by fixing the call that caused it. This is a deliberate design decision,
+not a temporary gap: the reasoning is the same as the module doc comment
+above already states for how these are always reported (uncatchable,
+process-terminating, with a full stack trace).
 
 ## Math
 

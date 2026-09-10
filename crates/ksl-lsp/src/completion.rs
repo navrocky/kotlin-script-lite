@@ -507,8 +507,50 @@ fn package_path_completions(
             Some(ksl_core::types::Type::Class(name)) => items.extend(class_member_completions(analysis, name)),
             _ => items.extend(builtin_method_completions(receiver_type)),
         }
+        items.extend(extension_completions(analysis, receiver_type));
     }
     items
+}
+
+/// Every declared extension function whose own receiver type appears
+/// anywhere in `receiver_type`'s own ancestor chain (mirrors
+/// `resolver::Resolver::type_ancestor_chain`, unavoidably duplicated here
+/// exactly the way `builtin_method_completions`'s own `builtin_type_chain`
+/// walk already is — `ksl-core` only exposes `builtin_type_chain` itself,
+/// not the resolver's private chain-walking method) — offered
+/// unconditionally alongside real methods: real-method-wins precedence is
+/// a *dispatch*-time rule (`ExprKind::MethodCall`'s own handling), not a
+/// completion-time one — a name that would actually lose to a real member
+/// at call time is still worth showing, the same "never under-suggest"
+/// philosophy `builtin_method_completions` already has for itself. `None`
+/// receiver type yields nothing (unlike `builtin_method_completions`'s
+/// unconditional-when-absent fallback) — with no known type there's no
+/// principled ancestor-name chain to walk at all.
+fn extension_completions(analysis: &Analysis, receiver_type: Option<&ksl_core::types::Type>) -> Vec<CompletionItem> {
+    let Some(ty) = receiver_type else { return Vec::new() };
+    let name = match ty {
+        ksl_core::types::Type::Nullable(inner) => inner.name(),
+        other => other.name(),
+    };
+    let builtin_chain = ksl_core::stdlib::builtin_type_chain(&name);
+    let chain: Vec<String> = if !builtin_chain.is_empty() {
+        builtin_chain.into_iter().map(String::from).collect()
+    } else {
+        vec![name, "Any".to_string()]
+    };
+    let mut seen = std::collections::HashSet::new();
+    chain
+        .iter()
+        .flat_map(|n| analysis.resolved.table.extension_functions_for(n))
+        .filter(|s| seen.insert(s.name.clone()))
+        .map(|s| CompletionItem {
+            label: s.name.clone(),
+            kind: Some(symbol_completion_kind(s.kind)),
+            detail: Some(s.signature.clone()),
+            documentation: s.doc.clone().map(Documentation::String),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Every completable member of a real user class instance (or the
@@ -781,8 +823,11 @@ fn is_digits(s: &str) -> bool {
 fn symbol_completion_kind(kind: SymbolKind) -> CompletionItemKind {
     match kind {
         SymbolKind::Val | SymbolKind::Var | SymbolKind::Param | SymbolKind::Field => CompletionItemKind::VARIABLE,
-        SymbolKind::Fun | SymbolKind::Method => CompletionItemKind::FUNCTION,
+        SymbolKind::Fun | SymbolKind::Method | SymbolKind::ExtensionFun => CompletionItemKind::FUNCTION,
         SymbolKind::Class => CompletionItemKind::CLASS,
+        // No dedicated "type alias" kind exists in the LSP spec — `STRUCT`
+        // is the common convention other language servers use for one.
+        SymbolKind::TypeAlias => CompletionItemKind::STRUCT,
     }
 }
 
@@ -1117,6 +1162,14 @@ mod tests {
             // yet; offered unconditionally for now, same as every other
             // keyword here, until that lands.
             "class", "this",
+            // `try`/`throw` are genuinely legal anywhere a statement/
+            // expression can start, same as `fun`/`val`. `catch`/`finally`
+            // (only legal right after a `try` block/its catches) and
+            // `typealias` (only legal at the top level) have real grammar
+            // restrictions of their own that `keyword_allowed` doesn't gate
+            // on yet either — same accepted, unconditional-for-now gap
+            // `class`/`this` already have, above.
+            "try", "catch", "finally", "throw", "typealias",
         ];
         for kw in general_kws {
             assert!(general_names.contains(&kw.to_string()), "'{kw}' wasn't offered inside a function body");
@@ -1339,6 +1392,24 @@ mod tests {
         let names = labels(text, Position::new(1, 2));
         assert!(names.contains(&"uppercase".to_string()), "{names:?}");
         assert!(names.contains(&"length".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_builtin_receiver_also_offers_a_declared_extension() {
+        let text = "fun String.shout(): String = this\nval s = \"hi\"\ns.uppercase()\n";
+        // "s." is 2 chars, cursor right after the dot on line 3 (0-based 2).
+        let names = labels(text, Position::new(2, 2));
+        assert!(names.contains(&"uppercase".to_string()), "{names:?}");
+        assert!(names.contains(&"shout".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn completion_after_a_dot_on_a_user_class_also_offers_a_declared_extension() {
+        let text = "class Point(val x: Int)\nfun Point.magnitude(): Int = x\nval p = Point(1)\np.magnitude()\n";
+        // "p." is 2 chars, cursor right after the dot on line 4 (0-based 3).
+        let names = labels(text, Position::new(3, 2));
+        assert!(names.contains(&"x".to_string()), "{names:?}");
+        assert!(names.contains(&"magnitude".to_string()), "{names:?}");
     }
 
     #[test]
@@ -1878,11 +1949,20 @@ mod tests {
         // (`kotlin.io`, `kotlin.collections`, `kotlin.text`, `kotlin.math`,
         // `kotlin.random`, `kotlin.test`) — every one of them offers its own
         // next segment, never a full member name (`println`,
-        // `assertEquals`, ...) this early.
+        // `assertEquals`, ...) this early. `kotlin` (the package, not a
+        // subpackage) also has real *direct* members of its own now —
+        // `Exception`/`RuntimeException` (`stdlib::exceptions`) — matching
+        // real Kotlin, where `kotlin.Exception` sits directly in package
+        // `kotlin` alongside its subpackages; `"*"` alongside them is the
+        // same wildcard-import offer `import_kotlin_test_dot_offers_
+        // exactly_the_real_members` already gets for the same reason.
         let text = "import kotlin.test.assertEquals\n";
         let mut names = labels(text, Position::new(0, 14)); // right after "import kotlin."
         names.sort();
-        assert_eq!(names, vec!["collections", "io", "math", "random", "test", "text"]);
+        assert_eq!(
+            names,
+            vec!["*", "Exception", "RuntimeException", "collections", "io", "math", "random", "test", "text"]
+        );
     }
 
     #[test]
