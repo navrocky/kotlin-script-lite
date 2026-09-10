@@ -1,0 +1,28 @@
+// Trailing-lambda call syntax (`foo { ... }`/`obj.method { ... }`) — only
+// when the lambda is the call's sole argument; parentheses are omitted
+// entirely. Desugars at parse time into the same `Call`/`MethodCall` AST
+// a fully-parenthesized `foo({ ... })` would produce, so it's checked and
+// evaluated identically — no separate feature underneath.
+
+fun withResult(body: () -> Int): Int = body()
+
+println(withResult { 41 + 1 })
+
+class Counter(var n: Int) {
+    fun update(f: (Int) -> Int) {
+        n = f(n)
+    }
+}
+
+val c = Counter(5)
+c.update { it + 10 }
+println(c.n)
+
+// The merged call chains like any other postfix expression.
+fun makeCounter(body: () -> Int): Counter = Counter(body())
+val c2 = makeCounter { 42 }
+c2.update { it * 2 }
+println(c2.n)
+
+// Explicit parens still work exactly as before.
+println(withResult({ 100 }))

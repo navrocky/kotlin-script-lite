@@ -480,8 +480,28 @@ itself, since `apply`'s first parameter already says `(Int) -> Int`). With
 no such context, an unannotated parameter's type can't be inferred and is
 an error (see [Types](#types)). A lambda captures the environment that was
 active where it was written (true lexical closures), not the caller's
-environment. There is no trailing-lambda call syntax (`list.map { ... }`)
-— lambdas are passed and invoked like any other value: `f(x)`.
+environment.
+
+**Trailing-lambda call syntax** — `foo { ... }`/`obj.method { ... }` —
+omits the parentheses entirely, but only when the lambda is the call's
+*sole* argument:
+
+```kotlin
+fun withResult(body: () -> Int): Int = body()
+withResult { 41 + 1 }              // 42, same as withResult({ 41 + 1 })
+
+class Counter(var n: Int) {
+    fun update(f: (Int) -> Int) { n = f(n) }
+}
+Counter(5).update { it + 10 }      // 15
+```
+
+This is purely parser sugar for `foo({ ... })`/`obj.method({ ... })` —
+identical checking and evaluation either way. Real Kotlin also allows a
+trailing lambda *after* an explicit, non-empty `(...)` argument list
+(`foo(a, b) { ... }`) — not supported here yet; `foo(a) { ... }` parses as
+two separate statements (a complete call, then an unrelated bare lambda),
+not one merged call.
 
 ## Imports
 
