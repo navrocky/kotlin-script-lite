@@ -682,7 +682,9 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
         class_info: HashMap::new(),
         current_class: None,
         return_type_stack: Vec::new(),
-        narrowed: HashSet::new(),
+        narrowed: HashMap::new(),
+        possibly_reassigned: HashSet::new(),
+        bool_alias_narrowing: HashMap::new(),
     };
     let global = r.push_scope(None, 0, FILE_SPAN, ScopeKind::Other);
     r.walk_stmts(&program.stmts, global, FILE_END);
@@ -815,23 +817,84 @@ struct Resolver<'a> {
     /// pushed/popped around walking a body, so `Return` checks/collects
     /// against the right one even when nested. See `ReturnTypeContext`.
     return_type_stack: Vec<ReturnTypeContext>,
-    /// Flow-sensitive null-safety smart-cast state: symbol indices (into
-    /// `table.symbols`) currently proven non-null at this exact point in
-    /// the walk, purely because of a `!= null`/`== null` check (and
-    /// `&&`/`||`/`!` combinations of those) somewhere in the enclosing
-    /// control flow — never because of the symbol's own *declared* type,
-    /// which stays `Nullable` in `table.symbols` regardless. Read by
-    /// `resolve_name` (the single place this changes an expression's
-    /// observed type) and written by whichever construct establishes a
-    /// narrowed region (`If`, short-circuit `Binary`, `While`, `When`) —
-    /// see each one's own comment. Scoped by `walk_stmts`, which
-    /// snapshots/restores this set around its own statement list, so a
-    /// narrowing established inside one block never leaks to a sibling or
-    /// outer block. Only ever contains indices of `!mutable` symbols
-    /// (`val`/parameter) — matches Kotlin's own restriction against
-    /// smart-casting a `var`, which could change between the check and the
-    /// use.
-    narrowed: HashSet<usize>,
+    /// Flow-sensitive smart-cast state: symbol index (into `table.symbols`)
+    /// → the more specific `Type` currently proven for it at this exact
+    /// point in the walk, purely from control flow (a `!= null`/`== null`
+    /// check, `&&`/`||`/`!` combinations of those, or a boolean-alias
+    /// replay — see `bool_alias_narrowing`) — never from the symbol's own
+    /// *declared* type, which stays whatever `table.symbols` says
+    /// regardless. Read by `resolve_name` (the single place this changes
+    /// an expression's observed type) and written by whichever construct
+    /// establishes a narrowed region (`If`, short-circuit `Binary`,
+    /// `While`, `When`) — see each one's own comment. Scoped by
+    /// `walk_stmts`, which snapshots/restores this map around its own
+    /// statement list, so a narrowing established inside one block never
+    /// leaks to a sibling or outer block.
+    ///
+    /// Keyed by `Type`, not a bare presence flag, on purpose: today this
+    /// only ever holds a `Nullable`'s own unwrapped inner type (populated
+    /// exclusively by null-check analysis — see `narrowing_for_condition`/
+    /// `null_check_symbol`), but a future `is`-check (`if (x is Dog)`)
+    /// narrows a symbol's *declared* type (e.g. `Any`) to a concrete
+    /// subtype, which needs to record *which* type, not just a yes/no
+    /// fact — this shape supports that without a second, parallel
+    /// narrowing table when it lands.
+    ///
+    /// A `var`'s presence here is not forbidden the way it once was — see
+    /// `null_check_symbol`'s own comment for why *establishing* narrowing
+    /// is always sound regardless of mutability, and `possibly_reassigned`
+    /// for the separate guard that keeps *consuming* a `var`'s narrowing
+    /// sound.
+    narrowed: HashMap<usize, Type>,
+    /// Symbol indices that *may* have been reassigned (via `Assign` or
+    /// `IncDec`) anywhere already walked, in program order, at or before
+    /// the current point — populated once, at the `Assign`/`IncDec` site,
+    /// and never removed (sticky for the rest of the pass, unlike
+    /// `narrowed`, which `walk_stmts` snapshots/restores per block). This
+    /// is what makes narrowing a `var` sound: `narrowed` on its own only
+    /// proves "true right when established" — a `var`'s value could still
+    /// have changed by the time some *later* statement reads it, whether
+    /// that's a reassignment textually *inside* the very block that
+    /// established the narrowing, or one reached through a boolean-alias
+    /// replay (`bool_alias_narrowing`) recorded earlier and consulted much
+    /// later. `resolve_name` — the single narrowing-consumption point —
+    /// checks this alongside `narrowed`, so every narrowing source
+    /// benefits uniformly with no special-casing anywhere else.
+    ///
+    /// Deliberately *not* scope-restored: a reassignment inside one
+    /// `if`-branch must still poison narrowing for code that runs after
+    /// it, since that branch may or may not have executed — the same
+    /// "once true, assume it's true from here on" conservative bias
+    /// `always_exits` documents for itself. Soundness for this specific
+    /// language (not a general claim) relies on `ksl` having no hoisting,
+    /// no forward-references to a not-yet-declared `fun` (only classes get
+    /// a same-file forward-reference predpass, and only for *signatures*,
+    /// never for method bodies — see `known_classes`/`walk_class_decl`),
+    /// and no concurrency (`coroutines` are explicitly future/deferred
+    /// work per `AGENTS.md`): the resolver visits every AST node in
+    /// exactly the order it can execute in, so an `Assign`/`IncDec`
+    /// reachable from a given point — inside a nested `if`/loop/lambda/
+    /// locally-declared `fun`, wherever — is always walked no later than
+    /// the earliest moment it could actually run. If/when coroutines
+    /// change that ordering guarantee, this reasoning needs revisiting.
+    possibly_reassigned: HashSet<usize>,
+    /// A `val`'s own symbol index → the `(pos, neg)` narrowing fact
+    /// `narrowing_for_condition` computed from *its own initializer* at
+    /// its `ValDecl` site — e.g. `val ateFood = eatenIndex != null` records
+    /// `(pos: {eatenIndex -> Int}, neg: {})` here, keyed by `ateFood`'s own
+    /// index. `narrowing_for_condition`'s `ExprKind::Name` case replays
+    /// this later, at any point `ateFood` itself is used as a condition
+    /// (`if (ateFood) { ... }`) — see that function's own comment. Only a
+    /// `val`-typed `Bool` local is ever recorded here (never a `var` —
+    /// matches Kotlin's own restriction, and the existing narrowing-
+    /// eligibility rule for the alias itself), and only when its own
+    /// initializer contributed *some* real narrowing (an empty pair is
+    /// never inserted, keeping this free of no-op entries). Composes for
+    /// free, with no extra code, through any chain of `val Bool` aliases
+    /// (`val b = a; if (b) { ... }` where `a` is itself such an alias) —
+    /// `b`'s own `ValDecl` handling calls `narrowing_for_condition` on
+    /// `a`, which hits this same lookup.
+    bool_alias_narrowing: HashMap<usize, (HashMap<usize, Type>, HashMap<usize, Type>)>,
 }
 
 /// What to do with a `return`'s type, for the innermost enclosing fun/
@@ -939,6 +1002,19 @@ fn always_exits(stmt: &Stmt) -> bool {
 
 fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Double)
+}
+
+/// `&&`'s negative half / `||`'s positive half both need "only when *both*
+/// sides agree a symbol is narrowed to the exact same type" — `HashMap`
+/// has no built-in `.intersection()` the way `HashSet` does, so this is
+/// that, specialized to this one call shape. Today's only narrowing
+/// source (null-checks) never disagrees about a symbol's narrowed type on
+/// two sides of the same condition, so exact equality is fine; a future
+/// `is`-narrowing (`x is Dog && x is Animal`) might want the *more
+/// specific* of two agreeing-but-different types instead of requiring an
+/// exact match — revisit then, not now.
+fn intersect_narrowing(a: &HashMap<usize, Type>, b: &HashMap<usize, Type>) -> HashMap<usize, Type> {
+    a.iter().filter(|(k, v)| b.get(k) == Some(*v)).map(|(k, v)| (*k, v.clone())).collect()
 }
 
 /// `true` for a primitive that can never have a "common supertype" with a
@@ -1125,22 +1201,28 @@ impl<'a> Resolver<'a> {
     /// — so it's checked against the known stdlib names too before being
     /// flagged as a diagnostic.
     ///
-    /// **Smart-cast integration point**: if the symbol's declared type is
-    /// `Nullable(inner)` and its index is currently in `self.narrowed`, the
-    /// *unwrapped* `inner` type is returned instead — this is the single
-    /// place null-safety narrowing takes effect, so every consumer of a
+    /// **Smart-cast integration point**: if `self.narrowed` currently
+    /// holds a proven type for this symbol, *and* it hasn't possibly been
+    /// reassigned since (`self.possibly_reassigned` — irrelevant for a
+    /// `val`, which can never be reassigned at all, but the one thing that
+    /// keeps a `var`'s narrowing sound), that proven type is returned
+    /// instead of the symbol's own declared type — this is the single
+    /// place smart-cast narrowing takes effect, so every consumer of a
     /// `Name`'s type (method/field access, arithmetic, comparisons, elvis,
     /// ...) benefits uniformly with no special-casing anywhere else. See
     /// `Resolver::narrowed`'s own doc comment for where narrowing is
-    /// established.
+    /// established, and `possibly_reassigned`'s for why this one extra
+    /// check is enough to also handle a reassignment *inside* the very
+    /// block that established the narrowing, with no separate "remove
+    /// from `narrowed` on `Assign`" step anywhere.
     fn resolve_name(&mut self, scope: usize, name: &str, use_span: Span) -> Type {
         self.touch(scope, use_span);
         if let Some(idx) = self.resolve_symbol_index(scope, name) {
             self.table.occurrences.push((use_span, idx));
             let ty = self.table.symbols[idx].ty.clone();
-            if let Type::Nullable(inner) = &ty {
-                if self.narrowed.contains(&idx) {
-                    return (**inner).clone();
+            if let Some(narrowed_ty) = self.narrowed.get(&idx) {
+                if !self.possibly_reassigned.contains(&idx) {
+                    return narrowed_ty.clone();
                 }
             }
             return ty;
@@ -1197,48 +1279,77 @@ impl<'a> Resolver<'a> {
     }
 
     /// Structural, read-only analysis of a boolean condition expression for
-    /// null-safety smart-cast: returns `(positive, negative)` — the symbol
-    /// indices proven non-null when `cond` evaluates to `true`, and when it
-    /// evaluates to `false`, respectively. Recurses through `&&`/`||`/`!`
-    /// so a compound condition like `x != null && y != null` narrows both;
-    /// anything not recognized contributes no narrowing (always sound,
-    /// just uninformative) rather than a false claim.
-    fn narrowing_for_condition(&self, cond: &Expr, scope: usize) -> (HashSet<usize>, HashSet<usize>) {
+    /// smart-cast: returns `(positive, negative)` — the symbol indices
+    /// (mapped to their proven-narrower `Type`) proven when `cond`
+    /// evaluates to `true`, and when it evaluates to `false`, respectively.
+    /// Recurses through `&&`/`||`/`!` so a compound condition like `x !=
+    /// null && y != null` narrows both; a bare `Name` resolving to a
+    /// recorded boolean alias (see `bool_alias_narrowing`) replays
+    /// whatever narrowing its own initializer established, transitively
+    /// through any chain of such aliases; anything else contributes no
+    /// narrowing (always sound, just uninformative) rather than a false
+    /// claim.
+    fn narrowing_for_condition(&self, cond: &Expr, scope: usize) -> (HashMap<usize, Type>, HashMap<usize, Type>) {
         match &cond.kind {
             ExprKind::Binary { op: BinaryOp::NotEq, lhs, rhs } => match self.null_check_symbol(lhs, rhs, scope) {
-                Some(idx) => (HashSet::from([idx]), HashSet::new()),
-                None => (HashSet::new(), HashSet::new()),
+                Some((idx, ty)) => (HashMap::from([(idx, ty)]), HashMap::new()),
+                None => (HashMap::new(), HashMap::new()),
             },
             ExprKind::Binary { op: BinaryOp::Eq, lhs, rhs } => match self.null_check_symbol(lhs, rhs, scope) {
-                Some(idx) => (HashSet::new(), HashSet::from([idx])),
-                None => (HashSet::new(), HashSet::new()),
+                Some((idx, ty)) => (HashMap::new(), HashMap::from([(idx, ty)])),
+                None => (HashMap::new(), HashMap::new()),
             },
             ExprKind::Binary { op: BinaryOp::And, lhs, rhs } => {
-                let (lpos, lneg) = self.narrowing_for_condition(lhs, scope);
+                let (mut lpos, lneg) = self.narrowing_for_condition(lhs, scope);
                 let (rpos, rneg) = self.narrowing_for_condition(rhs, scope);
-                (lpos.union(&rpos).copied().collect(), lneg.intersection(&rneg).copied().collect())
+                lpos.extend(rpos);
+                (lpos, intersect_narrowing(&lneg, &rneg))
             }
             ExprKind::Binary { op: BinaryOp::Or, lhs, rhs } => {
-                let (lpos, lneg) = self.narrowing_for_condition(lhs, scope);
+                let (lpos, mut lneg) = self.narrowing_for_condition(lhs, scope);
                 let (rpos, rneg) = self.narrowing_for_condition(rhs, scope);
-                (lpos.intersection(&rpos).copied().collect(), lneg.union(&rneg).copied().collect())
+                lneg.extend(rneg);
+                (intersect_narrowing(&lpos, &rpos), lneg)
             }
             ExprKind::Unary { op: UnaryOp::Not, expr: inner } => {
                 let (pos, neg) = self.narrowing_for_condition(inner, scope);
                 (neg, pos)
             }
-            _ => (HashSet::new(), HashSet::new()),
+            // Boolean-alias replay — see `bool_alias_narrowing`'s doc
+            // comment and `ValDecl`'s handling, which populates it. No
+            // extra staleness check is needed here: whatever symbol
+            // indices this returns still go through `resolve_name`'s own
+            // `possibly_reassigned` guard at the point they're actually
+            // used, uniformly with every other narrowing source.
+            ExprKind::Name(name) => self
+                .resolve_symbol_index(scope, name)
+                .and_then(|idx| self.bool_alias_narrowing.get(&idx))
+                .cloned()
+                .unwrap_or_default(),
+            _ => (HashMap::new(), HashMap::new()),
         }
     }
 
     /// If exactly one of `lhs`/`rhs` is the `null` literal and the other is
-    /// a bare `Name` resolving to a narrowing-eligible symbol (immutable —
-    /// `val`/parameter, matching Kotlin's own restriction against
-    /// smart-casting a `var` — and declared `Nullable`), returns that
-    /// symbol's index. This is the shared "is this an `x != null`/`x ==
-    /// null` check" pattern behind both `narrowing_for_condition` arms
-    /// (the caller decides which side — true or false — the match implies).
-    fn null_check_symbol(&self, lhs: &Expr, rhs: &Expr, scope: usize) -> Option<usize> {
+    /// a bare `Name` resolving to a `Nullable`-declared symbol, returns
+    /// that symbol's index paired with the unwrapped inner `Type` it would
+    /// narrow to. This is the shared "is this an `x != null`/`x == null`
+    /// check" pattern behind both `narrowing_for_condition` arms (the
+    /// caller decides which side — true or false — the match implies).
+    ///
+    /// No longer requires `!sym.mutable`: *establishing* narrowing from a
+    /// live check is sound right here regardless of whether the symbol is
+    /// a `val` or `var` — it reflects the value's exact state at this
+    /// precise program point. What would be unsound is trusting a `var`'s
+    /// narrowing at some *later* point without knowing whether it was
+    /// reassigned in between — that staleness question is handled
+    /// entirely downstream, by `resolve_name`'s `possibly_reassigned`
+    /// check, the single place narrowing is ever consumed. Keeping the
+    /// mutability check out of this establishment site (rather than
+    /// duplicating a weaker version of the real guard here) is what lets
+    /// a direct `if (v != null) { use(v) }` and a boolean-alias replay
+    /// both reuse this one function unchanged.
+    fn null_check_symbol(&self, lhs: &Expr, rhs: &Expr, scope: usize) -> Option<(usize, Type)> {
         let name_expr = match (&lhs.kind, &rhs.kind) {
             (ExprKind::NullLit, ExprKind::Name(_)) => rhs,
             (ExprKind::Name(_), ExprKind::NullLit) => lhs,
@@ -1246,11 +1357,8 @@ impl<'a> Resolver<'a> {
         };
         let ExprKind::Name(name) = &name_expr.kind else { return None };
         let idx = self.resolve_symbol_index(scope, name)?;
-        let sym = &self.table.symbols[idx];
-        if sym.mutable || !matches!(sym.ty, Type::Nullable(_)) {
-            return None;
-        }
-        Some(idx)
+        let Type::Nullable(inner) = &self.table.symbols[idx].ty else { return None };
+        Some((idx, (**inner).clone()))
     }
 
     /// If `expr` is a chain of bare-identifier `.` access (`a`, `a.b`,
@@ -1433,16 +1541,46 @@ impl<'a> Resolver<'a> {
                     .map(crate::doc_comment::parse)
                     .map(|d| d.summary)
                     .filter(|s| !s.is_empty());
-                self.define(scope, name, kind, *name_span, *mutable, sig, ty, Type::Unknown, Vec::new(), Vec::new(), Vec::new(), Vec::new(), doc);
+                let idx = self.define(
+                    scope, name, kind, *name_span, *mutable, sig, ty.clone(), Type::Unknown,
+                    Vec::new(), Vec::new(), Vec::new(), Vec::new(), doc,
+                );
+                // Boolean-alias narrowing: `val ateFood = eatenIndex !=
+                // null` records the same `(pos, neg)` facts a direct
+                // `if (eatenIndex != null)` would establish, keyed by
+                // `ateFood`'s own new index — see `bool_alias_narrowing`'s
+                // doc comment and `narrowing_for_condition`'s `Name` arm,
+                // which replays this later. `!mutable` here is the
+                // alias-holding boolean's own mutability (`ateFood` must
+                // be a `val`, matching Kotlin) — unrelated to whether
+                // whatever it narrows (`eatenIndex`) is itself a `val` or
+                // `var`.
+                if !mutable && ty == Type::Bool {
+                    let alias = self.narrowing_for_condition(init, scope);
+                    if !alias.0.is_empty() || !alias.1.is_empty() {
+                        self.bool_alias_narrowing.insert(idx, alias);
+                    }
+                }
                 Type::Unit
             }
             StmtKind::Assign { name, op, value } => {
                 let value_ty = self.walk_expr(value, scope, following);
-                match self.resolve_symbol(scope, name) {
-                    Some(sym) => {
+                match self.resolve_symbol_index(scope, name) {
+                    Some(idx) => {
+                        let sym = &self.table.symbols[idx];
                         let target_ty = sym.ty.clone();
                         let mutable = sym.mutable;
                         self.resolve_name(scope, name, stmt.span);
+                        // Any reassignment here on — legal (`var`) or not
+                        // (flagged just below as "cannot reassign val")
+                        // — means this symbol's value can no longer be
+                        // trusted to still be whatever an earlier check
+                        // narrowed it to. See `possibly_reassigned`'s own
+                        // doc comment for why this alone (no separate
+                        // "remove from `narrowed`" step, no scope-restore)
+                        // is enough to keep both a direct in-block
+                        // narrowing and a boolean-alias replay sound.
+                        self.possibly_reassigned.insert(idx);
                         // A plain local `val` reassignment was the one case
                         // missing this check — `FieldAssign`'s own handling
                         // below and the cross-file-import case further down
@@ -3111,6 +3249,12 @@ impl<'a> Resolver<'a> {
             // surfaces a runtime error via `apply_binary`.
             ExprKind::IncDec { name, name_span, .. } => {
                 self.table.name_refs.push((*name_span, name.clone()));
+                // `x++`/`x--`/`++x`/`--x` reassign `x` just as surely as a
+                // plain `x = ...` does — see `possibly_reassigned`'s own
+                // doc comment for why this needs the same marking.
+                if let Some(idx) = self.resolve_symbol_index(scope, name) {
+                    self.possibly_reassigned.insert(idx);
+                }
                 self.resolve_name(scope, name, *name_span)
             }
             // `receiver.field` — this resolver has no notion of packages, so
@@ -3753,7 +3897,7 @@ impl<'a> Resolver<'a> {
                 self.narrowed = ambient.clone();
                 let else_ty = match else_branch {
                     Some(eb) => {
-                        self.narrowed.extend(neg.iter().copied());
+                        self.narrowed.extend(neg.clone());
                         let ty = self.walk_block(eb, scope, expr.span, following, ScopeKind::Other);
                         self.narrowed = ambient.clone();
                         ty
@@ -5586,13 +5730,90 @@ mod tests {
     }
 
     #[test]
-    fn var_never_narrows() {
-        // Kotlin itself never smart-casts a mutable local — it could
-        // change between the check and the use — and neither does this
-        // resolver.
+    fn a_var_not_reassigned_between_its_check_and_its_use_narrows() {
+        // Reverses the old blanket "a `var` never narrows" decision: real
+        // Kotlin *does* narrow a `var` local as long as it's provably not
+        // reassigned between the check and the use — see
+        // `Resolver::possibly_reassigned`.
         let result = resolve_src(
             "fun f() {\n    var s: String? = \"hi\"\n    if (s != null) {\n        println(s.length())\n    }\n}\n",
         );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_var_reassigned_before_the_check_is_not_narrowed() {
+        let result = resolve_src(
+            "fun f() {\n    var s: String? = \"hi\"\n    s = null\n    if (s != null) {\n        println(s.length())\n    }\n}\n",
+        );
+        // Establishing narrowing right inside the `if` still works (that's
+        // the whole point) — the earlier `s = null` doesn't prevent that.
+        // Since `possibly_reassigned` is sticky, though, it's already
+        // marked by the time the `if` is reached, so the narrowing is
+        // established but never trusted at the use site.
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_var_reassigned_inside_the_narrowed_block_stops_being_narrowed_mid_block() {
+        let result = resolve_src(
+            "fun f() {\n    var s: String? = \"hi\"\n    if (s != null) {\n        s = null\n        println(s.length())\n    }\n}\n",
+        );
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn val_boolean_alias_of_a_null_check_narrows_at_its_use() {
+        let result = resolve_src(
+            "fun f(s: String?) {\n    val hasS = s != null\n    if (hasS) {\n        println(s.length())\n    }\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn the_real_world_var_plus_boolean_alias_pattern_narrows() {
+        // The exact motivating shape: a `var` never reassigned between its
+        // own declaration and the aliasing `val`'s check, used only inside
+        // the `if` gated by that alias.
+        let result = resolve_src(
+            "fun checkEatFood(): Int? = null\nfun removeAt(i: Int) {}\nfun f() {\n    var eatenIndex = checkEatFood()\n    val ateFood = eatenIndex != null\n    if (ateFood) {\n        removeAt(eatenIndex)\n    }\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn boolean_alias_is_invalidated_by_a_reassignment_before_its_use() {
+        let result = resolve_src(
+            "fun f() {\n    var s: String? = \"hi\"\n    val hasS = s != null\n    s = null\n    if (hasS) {\n        println(s.length())\n    }\n}\n",
+        );
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_boolean_alias_holder_that_is_itself_a_var_does_not_narrow() {
+        // The alias-holding boolean itself must be a `val` — a `var`
+        // boolean built the same way contributes no narrowing, same as
+        // any other unrecognized condition shape.
+        let result = resolve_src(
+            "fun f(s: String?) {\n    var hasS = s != null\n    if (hasS) {\n        println(s.length())\n    }\n}\n",
+        );
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_boolean_alias_of_a_non_narrowable_condition_contributes_nothing() {
+        let result = resolve_src(
+            "fun f(s: String?) {\n    val looksOk = true\n    if (looksOk) {\n        println(s.length())\n    }\n}\n",
+        );
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn boolean_alias_narrowing_does_not_leak_past_its_own_if_block() {
+        let result = resolve_src(
+            "fun f(s: String?) {\n    val hasS = s != null\n    if (hasS) {\n        println(s.length())\n    }\n    println(s.length())\n}\n",
+        );
+        // Second call, after the `if`, is still unguarded.
         assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
     }
 
