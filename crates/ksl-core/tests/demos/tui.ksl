@@ -1,4 +1,4 @@
-// A tiny ksl-level TUI helper library — screen/cursor control, built
+// A tiny ksl-level TUI helper library — screen/cursor/color control, built
 // entirely on plain ANSI escape strings via the `\u{XXXX}` string escape.
 // No native support needed for any of this (see docs/roadmap.md's Phase
 // 6.6 design principle): only `ksl.term`'s raw-mode/input primitives are
@@ -11,3 +11,33 @@ fun moveCursor(row: Int, col: Int): Unit = print("\u{1b}[" + row + ";" + col + "
 fun hideCursor(): Unit = print("\u{1b}[?25l")
 
 fun showCursor(): Unit = print("\u{1b}[?25h")
+
+// Returns the escape *string* for a foreground color switch — splice it
+// into a line still being built character by character (e.g. `line =
+// line + style(COLOR_RED) + "O"`), instead of printing out of order
+// relative to the rest of that line. Combines "reset every attribute"
+// with "set this color" in one SGR escape, so styles never bleed between
+// characters and switching straight from one to another never needs a
+// separate reset first.
+fun style(code: Int): String = "\u{1b}[0;" + code + "m"
+
+fun styleBold(code: Int): String = "\u{1b}[0;1;" + code + "m"
+
+// Clears every attribute back to the terminal's default — needed once
+// after the last styled character on a line, since `style`/`styleBold`
+// always set a specific color rather than "no color".
+fun resetColor(): String = "\u{1b}[0m"
+
+// Standard 8-color ANSI foreground SGR codes (30-37 normal intensity,
+// 90-97 "bright") — the widely-supported subset every real terminal
+// understands.
+val COLOR_BLACK = 30
+val COLOR_RED = 31
+val COLOR_GREEN = 32
+val COLOR_YELLOW = 33
+val COLOR_BLUE = 34
+val COLOR_MAGENTA = 35
+val COLOR_CYAN = 36
+val COLOR_WHITE = 37
+val COLOR_BRIGHT_RED = 91
+val COLOR_BRIGHT_YELLOW = 93
