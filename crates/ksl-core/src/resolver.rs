@@ -784,7 +784,7 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
     // `occurrences` entry now that its target `Symbol` actually exists,
     // so hover/goto-def work on a forward-referenced call the same as any
     // other. A name that somehow still doesn't resolve here (shouldn't
-    // happen — `forward_declared_fun_signature` already proved it would,
+    // happen — `forward_declared_fun_signatures` already proved it would,
     // and nothing removes an entry from `scope.names` once added) is
     // simply skipped, not a panic.
     for (span, scope, name) in std::mem::take(&mut r.pending_forward_refs) {
@@ -919,16 +919,21 @@ struct Resolver<'a> {
     /// list — a read-only side table (never touches `scope.names`/
     /// `self.table.symbols`, so it can never conflict with `define`'s own
     /// "already declared" bookkeeping), keyed by scope id, populated once
-    /// per scope the first time `walk_stmts` is called for it. Consulted
-    /// only by `forward_declared_fun_signature`, which additionally
-    /// requires the *reference* to be lexically nested inside another
-    /// callable body relative to the declaring block — see that method's
-    /// own doc comment for the exact rule (deliberately narrower than real
-    /// Kotlin's unconditional same-file/same-block hoisting, per this
-    /// session's own discussion).
-    forward_declared_funs: HashMap<usize, HashMap<String, CallSignature>>,
+    /// per scope the first time `walk_stmts` is called for it. More than
+    /// one entry per name is a real, same-scope forward-declared overload
+    /// group (each paired with its own `name_span`, for `resolved_calls`/
+    /// `FunctionValue::decl_span` matching — see `resolve_forward_overload`)
+    /// — mirrors `ScopeData::names` allowing several `SymbolKind::Fun`
+    /// symbols under one name for the exact same reason. Consulted only by
+    /// `forward_declared_fun_signatures`, which additionally requires the
+    /// *reference* to be lexically nested inside another callable body
+    /// relative to the declaring block — see that method's own doc comment
+    /// for the exact rule (deliberately narrower than real Kotlin's
+    /// unconditional same-file/same-block hoisting, per this session's own
+    /// discussion).
+    forward_declared_funs: HashMap<usize, HashMap<String, Vec<(CallSignature, Span)>>>,
     /// `(call span, call's own scope, name)` for every call site
-    /// `resolve_name` resolved via `forward_declared_fun_signature` — its
+    /// `resolve_name` resolved via `forward_declared_fun_signatures` — its
     /// target `Symbol` doesn't exist yet at that exact point in the walk,
     /// so it can't get a real `occurrences` entry (for hover/goto-def)
     /// right there. Resolved into real `occurrences` entries in one final
@@ -1472,7 +1477,7 @@ impl<'a> Resolver<'a> {
         }
         // A same-block sibling `fun`, declared later, referenced from
         // inside another callable's body (deferred execution) — see
-        // `forward_declared_fun_signature`'s own doc comment for the exact
+        // `forward_declared_fun_signatures`'s own doc comment for the exact
         // rule. The declaration's real `Symbol` doesn't exist yet at this
         // exact point in the walk (that only happens once the real,
         // in-order walk later reaches its own `FunDecl`), so a real
@@ -1480,10 +1485,13 @@ impl<'a> Resolver<'a> {
         // directly — `pending_forward_refs` records the call site instead,
         // resolved into a real occurrence in one final pass once the
         // whole file has been walked (see `resolve_with_imports`, right
-        // after `walk_stmts` returns). No named-argument checking for this
-        // call yet (a real, accepted scope limit) — just the call's own
-        // type, so it isn't wrongly flagged as undefined.
-        if let Some((ret, params, ..)) = self.forward_declared_fun_signature(scope, name) {
+        // after `walk_stmts` returns). A bare-name (non-`Call`) use of an
+        // overloaded forward-declared group resolves to its *last*
+        // candidate here — the same "last one wins for a non-call use"
+        // simplification already documented on `resolve_symbol_index`; a
+        // real `ExprKind::Call` site gets true per-overload resolution
+        // instead, in the `Call` arm (`resolve_forward_overload`).
+        if let Some((ret, params, ..)) = self.forward_declared_fun_signatures(scope, name).and_then(|v| v.into_iter().last().map(|(sig, _)| sig)) {
             self.pending_forward_refs.push((use_span, scope, name.to_string()));
             return Type::Function(params, Box::new(ret));
         }
@@ -1667,12 +1675,16 @@ impl<'a> Resolver<'a> {
         Vec::new()
     }
 
-    /// The signature of `name`, if it's a sibling `fun` declared *later*
-    /// in some ancestor block's own statement list, but only when the
-    /// reference itself is lexically nested inside at least one function/
-    /// lambda body relative to that declaring block — real Kotlin-like
-    /// same-block forward reference, deliberately narrowed to only the
-    /// "deferred execution" case:
+    /// Every candidate signature of `name` (paired with its own
+    /// `name_span`, for `resolved_calls`/`FunctionValue::decl_span`
+    /// matching — see `resolve_forward_overload`), if it's a sibling `fun`
+    /// declared *later* in some ancestor block's own statement list — more
+    /// than one only for a real same-scope forward-declared overload group,
+    /// same idea as `resolve_symbols` — but only when the reference itself
+    /// is lexically nested inside at least one function/lambda body
+    /// relative to that declaring block — real Kotlin-like same-block
+    /// forward reference, deliberately narrowed to only the "deferred
+    /// execution" case:
     /// ```kotlin
     /// fun useTest() { test() }   // OK — deferred: only runs once useTest()
     /// fun test() {}              // is itself called, by which point `test`
@@ -1700,12 +1712,12 @@ impl<'a> Resolver<'a> {
     /// `run { ... }` — so *that* lambda's own scope is a `FunctionBoundary`
     /// too) would wrongly count as "already deferred" relative to its own
     /// direct siblings.
-    fn forward_declared_fun_signature(&self, scope: usize, name: &str) -> Option<CallSignature> {
+    fn forward_declared_fun_signatures(&self, scope: usize, name: &str) -> Option<Vec<(CallSignature, Span)>> {
         let mut idx = scope;
         let mut crossed_boundary = false;
         loop {
-            if let Some(sig) = self.forward_declared_funs.get(&idx).and_then(|m| m.get(name)) {
-                return if crossed_boundary { Some(sig.clone()) } else { None };
+            if let Some(sigs) = self.forward_declared_funs.get(&idx).and_then(|m| m.get(name)) {
+                return if crossed_boundary { Some(sigs.clone()) } else { None };
             }
             if self.table.scopes[idx].kind == ScopeKind::FunctionBoundary {
                 crossed_boundary = true;
@@ -1737,7 +1749,7 @@ impl<'a> Resolver<'a> {
     fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize, following: Span) -> Type {
         // Real, same-block forward-reference support for a sibling `fun`
         // declared later in this exact statement list — see
-        // `forward_declared_fun_signature`'s own doc comment for the exact
+        // `forward_declared_fun_signatures`'s own doc comment for the exact
         // (deliberately narrower-than-real-Kotlin) rule this enables.
         // Computed lazily, once per distinct `scope` (every concrete scope
         // id is walked via `walk_stmts` exactly once), as a read-only side
@@ -1746,9 +1758,9 @@ impl<'a> Resolver<'a> {
         // completely normally, with no risk of a false "already declared"
         // from this predpass itself.
         if !self.forward_declared_funs.contains_key(&scope) {
-            let mut sigs = HashMap::new();
+            let mut sigs: HashMap<String, Vec<(CallSignature, Span)>> = HashMap::new();
             for s in stmts {
-                if let StmtKind::FunDecl { name, receiver: None, params, return_type, .. } = &s.kind {
+                if let StmtKind::FunDecl { name, name_span, receiver: None, params, return_type, .. } = &s.kind {
                     let param_types = params
                         .iter()
                         .map(|p| {
@@ -1763,7 +1775,9 @@ impl<'a> Resolver<'a> {
                         .as_ref()
                         .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                         .unwrap_or(Type::Unknown);
-                    sigs.insert(name.clone(), (ret_ty, param_types, param_names, Vec::new(), Vec::new()));
+                    sigs.entry(name.clone())
+                        .or_default()
+                        .push(((ret_ty, param_types, param_names, Vec::new(), Vec::new()), *name_span));
                 }
             }
             self.forward_declared_funs.insert(scope, sigs);
@@ -3864,6 +3878,59 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Same idea as `resolve_user_overload`, for a call to more than one
+    /// forward-declared sibling `fun` sharing one name in the same scope
+    /// (see `forward_declared_funs`'s own doc comment) — same
+    /// `types::resolve_overload` core, fed from `forward_declared_fun_
+    /// signatures`'s own `(CallSignature, Span)` pairs instead of a real
+    /// `Symbol`'s fields, since no real `Symbol` exists yet for any of
+    /// these candidates at this point in the walk. A `Unique` match still
+    /// records `call_span -> chosen name_span` in `resolved_calls` exactly
+    /// like `resolve_user_overload` does — by the time this call site
+    /// actually *runs* (necessarily later, since forward-declared calls are
+    /// only ever legal from inside another callable's own deferred body),
+    /// every sibling `fun` here has been registered for real and its
+    /// `FunctionValue::decl_span` is that same `name_span`, so the
+    /// interpreter's own fast-dispatch lookup (`ExprKind::Call`'s
+    /// `current_resolved` check) finds it correctly.
+    fn resolve_forward_overload(
+        &mut self,
+        name: &str,
+        candidates: &[(CallSignature, Span)],
+        arg_infos: &[(Option<String>, Type)],
+        span: Span,
+    ) -> Type {
+        let arg_types: Vec<Type> = arg_infos.iter().map(|(_, t)| t.clone()).collect();
+        let candidate_params: Vec<&[Type]> = candidates.iter().map(|((_, p, ..), _)| p.as_slice()).collect();
+        match types::resolve_overload(&candidate_params, &arg_types) {
+            types::OverloadResolution::Unique(i) => {
+                self.resolved_calls.insert(span, candidates[i].1);
+                candidates[i].0 .0.clone()
+            }
+            types::OverloadResolution::Ambiguous(is) => {
+                let first_ret = candidates[is[0]].0 .0.clone();
+                if is.iter().all(|&i| candidates[i].0 .0 == first_ret) { first_ret } else { Type::Unknown }
+            }
+            types::OverloadResolution::ArityMismatch => {
+                self.type_errors.push(RuntimeError::new(
+                    format!("no overload of '{name}' accepts {} argument(s)", arg_types.len()),
+                    span,
+                ));
+                Type::Unknown
+            }
+            types::OverloadResolution::NoMatch => {
+                if arg_types.iter().all(|t| *t != Type::Unknown) {
+                    let arg_list = arg_types.iter().map(Type::name).collect::<Vec<_>>().join(", ");
+                    self.type_errors.push(RuntimeError::new(
+                        format!("no overload of '{name}' matches argument types ({arg_list})"),
+                        span,
+                    ));
+                }
+                Type::Unknown
+            }
+        }
+    }
+
     /// Same idea as `resolve_stdlib_overload`/`resolve_user_overload`, for a
     /// call to a name brought in by a real cross-file `import`/
     /// `@file:Import` (see `CrossFileImports`) — or a qualified call
@@ -4551,8 +4618,32 @@ impl<'a> Resolver<'a> {
                         }
                     };
                 let use_cross_overload_resolution = cross_candidates.len() > 1;
-                let use_overload_resolution =
-                    use_local_overload_resolution || use_stdlib_overload_resolution || use_cross_overload_resolution;
+
+                // A forward-declared sibling group (see `forward_declared_
+                // funs`'s own doc comment) — the last resort, consulted
+                // only once none of local/stdlib/cross-file claims this
+                // name at all, matching the exact same precedence order
+                // `resolve_name`'s own fallback chain already uses (and
+                // that `self.walk_expr(callee, ...)` above already applied
+                // once, via `resolve_name`, to produce the callee's own
+                // bare-name type and `pending_forward_refs` entry).
+                let forward_candidates: Vec<(CallSignature, Span)> =
+                    if use_local_overload_resolution || !overloads.is_empty() || !cross_candidates.is_empty() {
+                        Vec::new()
+                    } else {
+                        match &callee.kind {
+                            ExprKind::Name(name) if self.resolve_symbol(scope, name).is_none() => {
+                                self.forward_declared_fun_signatures(scope, name).unwrap_or_default()
+                            }
+                            _ => Vec::new(),
+                        }
+                    };
+                let use_forward_overload_resolution = forward_candidates.len() > 1;
+
+                let use_overload_resolution = use_local_overload_resolution
+                    || use_stdlib_overload_resolution
+                    || use_cross_overload_resolution
+                    || use_forward_overload_resolution;
 
                 // A checkable signature comes from a local `fun` symbol, a
                 // non-overloaded stdlib function, or a non-overloaded
@@ -4664,6 +4755,25 @@ impl<'a> Resolver<'a> {
                                         m.symbol.param_has_default.clone(),
                                     )
                                 })
+                            })
+                            .or_else(|| {
+                                // The single-candidate (non-overloaded) case
+                                // of a same-block forward-declared sibling
+                                // `fun` (see `forward_declared_funs`'s own
+                                // doc comment) — the last resort, exactly
+                                // mirroring `resolve_name`'s own fallback
+                                // order. Without this branch a forward-
+                                // declared call's arguments were never
+                                // statically checked at all (only the call
+                                // expression's own bare *type*, via `resolve_
+                                // name`) — a real, now-closed gap: a mismatch
+                                // like `test("x")` against `fun test(x: Int)`
+                                // previously surfaced only as a runtime
+                                // `RuntimeError`, never a resolver diagnostic.
+                                match forward_candidates.as_slice() {
+                                    [(sig, _)] => Some(sig.clone()),
+                                    _ => None,
+                                }
                             }),
                         _ => None,
                     }
@@ -4690,6 +4800,10 @@ impl<'a> Resolver<'a> {
                 if use_cross_overload_resolution {
                     let ExprKind::Name(name) = &callee.kind else { unreachable!() };
                     return self.resolve_cross_file_overload(name, &cross_candidates, &arg_infos, expr.span);
+                }
+                if use_forward_overload_resolution {
+                    let ExprKind::Name(name) = &callee.kind else { unreachable!() };
+                    return self.resolve_forward_overload(name, &forward_candidates, &arg_infos, expr.span);
                 }
 
                 let ty = self.check_call_signature(&arg_infos, signature, expr.span);
@@ -7294,6 +7408,67 @@ mod tests {
             "fun run(block: () -> Unit) { block() }\nrun {\n    fun useTest() {\n        test()\n    }\n    fun test() {}\n}\n",
         );
         assert!(result.diagnostics.iter().all(|e| !e.message.contains("undefined name 'test'")), "{:?}", result.diagnostics);
+    }
+
+    // ---- forward-declared call's own argument/overload checking (closes
+    // the gap where a deferred forward-referenced call's arguments were
+    // never statically checked at all, only its bare callee type) ----
+
+    #[test]
+    fn a_deferred_call_to_a_single_forward_declared_fun_gets_real_argument_checking() {
+        let result = resolve_src("fun useTest() {\n    test(\"wrong type\")\n}\nfun test(x: Int) {}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("argument 1 has type String, expected Int")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_deferred_call_to_a_single_forward_declared_fun_with_matching_types_is_fine() {
+        let result = resolve_src("fun useTest() {\n    test(5)\n}\nfun test(x: Int) {}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_deferred_call_to_a_single_forward_declared_fun_checks_named_arguments_too() {
+        let result = resolve_src("fun useTest() {\n    test(y = 5)\n}\nfun test(x: Int) {}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("unknown parameter 'y'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_deferred_call_resolves_the_right_overload_among_forward_declared_siblings() {
+        let result = resolve_src(
+            "fun useTest() {\n    val a: String = test(5)\n    val b: String = test(\"hi\")\n}\nfun test(x: Int): String = \"int\"\nfun test(x: String): String = \"str\"\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_deferred_call_with_no_matching_forward_declared_overload_is_flagged() {
+        let result = resolve_src(
+            "fun useTest() {\n    test(true)\n}\nfun test(x: Int): String = \"int\"\nfun test(x: String): String = \"str\"\n",
+        );
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("no overload of 'test' matches argument types (Boolean)")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_resolved_forward_declared_overload_records_its_target_span_for_runtime_fast_dispatch() {
+        // The chosen overload's `name_span` must land on `fun test(x:
+        // Int)`'s own declaration line (5), matching `FunctionValue::
+        // decl_span`'s exact convention — see `resolve_forward_overload`'s
+        // own doc comment on why this has to be `name_span`, not the whole
+        // statement's span.
+        let src = "fun useTest() {\n    test(5)\n}\nfun test(x: String): String = \"str\"\nfun test(x: Int): String = \"int\"\n";
+        let result = resolve_src(src);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert_eq!(result.resolved_calls.len(), 1, "{:?}", result.resolved_calls);
+        let (_, target_span) = result.resolved_calls.iter().next().unwrap();
+        assert_eq!(target_span.line, 5);
     }
 
     // ---- Bug 3: a block-bodied fun with no annotation is always Unit ----

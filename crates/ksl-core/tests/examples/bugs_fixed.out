@@ -4,3 +4,5 @@ bug3 fixed: 20
 bug4 fixed: 2
 bug5 fixed: 42
 bug6 fixed
+bug2b fixed: int 7
+bug2b fixed: string seven

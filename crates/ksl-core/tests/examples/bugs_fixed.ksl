@@ -96,3 +96,19 @@ run {
     }
     println(Test6Wrapper(Test6()).get().hi())
 }
+
+run {
+    // Bug 2 follow-up: a call deferred inside another function's body, to a
+    // forward-declared *overload group* (several same-name siblings), now
+    // resolves to the right candidate by real argument type — not just a
+    // suppressed "undefined name" with no argument checking at all.
+    fun useTest() {
+        println(describe(7))
+        println(describe("seven"))
+    }
+
+    fun describe(x: Int): String = "bug2b fixed: int $x"
+    fun describe(x: String): String = "bug2b fixed: string $x"
+
+    useTest()
+}
