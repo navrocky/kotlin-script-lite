@@ -1,4 +1,4 @@
-// Regression coverage for the 4 bugs reported in the user's own
+// Regression coverage for the 6 bugs reported in the user's own
 // `tests/examples/bugs.ksl` scratch file — each repro below, fixed.
 
 fun run(block: () -> Unit) { block() }
@@ -66,4 +66,33 @@ run {
     f.addFood(1)
     f.addFood(2)
     println("bug4 fixed: ${f.foods.size()}")
+}
+
+run {
+    // Bug 5: a block body declaring a non-`Unit` return type must now
+    // provably return via an explicit `return` — the original bug's own
+    // script (`fun get(): Int {}`, an empty body) is now a compile-time
+    // "a 'return' expression required..." error instead of silently
+    // compiling. This positive case shows a real, correct block body
+    // still working exactly as before.
+    class Test5 {
+        fun get(): Int {
+            return 42
+        }
+    }
+    println("bug5 fixed: ${Test5().get()}")
+}
+
+run {
+    // Bug 6: a locally-scoped class is now visible as a type annotation to
+    // another local class declared after it, in the same block — even
+    // inside a nested lambda like this one.
+    class Test6 {
+        fun hi(): String = "bug6 fixed"
+    }
+
+    class Test6Wrapper(val t: Test6) {
+        fun get(): Test6 = t
+    }
+    println(Test6Wrapper(Test6()).get().hi())
 }

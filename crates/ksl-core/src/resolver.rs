@@ -1073,22 +1073,25 @@ fn reconcile_types(candidates: &[Type]) -> Reconciled {
 }
 
 /// Best-effort, single-level "does this statement always exit via
-/// `return`" check — used to decide whether a lambda body's tail
-/// expression is a *real* fallthrough candidate for return-type inference
-/// or a `return`-shadowed no-op (see `ReturnTypeContext::Collect`'s
-/// reconciliation, `walk_lambda`). Not full reachability analysis — only
-/// recognizes the single most common idiom (`if`/`when` where every
-/// branch's own last statement is `return`); anything deeper (nested
-/// blocks, loops) is conservatively treated as "might fall through",
-/// which only risks an occasional spurious "returns both X and Unit"
-/// diagnostic in an unusual shape, never a wrong inferred type silently
-/// accepted. A named `fun`/class method's own block body no longer uses
-/// this at all — its return type is unconditionally `Unit` without an
-/// explicit annotation (real Kotlin's own rule), so there's no
-/// "does the tail expression count" question left to ask there; only
-/// `walk_lambda` still needs this (a lambda's tail is always significant,
-/// but a `return` earlier in the same body still shouldn't also count the
-/// tail as a second, conflicting candidate).
+/// `return`" check, used two ways: (1) to decide whether a lambda body's
+/// tail expression is a *real* fallthrough candidate for return-type
+/// inference or a `return`-shadowed no-op (see `ReturnTypeContext::
+/// Collect`'s reconciliation, `walk_lambda`); (2) to decide whether a
+/// block-bodied `fun`/method declaring a non-`Unit` return type has
+/// provably satisfied it (`StmtKind::FunDecl`/`walk_class_method`'s own
+/// `ReturnTypeContext::Expected` handling — real Kotlin's "a 'return'
+/// expression required in a function with a block body" error). Not full
+/// reachability analysis — only recognizes the common idioms (`if`/`when`/
+/// `try` where every branch/catch's own last statement always returns);
+/// anything deeper (nested blocks, loops) is conservatively treated as
+/// "might fall through". For use (1) this only risks an occasional
+/// spurious "returns both X and Unit" diagnostic in an unusual shape,
+/// never a wrong inferred type silently accepted; for use (2) it can
+/// similarly flag a legitimate-but-unusual shape (e.g. a provably-
+/// always-returning `while (true) { ... return x }`, whose last statement
+/// is a loop, not a `return`/exhaustive `if`/`when`/`try`) — an accepted,
+/// documented trade-off, same conservative bias, never the reverse
+/// (silently missing a real missing-return gap).
 fn always_returns(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Return(_) => true,
@@ -1100,6 +1103,16 @@ fn always_returns(stmt: &Stmt) -> bool {
             ExprKind::When { arms, .. } => {
                 arms.iter().any(|a| a.is_else)
                     && arms.iter().all(|a| a.body.last().map(always_returns).unwrap_or(false))
+            }
+            // `finally`'s own body is irrelevant here (it runs for side
+            // effects only, never changes whether the `try` construct
+            // itself "returns a value" — the same reason it never
+            // participates in `ExprKind::Try`'s own type-join, see that
+            // arm above) — a `Try` always returns iff its own body does,
+            // and (when there are any) every `catch` body does too.
+            ExprKind::Try { body, catches, .. } => {
+                body.last().map(always_returns).unwrap_or(false)
+                    && catches.iter().all(|c| c.body.last().map(always_returns).unwrap_or(false))
             }
             _ => false,
         },
@@ -2129,6 +2142,39 @@ impl<'a> Resolver<'a> {
                                 stmt.span,
                             ));
                         }
+                        // A block body declaring a non-`Unit` return type
+                        // must provably always return a value via an
+                        // explicit `return` — real Kotlin's own "a
+                        // 'return' expression required in a function with
+                        // a block body" error. `declared == Unit` needs no
+                        // `return` at all (falling off the end already
+                        // means `Unit`, whether that came from a real `:
+                        // Unit` annotation or this same branch's own
+                        // no-annotation default just above), so it's
+                        // excluded here regardless of which produced it.
+                        // Reuses `always_returns` (`walk_lambda`'s own
+                        // return-type reconciliation already relies on the
+                        // same best-effort, single-level check) — an
+                        // unusual shape like a `while (true) { return x }`
+                        // whose last statement is a loop, not a `return`/
+                        // exhaustive `if`/`when`, can still trip this
+                        // conservatively (documented, same accepted
+                        // trade-off `always_returns` already has), but
+                        // never the reverse (silently missing a real gap).
+                        if let FunBody::Block(stmts) = body {
+                            if declared != Type::Unit
+                                && declared != Type::Unknown
+                                && !stmts.last().map(always_returns).unwrap_or(false)
+                            {
+                                self.type_errors.push(RuntimeError::new(
+                                    format!(
+                                        "a 'return' expression required in a function with a block body ('{{...}}') returning {}",
+                                        declared.name()
+                                    ),
+                                    stmt.span,
+                                ));
+                            }
+                        }
                         declared
                     }
                     ReturnTypeContext::Collect(mut seen) => {
@@ -2550,6 +2596,23 @@ impl<'a> Resolver<'a> {
             Vec::new(),
             doc,
         );
+        // `known_classes` only ever gets a *top-level* predpass
+        // (`resolve_with_imports`'s own construction) — a locally-scoped
+        // class (`class Foo { ... }` inside a function/lambda body) is
+        // never in it otherwise, so any type annotation referencing that
+        // class — including this class's own ctor params/properties, for
+        // a self-referential shape like `class Node(val next: Node?)` —
+        // would wrongly resolve to "unknown type" even when the class is
+        // declared earlier in the very same block. Inserting here, the
+        // moment any class (local or top-level) is actually walked, fixes
+        // this for every *subsequent* type annotation resolved anywhere
+        // in the rest of the file, local or not — deliberately not scoped
+        // to just this block (mirrors the already-accepted, documented
+        // "know it once declared, regardless of true lexical scope"
+        // compromise `Interpreter::known_classes`/`forward_declared_funs`
+        // both already make elsewhere in this file, not a new kind of
+        // leniency).
+        self.known_classes.insert(Rc::from(name));
 
         let mut fields = Vec::new();
         for cp in ctor_params {
@@ -2953,6 +3016,24 @@ impl<'a> Resolver<'a> {
                         format!("return type mismatch: expected {}, got {}", declared.name(), body_ty.name()),
                         stmt.span,
                     ));
+                }
+                // See `StmtKind::FunDecl`'s identical check for the full
+                // rationale — a block-bodied method declaring a non-`Unit`
+                // return type must provably always return via an explicit
+                // `return`.
+                if let FunBody::Block(stmts) = body {
+                    if declared != Type::Unit
+                        && declared != Type::Unknown
+                        && !stmts.last().map(always_returns).unwrap_or(false)
+                    {
+                        self.type_errors.push(RuntimeError::new(
+                            format!(
+                                "a 'return' expression required in a function with a block body ('{{...}}') returning {}",
+                                declared.name()
+                            ),
+                            stmt.span,
+                        ));
+                    }
                 }
                 declared
             }
@@ -7228,5 +7309,80 @@ mod tests {
         let result = resolve_src("class Foo {\n    fun test(): Int {\n        return kotlin.math.abs(-5)\n    }\n}\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    // ---- Bug 5: a block body declaring a non-Unit return type must return ----
+
+    #[test]
+    fn an_empty_block_body_with_a_non_unit_return_type_is_a_missing_return_error() {
+        let result = resolve_src("class Test {\n    fun get(): Int {}\n}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("a 'return' expression required")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_top_level_fun_with_an_empty_block_body_and_a_non_unit_return_type_is_also_flagged() {
+        let result = resolve_src("fun get(): Int {}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("a 'return' expression required")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_block_body_that_always_returns_is_not_flagged() {
+        let result = resolve_src("fun get(): Int {\n    return 5\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_block_body_returning_on_every_branch_of_an_exhaustive_if_is_not_flagged() {
+        let result = resolve_src("fun get(cond: Boolean): Int {\n    if (cond) {\n        return 1\n    } else {\n        return 2\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_block_body_that_might_not_return_on_every_branch_is_flagged() {
+        let result = resolve_src("fun get(cond: Boolean): Int {\n    if (cond) {\n        return 1\n    }\n}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("a 'return' expression required")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_unit_declared_block_body_never_needs_a_return() {
+        let result = resolve_src("fun sideEffect(): Unit {\n    println(\"hi\")\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_try_finally_whose_body_always_returns_is_not_flagged() {
+        // Regression guard: `always_returns` needed to learn about
+        // `ExprKind::Try` specifically for this — `finally`'s own body is
+        // irrelevant to whether the `try` construct itself always returns.
+        let result = resolve_src("fun f(): Int {\n    try {\n        return 1\n    } finally {\n        println(\"cleanup\")\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    // ---- Bug 6: a locally-scoped class is visible to its own siblings ----
+
+    #[test]
+    fn a_local_class_is_visible_as_a_type_annotation_to_a_later_sibling_local_class() {
+        let result = resolve_src(
+            "fun run(block: () -> Unit) { block() }\nrun {\n    class Test {\n    }\n    class Test2(val t: Test) {\n        fun get(): Test {\n            return t\n        }\n    }\n}\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_local_class_can_reference_itself_in_its_own_constructor_parameter() {
+        let result = resolve_src("fun run(block: () -> Unit) { block() }\nrun {\n    class Node(val next: Node?)\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 }

@@ -3269,4 +3269,32 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
         let src = "class Foods {\n    val foods: List = listOf()\n    fun addFood(pos: Int) {\n        foods.add(pos)\n    }\n    fun count(): Int {\n        return foods.size()\n    }\n}\nval f = Foods()\nf.addFood(1)\nf.addFood(2)\nprintln(f.count())\n";
         assert_eq!(run(src), "2\n");
     }
+
+    // ---- Bug 5: a block body declaring a non-Unit return type must return ----
+
+    #[test]
+    fn an_empty_block_body_with_a_non_unit_return_type_is_refused_before_running() {
+        let err = run_err("class Test {\n    fun get(): Int {}\n}\nprintln(Test().get())\n");
+        assert!(err.contains("a 'return' expression required"), "{err}");
+    }
+
+    #[test]
+    fn a_block_body_that_actually_returns_still_runs_correctly() {
+        let src = "class Test {\n    fun get(): Int {\n        return 5\n    }\n}\nprintln(Test().get())\n";
+        assert_eq!(run(src), "5\n");
+    }
+
+    // ---- Bug 6: a locally-scoped class is visible to its own siblings ----
+
+    #[test]
+    fn a_local_class_referencing_a_sibling_local_class_actually_runs() {
+        let src = "fun run(block: () -> Unit) { block() }\nrun {\n    class Test {\n        fun hi(): String = \"hi\"\n    }\n    class Test2(val t: Test) {\n        fun get(): Test = t\n    }\n    println(Test2(Test()).get().hi())\n}\n";
+        assert_eq!(run(src), "hi\n");
+    }
+
+    #[test]
+    fn a_self_referential_local_class_actually_runs() {
+        let src = "fun run(block: () -> Unit) { block() }\nrun {\n    class Node(val value: Int, val next: Node?)\n    val n = Node(2, Node(1, null))\n    println(n.value)\n    println(n.next!!.value)\n}\n";
+        assert_eq!(run(src), "2\n1\n");
+    }
 }
