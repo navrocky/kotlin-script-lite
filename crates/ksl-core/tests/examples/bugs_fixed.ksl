@@ -1,0 +1,69 @@
+// Regression coverage for the 4 bugs reported in the user's own
+// `tests/examples/bugs.ksl` scratch file — each repro below, fixed.
+
+fun run(block: () -> Unit) { block() }
+
+run {
+    // Bug 1: `init {}` now sees a field's own definite (first)
+    // assignment, not a "cannot reassign val" error.
+    class TestClass1 {
+        val field: String
+        init {
+            field = "bug1 fixed"
+        }
+    }
+    println(TestClass1().field)
+}
+
+run {
+    // Bug 2: a call to a not-yet-declared sibling `fun`, deferred inside
+    // another function's own body, now resolves — it only actually runs
+    // once `useTest()` itself is called, by which point `test()` has
+    // definitely already been declared.
+    fun useTest() {
+        test()
+    }
+
+    fun test() {
+        println("bug2 fixed")
+    }
+
+    useTest()
+}
+
+run {
+    // Bug 3: a block-bodied function with no return-type annotation now
+    // always infers `Unit`, matching real Kotlin — its own trailing
+    // expression is never silently promoted to a return value; an
+    // explicit `return` (whether the function is annotated or not) is
+    // required to produce anything else. The original bug's own script
+    // (`fun test() { 10 }; val i: Int = test()`) is now a compile-time
+    // "type mismatch: expected Int, got Unit" error instead of silently
+    // running — see `resolver::tests::a_block_bodied_fun_with_no_
+    // annotation_infers_unit_not_its_tail_value` for that negative case;
+    // this positive one shows an explicitly-annotated block body (always
+    // correct) still working exactly as before.
+    fun test(): Int {
+        10 // a bare, discarded expression statement — never the result
+        return 20
+    }
+    val i: Int = test()
+    println("bug3 fixed: $i")
+}
+
+run {
+    // Bug 4: a bare field name used as a chained call's own receiver now
+    // resolves through implicit `this`, instead of being mistaken for a
+    // package-qualified path.
+    class Foods {
+        val foods: List = listOf()
+
+        fun addFood(pos: Int): Unit {
+            foods.add(pos)
+        }
+    }
+    val f = Foods()
+    f.addFood(1)
+    f.addFood(2)
+    println("bug4 fixed: ${f.foods.size()}")
+}

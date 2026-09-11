@@ -447,7 +447,14 @@ impl<'a> Interpreter<'a> {
     /// access, including the ones inside a hot loop.
     fn eval_receiver(&mut self, receiver: &Expr, env: &Env) -> Result<Result<Value, Vec<String>>, Flow> {
         if let ExprKind::Name(name) = &receiver.kind {
-            return Ok(match env.get(name) {
+            // Same implicit-`this` fallback a bare `ExprKind::Name`
+            // evaluation already uses — without this, a bare field used as
+            // a chained call's own receiver (`foods.add(pos)` inside a
+            // method, `foods` a field with no local of that name) was
+            // wrongly treated as the start of a package-qualified path,
+            // crashing with "unknown package 'foods'" (see `resolver.rs`'s
+            // matching static-side fix, `is_implicit_this_field_or_method`).
+            return Ok(match env.get(name).or_else(|| self.implicit_this_field(env, name)) {
                 Some(v) => Ok(v),
                 None => Err(vec![name.clone()]),
             });
@@ -756,12 +763,21 @@ impl<'a> Interpreter<'a> {
                 ClassMember::Property { name, type_annotation, mutable, init, .. } => {
                     let ty = type_annotation.as_ref().map(resolve_ty).unwrap_or(crate::types::Type::Unknown);
                     fields.push(crate::class::FieldDecl { name: name.clone(), ty: ty.clone(), mutable: *mutable });
-                    constructor_body.push(crate::class::ConstructorStep::Property {
-                        name: name.clone(),
-                        mutable: *mutable,
-                        ty,
-                        init: init.clone(),
-                    });
+                    // No initializer at all (`val field: String`, no `=`)
+                    // — no `ConstructorStep` for it either; the resolver
+                    // has already proven (`ClassFieldInfo::assigned`) it's
+                    // definitely assigned by some later `init { }` block
+                    // instead, whose own `FieldAssign`/implicit-`this`
+                    // `Assign` step sets it directly via `set_field` — no
+                    // pre-population needed here.
+                    if let Some(init_expr) = init {
+                        constructor_body.push(crate::class::ConstructorStep::Property {
+                            name: name.clone(),
+                            mutable: *mutable,
+                            ty,
+                            init: init_expr.clone(),
+                        });
+                    }
                 }
                 ClassMember::Init(stmts) => constructor_body.push(crate::class::ConstructorStep::Init(stmts.clone())),
                 ClassMember::Method(stmt) => {
@@ -846,7 +862,17 @@ impl<'a> Interpreter<'a> {
         let Some(decl) = class.fields.iter().find(|f| f.name == field) else {
             return Err(RuntimeError::new(format!("'{}' has no field '{field}'", class.name), span).into());
         };
-        if !decl.mutable {
+        // A `val` field with no inline initializer (see `resolver.rs`'s
+        // `ClassFieldInfo::assigned` — the matching static-side proof)
+        // genuinely has no value at all until its own first assignment
+        // from an `init { }` block — `construct_object` never pre-
+        // populates it, so its presence in the object's own field map
+        // *is* the runtime signal for "already has a value." Only a
+        // field that's already present is a real reassignment; the very
+        // first write to an absent one is its definitional assignment,
+        // legal regardless of `mutable`.
+        let already_has_a_value = o.borrow().get_field(field).is_some();
+        if !decl.mutable && already_has_a_value {
             return Err(RuntimeError::new(format!("cannot reassign val '{field}'"), span).into());
         }
         let actual = crate::types::Type::from_value(&new_val);
@@ -1632,7 +1658,22 @@ impl<'a> Interpreter<'a> {
         let result = match &f.body {
             FunBody::Expr(e) => self.eval_expr(e, &call_env),
             FunBody::Block(stmts) => match self.exec_block(stmts, &call_env) {
-                Ok(v) => Ok(v),
+                // Real Kotlin rule: a block-bodied *named* `fun`/method's
+                // own tail expression is never its return value — only an
+                // explicit `return` is (`Err(Flow::Return(v))` below);
+                // falling off the end of the block always yields `Unit`.
+                // `f.name.is_none()` is the one, already-established
+                // signal for "this is actually a lambda literal, not a
+                // real `fun`" (every real `fun`/method/extension always
+                // has `Some(name)` — see `StmtKind::FunDecl`'s own
+                // `exec_stmt` handling and `exec_class_decl`'s method
+                // construction; only `ExprKind::Lambda`'s own
+                // `FunctionValue` ever has `None`, the same signal the
+                // implicit-`it`-parameter check just above already
+                // relies on) — a lambda's own trailing value is still its
+                // real result, matching Kotlin's actual lambda semantics
+                // (`xs.map { it * 2 }` would break otherwise).
+                Ok(v) => Ok(if f.name.is_some() { Value::Unit } else { v }),
                 Err(Flow::Return(v)) => Ok(v),
                 Err(e) => Err(e),
             },
@@ -3163,5 +3204,69 @@ println("x = $x, x*2 = ${x * 2}")"#), "x = 5, x*2 = 10\n");
             .expect("double is defined");
         let result = interp.call_extension(&f, crate::value::Value::Int(21), Vec::new(), crate::error::Span::default());
         assert!(matches!(result, Ok(crate::value::Value::Int(42))), "double() should still work after collect_cycles");
+    }
+
+    // ---- Bug 1: definite assignment for a property with no initializer ----
+
+    #[test]
+    fn a_field_assigned_from_init_constructs_and_reads_correctly() {
+        let src = "class TestClass1 {\n    val field: String\n    init {\n        field = \"hello\"\n    }\n}\nprintln(TestClass1().field)\n";
+        assert_eq!(run(src), "hello\n");
+    }
+
+    #[test]
+    fn a_field_assigned_via_explicit_this_in_init_also_works() {
+        let src = "class T {\n    val field: String\n    init {\n        this.field = \"explicit\"\n    }\n}\nprintln(T().field)\n";
+        assert_eq!(run(src), "explicit\n");
+    }
+
+    #[test]
+    fn a_var_field_with_no_initializer_can_be_assigned_more_than_once_in_init() {
+        let src = "class T {\n    var field: Int\n    init {\n        field = 1\n        field = 2\n    }\n}\nprintln(T().field)\n";
+        assert_eq!(run(src), "2\n");
+    }
+
+    // ---- Bug 2: deferred forward-reference for a local/nested `fun` ----
+
+    #[test]
+    fn a_deferred_forward_reference_actually_runs_correctly() {
+        let src = "fun useTest() {\n    test()\n}\nfun test() {\n    println(\"test ran\")\n}\nuseTest()\n";
+        assert_eq!(run(src), "test ran\n");
+    }
+
+    #[test]
+    fn the_exact_bugs_ksl_shape_wrapped_in_a_lambda_runs_correctly() {
+        let src = "fun run(block: () -> Unit) { block() }\nrun {\n    fun useTest() {\n        test()\n    }\n    fun test() {\n        println(\"test ran, wrapped\")\n    }\n    useTest()\n}\n";
+        assert_eq!(run(src), "test ran, wrapped\n");
+    }
+
+    // ---- Bug 3: block-bodied fun with no annotation always returns Unit ----
+
+    #[test]
+    fn a_block_bodied_fun_with_no_return_actually_returns_unit_at_runtime() {
+        // Bypasses static checking on purpose — this exercises the
+        // *runtime* half of the fix (`call_function_inner`) directly,
+        // independent of the resolver now also refusing to compile
+        // `val i: Int = test()` for the same script.
+        let mut out = Vec::new();
+        let program = crate::parse_only("fun test() {\n    10\n}\nprintln(test())\n").expect("valid syntax");
+        let mut interp = super::Interpreter::new(&mut out);
+        assert!(interp.run(&program.stmts).is_ok());
+        drop(interp);
+        assert_eq!(String::from_utf8(out).unwrap(), "kotlin.Unit\n");
+    }
+
+    #[test]
+    fn a_lambda_still_returns_its_tail_value_at_runtime() {
+        let src = "val f: (Int) -> Int = { x -> x * 2 }\nprintln(f(5))\n";
+        assert_eq!(run(src), "10\n");
+    }
+
+    // ---- Bug 4: implicit-`this` as a chained call's own receiver ----
+
+    #[test]
+    fn a_bare_field_receiver_of_a_method_call_dispatches_correctly() {
+        let src = "class Foods {\n    val foods: List = listOf()\n    fun addFood(pos: Int) {\n        foods.add(pos)\n    }\n    fun count(): Int {\n        return foods.size()\n    }\n}\nval f = Foods()\nf.addFood(1)\nf.addFood(2)\nprintln(f.count())\n";
+        assert_eq!(run(src), "2\n");
     }
 }

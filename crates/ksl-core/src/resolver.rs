@@ -195,6 +195,25 @@ struct ClassFieldInfo {
     /// entry pointing back at it, the same way a use of any ordinary local
     /// does — see `ExprKind::FieldAccess`'s handling.
     symbol_idx: usize,
+    /// Presence-based (not full per-branch dataflow) definite-assignment
+    /// tracking: `true` immediately for a promoted ctor param (bound from
+    /// a real argument before any constructor code runs at all) and for a
+    /// body `Property` with its own inline initializer (set right after
+    /// that initializer is walked, in `walk_class_decl`'s Phase-2 loop —
+    /// deliberately *after*, not before, so a self-reference in that same
+    /// initializer still reads as unassigned). `false` for a `Property`
+    /// with no initializer until `check_val_reassignment` sees its first
+    /// assignment somewhere in an `init { }` block, walked in textual
+    /// order (the same order the constructor actually runs in) — read via
+    /// `check_read_before_assignment` (a read while still `false` is a
+    /// "must be initialized before use" error) and checked for
+    /// completeness once the whole class body has been walked (a `false`
+    /// field at that point never got assigned *anywhere* in the
+    /// constructor at all). Known, accepted limitation: this proves
+    /// "assigned somewhere earlier in program order," not "assigned on
+    /// every possible execution path" — `if (x) { field = a }` counts as
+    /// assigned even when `x` could be `false` at runtime.
+    assigned: bool,
 }
 
 struct ClassMethodInfo {
@@ -716,8 +735,10 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
             .collect(),
         known_type_aliases: HashMap::new(),
         extension_functions: HashMap::new(),
+        forward_declared_funs: HashMap::new(),
         class_info: HashMap::new(),
         current_class: None,
+        in_constructor: false,
         return_type_stack: Vec::new(),
         narrowed: HashMap::new(),
         possibly_reassigned: HashSet::new(),
@@ -870,6 +891,19 @@ struct Resolver<'a> {
     /// enumeration rather than lookup). See `define_extension_function`/
     /// `extension_method_signature`.
     extension_functions: HashMap<(Rc<str>, String), Vec<usize>>,
+    /// Per-block-scope, lazily-computed signatures of every plain (non-
+    /// extension) `fun` directly declared in that scope's own statement
+    /// list — a read-only side table (never touches `scope.names`/
+    /// `self.table.symbols`, so it can never conflict with `define`'s own
+    /// "already declared" bookkeeping), keyed by scope id, populated once
+    /// per scope the first time `walk_stmts` is called for it. Consulted
+    /// only by `forward_declared_fun_signature`, which additionally
+    /// requires the *reference* to be lexically nested inside another
+    /// callable body relative to the declaring block — see that method's
+    /// own doc comment for the exact rule (deliberately narrower than real
+    /// Kotlin's unconditional same-file/same-block hoisting, per this
+    /// session's own discussion).
+    forward_declared_funs: HashMap<usize, HashMap<String, CallSignature>>,
     /// Every `class` declared in this file's own static shape (fields'/
     /// methods' real, checkable signatures) — see `ClassInfo`'s own doc
     /// comment. Populated as each `ClassDecl` is walked (`walk_class_decl`),
@@ -896,6 +930,18 @@ struct Resolver<'a> {
     /// interaction to worry about: a local class's own body walk saves
     /// and restores this exactly like a top-level one would).
     current_class: Option<Rc<str>>,
+    /// `true` while walking exactly a class's own property initializers/
+    /// `init { }` blocks (`walk_class_decl`'s own per-member loop) —
+    /// `false` everywhere else, including inside a method body reached
+    /// from within that same loop (`walk_class_method` saves/restores this
+    /// to `false` around its own body walk). This is what scopes the
+    /// definite-assignment relaxation (`check_val_reassignment`/
+    /// `check_read_before_assignment`, see `ClassFieldInfo::assigned`) to
+    /// construction specifically — a `val` field with no initializer may
+    /// only ever receive its one defining assignment while this is `true`;
+    /// a method touching it (even the very first method ever called)
+    /// always sees it as a real, already-final `val`.
+    in_constructor: bool,
     /// Stack of enclosing functions'/lambdas' return-type contexts,
     /// pushed/popped around walking a body, so `Return` checks/collects
     /// against the right one even when nested. See `ReturnTypeContext`.
@@ -1027,16 +1073,22 @@ fn reconcile_types(candidates: &[Type]) -> Reconciled {
 }
 
 /// Best-effort, single-level "does this statement always exit via
-/// `return`" check — used only to decide whether a fun/lambda body's tail
+/// `return`" check — used to decide whether a lambda body's tail
 /// expression is a *real* fallthrough candidate for return-type inference
 /// or a `return`-shadowed no-op (see `ReturnTypeContext::Collect`'s
-/// reconciliation). Not full reachability analysis — only recognizes the
-/// single most common idiom (`if`/`when` where every branch's own last
-/// statement is `return`); anything deeper (nested blocks, loops) is
-/// conservatively treated as "might fall through", which only risks an
-/// occasional spurious "returns both X and Unit" diagnostic in an unusual
-/// shape, never a wrong inferred type silently accepted — an explicit
-/// return-type annotation always sidesteps this entirely.
+/// reconciliation, `walk_lambda`). Not full reachability analysis — only
+/// recognizes the single most common idiom (`if`/`when` where every
+/// branch's own last statement is `return`); anything deeper (nested
+/// blocks, loops) is conservatively treated as "might fall through",
+/// which only risks an occasional spurious "returns both X and Unit"
+/// diagnostic in an unusual shape, never a wrong inferred type silently
+/// accepted. A named `fun`/class method's own block body no longer uses
+/// this at all — its return type is unconditionally `Unit` without an
+/// explicit annotation (real Kotlin's own rule), so there's no
+/// "does the tail expression count" question left to ask there; only
+/// `walk_lambda` still needs this (a lambda's tail is always significant,
+/// but a `return` earlier in the same body still shouldn't also count the
+/// tail as a second, conflicting candidate).
 fn always_returns(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Return(_) => true,
@@ -1324,7 +1376,11 @@ impl<'a> Resolver<'a> {
             if let Some(info) = self.class_info.get(class_name.as_ref()) {
                 if let Some(f) = info.fields.iter().find(|f| f.name == name) {
                     self.table.occurrences.push((use_span, f.symbol_idx));
-                    return f.ty.clone();
+                    let ty = f.ty.clone();
+                    // A bare name resolving to a field always implicitly
+                    // means `this.field`.
+                    self.check_read_before_assignment(name, true, use_span);
+                    return ty;
                 }
                 if let Some(m) = info.methods.iter().find(|m| m.name == name) {
                     self.table.occurrences.push((use_span, m.symbol_idx));
@@ -1356,6 +1412,16 @@ impl<'a> Resolver<'a> {
                 );
                 return found.symbol.ty.clone();
             }
+        }
+        // A same-block sibling `fun`, declared later, referenced from
+        // inside another callable's body (deferred execution) — see
+        // `forward_declared_fun_signature`'s own doc comment for the exact
+        // rule. No `occurrences`/named-argument checking for this call
+        // yet (a real, accepted scope limit — the declaration's exact
+        // `Symbol` doesn't exist until the real, in-order walk reaches
+        // it), just the call's own type, so it isn't wrongly flagged.
+        if let Some((ret, params, ..)) = self.forward_declared_fun_signature(scope, name) {
+            return Type::Function(params, Box::new(ret));
         }
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
         Type::Unknown
@@ -1456,7 +1522,11 @@ impl<'a> Resolver<'a> {
     /// through (`f().g`).
     fn dotted_path_if_not_local(&self, expr: &Expr, scope: usize) -> Option<Vec<String>> {
         match &expr.kind {
-            ExprKind::Name(name) if self.resolve_symbol(scope, name).is_none() => Some(vec![name.clone()]),
+            ExprKind::Name(name)
+                if self.resolve_symbol(scope, name).is_none() && !self.is_implicit_this_field_or_method(name) =>
+            {
+                Some(vec![name.clone()])
+            }
             ExprKind::FieldAccess { receiver, field, .. } => {
                 let mut path = self.dotted_path_if_not_local(receiver, scope)?;
                 path.push(field.clone());
@@ -1464,6 +1534,28 @@ impl<'a> Resolver<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Whether `name` (already ruled out as an ordinary scope-chain local)
+    /// would instead resolve via the implicit-`this` fallback — i.e. the
+    /// exact same field/method lookup `resolve_name` itself falls back to,
+    /// just as a pure yes/no check with no side effects (no `occurrences`
+    /// entry, no type returned): `dotted_path_if_not_local` only needs to
+    /// know whether to treat a bare name as "local" or "possibly a
+    /// package," not resolve it — the real resolution (and thus the real
+    /// `occurrences` entry/type) still happens exactly as before, through
+    /// the ordinary `self.walk_expr(receiver, ...)` path, once this
+    /// returns `true` and `dotted_path_if_not_local` backs off. Without
+    /// this, a bare field/method receiver of a chained call (`foods.add
+    /// (pos)` inside a method, `foods` a field with no local of that name)
+    /// was wrongly flattened into a package-qualified path, reporting
+    /// "unknown package 'foods'" — this check is what `resolve_name`'s own
+    /// implicit-`this` fallback already effectively is, just without its
+    /// side effects.
+    fn is_implicit_this_field_or_method(&self, name: &str) -> bool {
+        let Some(class_name) = &self.current_class else { return false };
+        let Some(info) = self.class_info.get(class_name.as_ref()) else { return false };
+        info.fields.iter().any(|f| f.name == name) || info.methods.iter().any(|m| m.name == name)
     }
 
     /// Read-only scope-chain lookup by name, returning the matched `Symbol`
@@ -1511,6 +1603,53 @@ impl<'a> Resolver<'a> {
         Vec::new()
     }
 
+    /// The signature of `name`, if it's a sibling `fun` declared *later*
+    /// in some ancestor block's own statement list, but only when the
+    /// reference itself is lexically nested inside at least one function/
+    /// lambda body relative to that declaring block — real Kotlin-like
+    /// same-block forward reference, deliberately narrowed to only the
+    /// "deferred execution" case:
+    /// ```kotlin
+    /// fun useTest() { test() }   // OK — deferred: only runs once useTest()
+    /// fun test() {}              // is itself called, by which point `test`
+    ///                            // has definitely already been registered
+    ///
+    /// test3()                    // NOT OK — runs immediately, before
+    /// fun test3() {}              // `test3`'s own declaration is reached
+    /// ```
+    /// A direct call in the very same block as the declaration stays a
+    /// genuine "undefined name," exactly as before — the interpreter has
+    /// no static pre-scan of its own (see `StmtKind::FunDecl`'s own
+    /// `exec_stmt` handling: a function is only registered into `env` when
+    /// its own statement is *actually reached*), so resolving that shape
+    /// would risk a real, unproven-by-the-resolver runtime crash.
+    ///
+    /// Implementation mirrors `SymbolTable::inside_a_loop_at`'s own
+    /// scope-chain walk, just tracking "have I crossed a
+    /// `ScopeKind::FunctionBoundary` yet" instead of stopping at the
+    /// first one. **Order matters**: each scope's own `forward_declared_
+    /// funs` entry is checked *before* that same scope's own `kind` is
+    /// folded into `crossed_boundary` — `crossed_boundary` must reflect
+    /// only scopes already left behind, not the current one, or a direct
+    /// call sitting immediately inside a `FunctionBoundary` scope (e.g.
+    /// everything in this file is itself wrapped in one outer lambda —
+    /// `run { ... }` — so *that* lambda's own scope is a `FunctionBoundary`
+    /// too) would wrongly count as "already deferred" relative to its own
+    /// direct siblings.
+    fn forward_declared_fun_signature(&self, scope: usize, name: &str) -> Option<CallSignature> {
+        let mut idx = scope;
+        let mut crossed_boundary = false;
+        loop {
+            if let Some(sig) = self.forward_declared_funs.get(&idx).and_then(|m| m.get(name)) {
+                return if crossed_boundary { Some(sig.clone()) } else { None };
+            }
+            if self.table.scopes[idx].kind == ScopeKind::FunctionBoundary {
+                crossed_boundary = true;
+            }
+            idx = self.table.scopes[idx].parent?;
+        }
+    }
+
     /// `following` is the span of whatever comes next, textually, after
     /// this whole statement list — used only to give the *last* statement
     /// in the list (if it opens a scope) a real upper bound; every earlier
@@ -1532,6 +1671,39 @@ impl<'a> Resolver<'a> {
     /// funnels through here (directly, or via `walk_block`), so this one
     /// snapshot/restore correctly scopes every narrowing source.
     fn walk_stmts(&mut self, stmts: &[Stmt], scope: usize, following: Span) -> Type {
+        // Real, same-block forward-reference support for a sibling `fun`
+        // declared later in this exact statement list — see
+        // `forward_declared_fun_signature`'s own doc comment for the exact
+        // (deliberately narrower-than-real-Kotlin) rule this enables.
+        // Computed lazily, once per distinct `scope` (every concrete scope
+        // id is walked via `walk_stmts` exactly once), as a read-only side
+        // table — never touches `scope.names`/`self.table.symbols`, so the
+        // real, in-order walk below registers each `FunDecl`'s own symbol
+        // completely normally, with no risk of a false "already declared"
+        // from this predpass itself.
+        if !self.forward_declared_funs.contains_key(&scope) {
+            let mut sigs = HashMap::new();
+            for s in stmts {
+                if let StmtKind::FunDecl { name, receiver: None, params, return_type, .. } = &s.kind {
+                    let param_types = params
+                        .iter()
+                        .map(|p| {
+                            p.type_annotation
+                                .as_ref()
+                                .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
+                                .unwrap_or(Type::Unknown)
+                        })
+                        .collect();
+                    let param_names = params.iter().map(|p| p.name.clone()).collect();
+                    let ret_ty = return_type
+                        .as_ref()
+                        .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
+                        .unwrap_or(Type::Unknown);
+                    sigs.insert(name.clone(), (ret_ty, param_types, param_names, Vec::new(), Vec::new()));
+                }
+            }
+            self.forward_declared_funs.insert(scope, sigs);
+        }
         let narrowed_on_entry = self.narrowed.clone();
         let mut last = Type::Unit;
         for (i, s) in stmts.iter().enumerate() {
@@ -1708,10 +1880,10 @@ impl<'a> Resolver<'a> {
                             Some((field_ty, mutable, symbol_idx)) => {
                                 self.touch(scope, stmt.span);
                                 self.table.occurrences.push((stmt.span, symbol_idx));
-                                if !mutable {
-                                    self.type_errors
-                                        .push(RuntimeError::new(format!("cannot reassign val '{name}'"), stmt.span));
-                                }
+                                // A bare name resolving to a field always
+                                // implicitly means `this.field` — real
+                                // definite-first-assignment candidate.
+                                self.check_val_reassignment(name, mutable, true, stmt.span);
                                 if *op == AssignOp::Set
                                     && field_ty != Type::Unknown
                                     && value_ty != Type::Unknown
@@ -1917,6 +2089,18 @@ impl<'a> Resolver<'a> {
                 self.walk_params(params, fn_scope, following, parsed_doc.as_ref());
                 self.return_type_stack.push(if has_return_annotation {
                     ReturnTypeContext::Expected(ret_ty.clone())
+                } else if matches!(body, FunBody::Block(_)) {
+                    // Real Kotlin rule: a function with a BLOCK body and no
+                    // explicit return-type annotation always has return
+                    // type `Unit` — the tail expression of a block body is
+                    // never itself a return value (unlike an expression
+                    // body, `fun f() = expr`), so it's never a candidate
+                    // for inference here; an explicit `return <value>`
+                    // inside such a body now gets a real "type mismatch:
+                    // expected Unit" diagnostic via the same `Expected`
+                    // handling below, instead of silently setting the
+                    // whole function's inferred return type.
+                    ReturnTypeContext::Expected(Type::Unit)
                 } else {
                     ReturnTypeContext::Collect(Vec::new())
                 });
@@ -1948,21 +2132,14 @@ impl<'a> Resolver<'a> {
                         declared
                     }
                     ReturnTypeContext::Collect(mut seen) => {
-                        // The tail expression only counts as a return-type
-                        // candidate if the body could actually fall
-                        // through to it — see `always_returns`'s doc
-                        // comment for why an unconditional `return` (or an
-                        // if/when where every branch returns) must not
-                        // also contribute a phantom `Unit` candidate here.
-                        let falls_through = match body {
-                            FunBody::Expr(_) => true,
-                            FunBody::Block(stmts) => {
-                                !stmts.last().map(always_returns).unwrap_or(false)
-                            }
-                        };
-                        if falls_through {
-                            seen.push(body_ty.clone());
-                        }
+                        // Only ever reached for an expression body with no
+                        // return-type annotation now — a block body always
+                        // pushes `Expected(Type::Unit)` above instead, so
+                        // its own tail statement is never a return-type
+                        // candidate here; the tail expression IS the
+                        // return value for an expression body,
+                        // unconditionally.
+                        seen.push(body_ty.clone());
                         match reconcile_types(&seen) {
                             Reconciled::Agreed(t) => t,
                             Reconciled::Nothing => {
@@ -2107,9 +2284,11 @@ impl<'a> Resolver<'a> {
                             } else if let Some(cross_ref) = self.class_field_cross_file_ref(&recv_ty, field) {
                                 self.cross_file_refs.insert(*field_span, cross_ref);
                             }
-                            if !mutable {
-                                self.type_errors.push(RuntimeError::new(format!("cannot reassign val '{field}'"), *field_span));
-                            }
+                            // `other.field = x` (any receiver besides a
+                            // bare `this`) never gets the definite-first-
+                            // assignment relaxation — only this instance's
+                            // own construction can grant it.
+                            self.check_val_reassignment(field, mutable, matches!(&receiver.kind, ExprKind::This), *field_span);
                             if *op == AssignOp::Set
                                 && field_ty != Type::Unknown
                                 && value_ty != Type::Unknown
@@ -2385,7 +2564,7 @@ impl<'a> Resolver<'a> {
                 // the ctor param's own real `Symbol` is defined into
                 // `ctor_scope` (Phase 2 defines it; Phase 1 only computes
                 // signatures).
-                fields.push(ClassFieldInfo { name: cp.param.name.clone(), ty, mutable, symbol_idx: 0 });
+                fields.push(ClassFieldInfo { name: cp.param.name.clone(), ty, mutable, symbol_idx: 0, assigned: true });
             }
         }
         for m in members {
@@ -2395,8 +2574,13 @@ impl<'a> Resolver<'a> {
                     .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
                     .unwrap_or(Type::Unknown);
                 // Patched below too, once `define_class_member` runs for
-                // this property in Phase 2.
-                fields.push(ClassFieldInfo { name: fname.clone(), ty, mutable: *mutable, symbol_idx: 0 });
+                // this property in Phase 2. `assigned: false` unconditionally
+                // here — even a property WITH an inline initializer only
+                // becomes `assigned` once Phase 2 actually walks that
+                // initializer, in declaration order (see `ClassFieldInfo::
+                // assigned`'s own doc comment for why this can't be seeded
+                // `true` up front here).
+                fields.push(ClassFieldInfo { name: fname.clone(), ty, mutable: *mutable, symbol_idx: 0, assigned: false });
             }
         }
         let mut methods = Vec::new();
@@ -2527,34 +2711,66 @@ impl<'a> Resolver<'a> {
         // classes can't nest, but this stays correct if that ever
         // changes).
         let outer_class = self.current_class.replace(Rc::from(name));
+        // `in_constructor` is `true` for exactly the span of this loop
+        // (property initializers + `init` blocks) — `walk_class_method`
+        // (below) saves/restores it to `false` around its own body walk,
+        // since a method body is never part of construction, even though
+        // it's reached from within this same loop. See `ClassFieldInfo::
+        // assigned`'s doc comment for what this gates.
+        let outer_in_constructor = std::mem::replace(&mut self.in_constructor, true);
         for m in members {
             match m {
                 ClassMember::Property { name: fname, name_span: fspan, type_annotation, mutable, init, doc_comment } => {
                     let expected = type_annotation.as_ref().map(|a| self.resolve_type_annotation_here(Some(a)));
-                    let init_ty = self.walk_expr_expected(init, ctor_scope, following, expected.as_ref());
-                    let field_ty = match &expected {
-                        Some(t) => {
-                            if init_ty != Type::Unknown && *t != Type::Unknown && !types::is_assignable(&init_ty, t) {
-                                self.type_errors.push(RuntimeError::new(
-                                    format!(
-                                        "property '{fname}' has type {}, but its initializer has type {}",
-                                        t.name(),
-                                        init_ty.name()
-                                    ),
-                                    init.span,
-                                ));
+                    let field_ty = match init {
+                        Some(init_expr) => {
+                            let init_ty = self.walk_expr_expected(init_expr, ctor_scope, following, expected.as_ref());
+                            let ty = match &expected {
+                                Some(t) => {
+                                    if init_ty != Type::Unknown && *t != Type::Unknown && !types::is_assignable(&init_ty, t) {
+                                        self.type_errors.push(RuntimeError::new(
+                                            format!(
+                                                "property '{fname}' has type {}, but its initializer has type {}",
+                                                t.name(),
+                                                init_ty.name()
+                                            ),
+                                            init_expr.span,
+                                        ));
+                                    }
+                                    t.clone()
+                                }
+                                None => {
+                                    if init_ty == Type::Unknown {
+                                        self.type_errors.push(RuntimeError::new(
+                                            format!("cannot infer type of property '{fname}'; add an explicit type annotation"),
+                                            *fspan,
+                                        ));
+                                    }
+                                    init_ty
+                                }
+                            };
+                            // Marked *after* walking the initializer, not
+                            // before — so a self-reference in its own
+                            // initializer (`val a: Int = a`) still reads
+                            // as "not yet assigned" via `resolve_name`'s
+                            // own `check_read_before_assignment` call.
+                            if let Some(info) = self.class_info.get_mut(name) {
+                                if let Some(f) = info.fields.iter_mut().find(|f| f.name == *fname) {
+                                    f.assigned = true;
+                                }
                             }
-                            t.clone()
+                            ty
                         }
-                        None => {
-                            if init_ty == Type::Unknown {
+                        None => match &expected {
+                            Some(t) => t.clone(),
+                            None => {
                                 self.type_errors.push(RuntimeError::new(
-                                    format!("cannot infer type of property '{fname}'; add an explicit type annotation"),
+                                    format!("property '{fname}' must have either an initializer or an explicit type annotation"),
                                     *fspan,
                                 ));
+                                Type::Unknown
                             }
-                            init_ty
-                        }
+                        },
                     };
                     if let Some(info) = self.class_info.get_mut(name) {
                         if let Some(f) = info.fields.iter_mut().find(|f| f.name == *fname) {
@@ -2593,6 +2809,23 @@ impl<'a> Resolver<'a> {
                 }
                 ClassMember::Method(method_stmt) => {
                     self.walk_class_method(method_stmt, name, scope, following);
+                }
+            }
+        }
+        self.in_constructor = outer_in_constructor;
+        // Presence-based definite-assignment completeness check: every
+        // field with no inline initializer must have been assigned by
+        // *some* statement somewhere in the constructor (an `init` block,
+        // per the loop above) — otherwise it's never given a value at
+        // all. See `ClassFieldInfo::assigned`'s own doc comment for the
+        // accepted, non-branch-sensitive scope of this check.
+        if let Some(info) = self.class_info.get(name) {
+            for f in &info.fields {
+                if !f.assigned {
+                    self.type_errors.push(RuntimeError::new(
+                        format!("property '{}' must be initialized", f.name),
+                        name_span,
+                    ));
                 }
             }
         }
@@ -2689,13 +2922,25 @@ impl<'a> Resolver<'a> {
         self.walk_params(params, fn_scope, following, parsed_doc.as_ref());
         self.return_type_stack.push(if has_return_annotation {
             ReturnTypeContext::Expected(ret_ty.clone())
+        } else if matches!(body, FunBody::Block(_)) {
+            // Real Kotlin rule: a block-bodied function with no explicit
+            // return-type annotation always has return type `Unit` — see
+            // `StmtKind::FunDecl`'s identical handling for the full
+            // rationale.
+            ReturnTypeContext::Expected(Type::Unit)
         } else {
             ReturnTypeContext::Collect(Vec::new())
         });
+        // A method body is never part of construction, even one reached
+        // (textually) from inside `walk_class_decl`'s own per-member loop,
+        // which has already set `in_constructor = true` — see that field's
+        // own doc comment.
+        let outer_in_constructor = std::mem::replace(&mut self.in_constructor, false);
         let body_ty = match body {
             FunBody::Expr(e) => self.walk_expr(e, fn_scope, following),
             FunBody::Block(stmts) => self.walk_stmts(stmts, fn_scope, following),
         };
+        self.in_constructor = outer_in_constructor;
         let ctx = self.return_type_stack.pop().unwrap();
         let final_ret_ty = match ctx {
             ReturnTypeContext::Expected(declared) => {
@@ -2712,13 +2957,11 @@ impl<'a> Resolver<'a> {
                 declared
             }
             ReturnTypeContext::Collect(mut seen) => {
-                let falls_through = match body {
-                    FunBody::Expr(_) => true,
-                    FunBody::Block(stmts) => !stmts.last().map(always_returns).unwrap_or(false),
-                };
-                if falls_through {
-                    seen.push(body_ty.clone());
-                }
+                // Only ever reached for an expression-bodied method with
+                // no return-type annotation now — a block-bodied method
+                // always pushes `Expected(Type::Unit)` above instead, same
+                // as `StmtKind::FunDecl`'s identical fix.
+                seen.push(body_ty.clone());
                 match reconcile_types(&seen) {
                     Reconciled::Agreed(t) => t,
                     Reconciled::Nothing => {
@@ -2874,6 +3117,61 @@ impl<'a> Resolver<'a> {
             }
         }
         None
+    }
+
+    /// Checks (and, for a legal definite-first-assignment, records)
+    /// whether assigning to `field_name` on the *current* class instance
+    /// is legal — shared by `StmtKind::Assign`'s implicit-`this` fallback
+    /// and `StmtKind::FieldAssign`'s explicit-receiver handling (`this.
+    /// field = `/`obj.field = `), so both apply the exact same
+    /// presence-based definite-assignment rule rather than risking the two
+    /// drifting apart. `is_this_receiver` is `false` for any receiver
+    /// other than a bare `this` (including another instance of the same
+    /// class, e.g. `other.field = x`) — the relaxation below is specific
+    /// to *this* instance's own construction, never someone else's
+    /// already-built object. See `ClassFieldInfo::assigned`'s own doc
+    /// comment for the full picture (including its accepted, non-branch-
+    /// sensitive scope) and `check_read_before_assignment`, its read-side
+    /// counterpart.
+    fn check_val_reassignment(&mut self, field_name: &str, mutable: bool, is_this_receiver: bool, span: Span) {
+        let already_assigned = self.current_class.as_ref().and_then(|c| {
+            self.class_info.get(c.as_ref()).and_then(|info| info.fields.iter().find(|f| f.name == field_name).map(|f| f.assigned))
+        });
+        let is_definite_first_assignment = is_this_receiver && self.in_constructor && already_assigned == Some(false);
+        if !mutable && !is_definite_first_assignment {
+            self.type_errors.push(RuntimeError::new(format!("cannot reassign val '{field_name}'"), span));
+        }
+        if is_this_receiver && self.in_constructor {
+            // Bookkeeping only — legal to update regardless of val/var: a
+            // `var` field with no initializer needs exactly the same "was
+            // it assigned somewhere during construction" completeness
+            // check a `val` does (see `walk_class_decl`'s end-of-loop
+            // sweep), just never the reassignment restriction afterward.
+            if let Some(cn) = self.current_class.clone() {
+                if let Some(info) = self.class_info.get_mut(cn.as_ref()) {
+                    if let Some(f) = info.fields.iter_mut().find(|f| f.name == field_name) {
+                        f.assigned = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The read-side counterpart of `check_val_reassignment` (see its own
+    /// doc comment) — flags a read of `field_name` on `this`, during
+    /// construction, strictly before its own definite (first) assignment
+    /// has been seen yet. Same presence-based, non-branch-sensitive scope:
+    /// this is a *use*-site check, so it never mutates `assigned` itself.
+    fn check_read_before_assignment(&mut self, field_name: &str, is_this_receiver: bool, span: Span) {
+        if !is_this_receiver || !self.in_constructor {
+            return;
+        }
+        let assigned = self.current_class.as_ref().and_then(|c| {
+            self.class_info.get(c.as_ref()).and_then(|info| info.fields.iter().find(|f| f.name == field_name).map(|f| f.assigned))
+        });
+        if assigned == Some(false) {
+            self.type_errors.push(RuntimeError::new(format!("property '{field_name}' must be initialized before use"), span));
+        }
     }
 
     /// `(field's type, mutable)` for `t.field`/`t.field = ...` — same-file
@@ -3651,6 +3949,7 @@ impl<'a> Resolver<'a> {
                             } else if let Some(cross_ref) = self.class_field_cross_file_ref(&recv_ty, field) {
                                 self.cross_file_refs.insert(*field_span, cross_ref);
                             }
+                            self.check_read_before_assignment(field, matches!(&receiver.kind, ExprKind::This), *field_span);
                             self.class_field_type(&recv_ty, field).map(|(ty, _)| ty).unwrap_or(Type::Unknown)
                         } else if recv_ty == Type::Unknown {
                             Type::Unknown
@@ -3662,6 +3961,7 @@ impl<'a> Resolver<'a> {
                                     } else if let Some(cross_ref) = self.class_field_cross_file_ref(&recv_ty, field) {
                                         self.cross_file_refs.insert(*field_span, cross_ref);
                                     }
+                                    self.check_read_before_assignment(field, matches!(&receiver.kind, ExprKind::This), *field_span);
                                     ty
                                 }
                                 None => {
@@ -6718,5 +7018,215 @@ mod tests {
         // mismatch this test would catch.
         let result = resolve_src("fun String.pair(a: Int, b: String): String = b + a.toString()\nval x: String = \"s\".pair(b = \"hi\", a = 5)\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    // ---- Bug 1: definite assignment for a property with no initializer ----
+
+    #[test]
+    fn definite_assignment_in_init_is_not_a_reassignment() {
+        let result = resolve_src("class Foo {\n    val field: String\n    init {\n        field = \"\"\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn definite_assignment_via_explicit_this_is_not_a_reassignment() {
+        let result = resolve_src("class Foo {\n    val field: String\n    init {\n        this.field = \"\"\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_second_assignment_to_the_same_field_is_still_a_reassignment_error() {
+        let result = resolve_src("class Foo {\n    val field: String\n    init {\n        field = \"a\"\n        field = \"b\"\n    }\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'field'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_field_never_assigned_anywhere_is_an_error() {
+        let result = resolve_src("class Foo {\n    val field: String\n    init {\n    }\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("property 'field' must be initialized")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_property_with_neither_initializer_nor_annotation_is_an_error() {
+        let result = resolve_src("class Foo {\n    val field\n}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("must have either an initializer or an explicit type annotation")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn assigning_another_instances_field_is_never_relaxed() {
+        let result = resolve_src(
+            "class Foo {\n    val field: String\n    init { field = \"\" }\n    fun steal(other: Foo) {\n        other.field = \"x\"\n    }\n}\n",
+        );
+        assert!(result.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'field'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn reading_a_field_before_its_assignment_in_init_is_an_error() {
+        let result = resolve_src("class Foo {\n    val field: String\n    init {\n        println(field)\n        field = \"\"\n    }\n}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("property 'field' must be initialized before use")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn reading_a_field_after_its_assignment_in_init_is_fine() {
+        let result = resolve_src("class Foo {\n    val field: String\n    init {\n        field = \"\"\n        println(field)\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_property_initializer_reading_a_later_uninitialized_property_is_an_error() {
+        // `b` is declared BELOW `a`, with no initializer of its own — `a`'s
+        // own initializer runs first (declaration order), so `b` isn't
+        // assigned yet at that point.
+        let result = resolve_src("class Foo {\n    val a: Int = b + 1\n    val b: Int\n    init { b = 5 }\n}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("property 'b' must be initialized before use")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_property_initializer_reading_an_earlier_already_initialized_property_is_fine() {
+        let result = resolve_src("class Foo {\n    val b: Int = 5\n    val a: Int = b + 1\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_self_referential_initializer_is_an_error() {
+        let result = resolve_src("class Foo {\n    val a: Int = a\n}\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("property 'a' must be initialized before use")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_method_body_never_gets_the_definite_assignment_relaxation() {
+        // `field` has no initializer and is never assigned in any `init`
+        // block at all — even a method attempting a "first" assignment
+        // still can't, and it's still flagged as never initialized.
+        let result = resolve_src("class Foo {\n    val field: String\n    fun setIt() {\n        field = \"x\"\n    }\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("cannot reassign val 'field'")), "{:?}", result.type_errors);
+        assert!(result.type_errors.iter().any(|e| e.message.contains("property 'field' must be initialized")), "{:?}", result.type_errors);
+    }
+
+    // ---- Bug 2: deferred forward-reference for a local/nested `fun` ----
+
+    #[test]
+    fn a_call_deferred_inside_another_functions_body_resolves_to_a_later_sibling() {
+        let result = resolve_src("fun useTest() {\n    test()\n}\nfun test() {}\n");
+        assert!(result.diagnostics.iter().all(|e| !e.message.contains("undefined name 'test'")), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_direct_immediate_call_before_its_own_declaration_is_still_undefined() {
+        let result = resolve_src("test3()\nfun test3() {}\n");
+        assert!(result.diagnostics.iter().any(|e| e.message.contains("undefined name 'test3'")), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_direct_call_inside_the_same_wrapping_lambda_as_its_declaration_is_still_undefined() {
+        // Exact shape from the user's own repro file: the whole snippet is
+        // wrapped in a lambda block (`run { ... }`), but the call and its
+        // declaration are still direct siblings *within* that same lambda
+        // — a call is only deferred if it's nested inside ANOTHER
+        // callable body relative to the declaring block.
+        let result = resolve_src(
+            "fun run(block: () -> Unit) { block() }\nrun {\n    test3()\n    fun test3() {}\n}\n",
+        );
+        assert!(result.diagnostics.iter().any(|e| e.message.contains("undefined name 'test3'")), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_call_deferred_inside_a_nested_function_within_a_wrapping_lambda_resolves() {
+        let result = resolve_src(
+            "fun run(block: () -> Unit) { block() }\nrun {\n    fun useTest() {\n        test()\n    }\n    fun test() {}\n}\n",
+        );
+        assert!(result.diagnostics.iter().all(|e| !e.message.contains("undefined name 'test'")), "{:?}", result.diagnostics);
+    }
+
+    // ---- Bug 3: a block-bodied fun with no annotation is always Unit ----
+
+    #[test]
+    fn a_block_bodied_fun_with_no_annotation_infers_unit_not_its_tail_value() {
+        let result = resolve_src("fun test() {\n    10\n}\nval i: Int = test()\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("expected Int, got Unit")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_block_bodied_fun_assigned_to_a_val_unit_type_checks_fine() {
+        let result = resolve_src("fun test() {\n    10\n}\nval u: Unit = test()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn an_explicit_return_with_a_value_in_an_unannotated_block_body_is_a_mismatch() {
+        let result = resolve_src("fun test() {\n    return 5\n}\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("expected Unit, got Int")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn an_expression_bodied_fun_still_infers_its_tail_type_normally() {
+        let result = resolve_src("fun test() = 10\nval i: Int = test()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn an_explicitly_annotated_block_bodied_fun_is_unaffected() {
+        let result = resolve_src("fun test(): Int {\n    return 10\n}\nval i: Int = test()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_lambdas_tail_value_is_still_its_own_result_not_unit() {
+        let result = resolve_src("val f: (Int) -> Int = { x -> x * 2 }\nval i: Int = f(5)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_block_bodied_method_with_no_annotation_also_defaults_to_unit() {
+        let result = resolve_src("class Foo {\n    fun test() {\n        10\n    }\n}\nval i: Int = Foo().test()\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("expected Int, got Unit")), "{:?}", result.type_errors);
+    }
+
+    // ---- Bug 4: implicit-`this` as a chained call's own receiver ----
+
+    #[test]
+    fn a_bare_field_receiver_of_a_method_call_resolves_via_implicit_this() {
+        let result = resolve_src(
+            "class Foods {\n    val foods: List = listOf()\n    fun addFood(pos: Int): Unit {\n        foods.add(pos)\n    }\n}\n",
+        );
+        assert!(result.diagnostics.iter().all(|e| !e.message.contains("unknown package")), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_bare_field_receiver_of_a_zero_arg_method_call_also_resolves() {
+        let result = resolve_src(
+            "class Foods {\n    val foods: List = listOf()\n    fun count(): Int {\n        return foods.size()\n    }\n}\n",
+        );
+        assert!(result.diagnostics.iter().all(|e| !e.message.contains("unknown package")), "{:?}", result.diagnostics);
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_real_package_qualified_call_inside_a_method_still_resolves_as_a_package() {
+        // Fully qualified (not a bare imported name) — exercises the same
+        // `dotted_path_if_not_local` flattening Bug 4's fix touches:
+        // `kotlin` is the base name here, and it's not a field/method of
+        // `Foo`, so `is_implicit_this_field_or_method` must still say
+        // "no" and leave this as a genuine package path.
+        let result = resolve_src("class Foo {\n    fun test(): Int {\n        return kotlin.math.abs(-5)\n    }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 }

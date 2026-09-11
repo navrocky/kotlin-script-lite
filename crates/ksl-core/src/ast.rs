@@ -328,7 +328,14 @@ pub enum ClassMember {
         name_span: Span,
         type_annotation: Option<TypeAnnotation>,
         mutable: bool,
-        init: Expr,
+        /// `None` for a property declared with no initializer at all
+        /// (`val field: String`, no `=`) — legal only when
+        /// `type_annotation` is `Some` (there's nothing else to infer a
+        /// type from), and only when the resolver can prove the field is
+        /// definitely assigned somewhere in the constructor (a property
+        /// initializer above it, or an `init { }` block) before any read —
+        /// see `resolver.rs`'s `ClassFieldInfo::assigned`.
+        init: Option<Expr>,
         /// Raw text of an immediately-preceding `/** ... */` doc comment,
         /// if any — see `StmtKind::ValDecl::doc_comment`.
         doc_comment: Option<String>,

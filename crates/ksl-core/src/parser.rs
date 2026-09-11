@@ -652,8 +652,14 @@ impl<'a> Parser<'a> {
                 let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
                 let type_annotation =
                     if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
-                self.expect(TokenKind::Assign, "'='")?;
-                let init = self.parse_expr()?;
+                // `= initializer` is now optional — `val field: String`
+                // with no initializer is legal (see `ClassMember::
+                // Property::init`'s own doc comment), left to the resolver
+                // to prove definitely assigned in the constructor. A type
+                // annotation is still mandatory in that case (nothing else
+                // to infer a type from), but that check belongs to the
+                // resolver, not here — the parser accepts either shape.
+                let init = if self.matches(&TokenKind::Assign) { Some(self.parse_expr()?) } else { None };
                 Ok(ClassMember::Property { name, name_span, type_annotation, mutable, init, doc_comment })
             }
             TokenKind::Fun => Ok(ClassMember::Method(Box::new(self.parse_fun_decl()?))),
@@ -2747,5 +2753,34 @@ mod tests {
     #[test]
     fn function_type_receiver_is_not_supported() {
         parse_err("fun (Int) -> Int.foo(): Int = 1\n");
+    }
+
+    // ---- properties with no initializer (definite assignment) ----
+
+    #[test]
+    fn property_with_no_initializer_parses_when_annotated() {
+        let stmts = parse_src("class Foo {\n    val field: String\n    init {\n        field = \"\"\n    }\n}\n");
+        match &stmts[0].kind {
+            StmtKind::ClassDecl { members, .. } => match &members[0] {
+                ClassMember::Property { init, type_annotation, .. } => {
+                    assert!(init.is_none());
+                    assert!(type_annotation.is_some());
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn property_with_an_initializer_still_parses_as_before() {
+        let stmts = parse_src("class Foo {\n    val field: String = \"x\"\n}\n");
+        match &stmts[0].kind {
+            StmtKind::ClassDecl { members, .. } => match &members[0] {
+                ClassMember::Property { init, .. } => assert!(init.is_some()),
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
