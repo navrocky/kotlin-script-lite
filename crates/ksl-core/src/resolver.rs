@@ -169,6 +169,14 @@ fn builtin_method_signature_as_call_signature(receiver_type: &str, method: &str)
 /// directly (see `Resolver::class_method_signature`) rather than walking a
 /// chain of `ClassInfo`s.
 struct ClassInfo {
+    /// The class declaration's own `Symbol` index (`SymbolKind::Class`,
+    /// from the same `self.define` call that returns `class_idx` in
+    /// `walk_class_decl`) — lets a *use* of the class's name as a type
+    /// annotation (`val p: Point`, a ctor param's own type, a return
+    /// type, ...) get a real `occurrences` entry pointing back at the
+    /// declaration, for hover/goto-def, the same way any other declared
+    /// name's use already does. See `diagnose_unknown_names`.
+    symbol_idx: usize,
     fields: Vec<ClassFieldInfo>,
     methods: Vec<ClassMethodInfo>,
     /// The primary constructor's own real parameter types/names — what
@@ -736,6 +744,7 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
         known_type_aliases: HashMap::new(),
         extension_functions: HashMap::new(),
         forward_declared_funs: HashMap::new(),
+        pending_forward_refs: Vec::new(),
         class_info: HashMap::new(),
         current_class: None,
         in_constructor: false,
@@ -769,6 +778,20 @@ pub fn resolve_with_imports(program: &Program, packages: &crate::package_index::
     }
     let global = r.push_scope(None, 0, FILE_SPAN, ScopeKind::Other);
     r.walk_stmts(&program.stmts, global, FILE_END);
+    // Every `FunDecl` in the file has now been walked (and `self.define`d)
+    // for real — resolve every deferred forward-reference call site
+    // (`pending_forward_refs`, see its own doc comment) into a genuine
+    // `occurrences` entry now that its target `Symbol` actually exists,
+    // so hover/goto-def work on a forward-referenced call the same as any
+    // other. A name that somehow still doesn't resolve here (shouldn't
+    // happen — `forward_declared_fun_signature` already proved it would,
+    // and nothing removes an entry from `scope.names` once added) is
+    // simply skipped, not a panic.
+    for (span, scope, name) in std::mem::take(&mut r.pending_forward_refs) {
+        if let Some(idx) = r.resolve_symbol_index(scope, &name) {
+            r.table.occurrences.push((span, idx));
+        }
+    }
     let imported_symbols = r.imports.by_name.into_values().flatten().collect();
     ResolveResult {
         table: r.table,
@@ -904,6 +927,16 @@ struct Resolver<'a> {
     /// Kotlin's unconditional same-file/same-block hoisting, per this
     /// session's own discussion).
     forward_declared_funs: HashMap<usize, HashMap<String, CallSignature>>,
+    /// `(call span, call's own scope, name)` for every call site
+    /// `resolve_name` resolved via `forward_declared_fun_signature` — its
+    /// target `Symbol` doesn't exist yet at that exact point in the walk,
+    /// so it can't get a real `occurrences` entry (for hover/goto-def)
+    /// right there. Resolved into real `occurrences` entries in one final
+    /// pass, once `walk_stmts` has finished the whole file (see
+    /// `resolve_with_imports`) — by then, every `FunDecl` anywhere in the
+    /// file has been walked and `self.define`d for real, so `resolve_
+    /// symbol_index(scope, name)` finds the genuine `Symbol`.
+    pending_forward_refs: Vec<(Span, usize, String)>,
     /// Every `class` declared in this file's own static shape (fields'/
     /// methods' real, checkable signatures) — see `ClassInfo`'s own doc
     /// comment. Populated as each `ClassDecl` is walked (`walk_class_decl`),
@@ -1321,13 +1354,24 @@ impl<'a> Resolver<'a> {
     /// leaf that doesn't resolve — the recursive half of
     /// `resolve_type_annotation_here`, split out so it can run once ahead
     /// of the (non-diagnosing) `types::resolve_type_annotation` call rather
-    /// than duplicating that function's own traversal.
+    /// than duplicating that function's own traversal. Also pushes a real
+    /// `occurrences` entry for a `Named` leaf that resolves to a same-file
+    /// class (local or top-level — `self.class_info` covers both, see
+    /// `ClassInfo::symbol_idx`) — this is what makes hover/goto-def work
+    /// on a type annotation naming a class (`val p: Point`, a ctor
+    /// param's own type, a return type, ...) the same way it already does
+    /// for an ordinary value's use. A cross-file/imported class isn't
+    /// covered here yet (would need a `cross_file_refs` entry instead of
+    /// `occurrences` — a separate, not-yet-addressed gap, pre-existing
+    /// same as this whole method was before this fix).
     fn diagnose_unknown_names(&mut self, ann: &TypeAnnotation) {
         match ann {
             TypeAnnotation::Named(name, span) => {
                 let ty = types::resolve_type_annotation(ann, &self.generic_params, &self.known_classes, &self.known_type_aliases);
                 if ty == Type::Unknown {
                     self.type_errors.push(RuntimeError::new(format!("unknown type '{name}'"), *span));
+                } else if let Some(info) = self.class_info.get(name.as_str()) {
+                    self.table.occurrences.push((*span, info.symbol_idx));
                 }
             }
             TypeAnnotation::Function(params, ret, _) => {
@@ -1429,11 +1473,18 @@ impl<'a> Resolver<'a> {
         // A same-block sibling `fun`, declared later, referenced from
         // inside another callable's body (deferred execution) — see
         // `forward_declared_fun_signature`'s own doc comment for the exact
-        // rule. No `occurrences`/named-argument checking for this call
-        // yet (a real, accepted scope limit — the declaration's exact
-        // `Symbol` doesn't exist until the real, in-order walk reaches
-        // it), just the call's own type, so it isn't wrongly flagged.
+        // rule. The declaration's real `Symbol` doesn't exist yet at this
+        // exact point in the walk (that only happens once the real,
+        // in-order walk later reaches its own `FunDecl`), so a real
+        // `occurrences` entry (for hover/goto-def) can't be pushed here
+        // directly — `pending_forward_refs` records the call site instead,
+        // resolved into a real occurrence in one final pass once the
+        // whole file has been walked (see `resolve_with_imports`, right
+        // after `walk_stmts` returns). No named-argument checking for this
+        // call yet (a real, accepted scope limit) — just the call's own
+        // type, so it isn't wrongly flagged as undefined.
         if let Some((ret, params, ..)) = self.forward_declared_fun_signature(scope, name) {
+            self.pending_forward_refs.push((use_span, scope, name.to_string()));
             return Type::Function(params, Box::new(ret));
         }
         self.diagnostics.push(RuntimeError::new(format!("undefined name '{name}'"), use_span));
@@ -2696,7 +2747,7 @@ impl<'a> Resolver<'a> {
         self.table.symbols[class_idx].param_has_default = ctor_param_has_default.clone();
         self.class_info.insert(
             Rc::from(name),
-            ClassInfo { fields, methods, ctor_param_types, ctor_param_names, ctor_param_has_default },
+            ClassInfo { symbol_idx: class_idx, fields, methods, ctor_param_types, ctor_param_names, ctor_param_has_default },
         );
 
         // The constructor's own scope (ctor params, bare — property
@@ -7209,6 +7260,16 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_forward_referenced_call_gets_a_real_occurrence_for_hover_and_goto_def() {
+        // "test" starts at column 5 on both lines.
+        let result = resolve_src("fun useTest() {\n    test()\n}\nfun test() {}\n");
+        let decl = result.table.symbol_at(4, 5).expect("test's own declaration should resolve");
+        assert_eq!(decl.kind, SymbolKind::Fun);
+        let use_site = result.table.symbol_at(2, 5).expect("the deferred call site should resolve to a real occurrence");
+        assert!(std::ptr::eq(decl, use_site));
+    }
+
+    #[test]
     fn a_direct_immediate_call_before_its_own_declaration_is_still_undefined() {
         let result = resolve_src("test3()\nfun test3() {}\n");
         assert!(result.diagnostics.iter().any(|e| e.message.contains("undefined name 'test3'")), "{:?}", result.diagnostics);
@@ -7384,5 +7445,35 @@ mod tests {
     fn a_local_class_can_reference_itself_in_its_own_constructor_parameter() {
         let result = resolve_src("fun run(block: () -> Unit) { block() }\nrun {\n    class Node(val next: Node?)\n}\n");
         assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_top_level_class_used_as_a_type_annotation_gets_a_real_occurrence() {
+        let result = resolve_src("class Test {\n}\nclass Test2(val t: Test) {\n}\n");
+        // "Test" (the declaration) starts at column 7 on line 1; the ctor
+        // param's own annotation "Test" starts at column 20 on line 3.
+        let decl = result.table.symbol_at(1, 7).expect("Test's own declaration should resolve");
+        assert_eq!(decl.kind, SymbolKind::Class);
+        let use_site = result.table.symbol_at(3, 20).expect("the type annotation should resolve to a real occurrence");
+        assert!(std::ptr::eq(decl, use_site));
+    }
+
+    #[test]
+    fn a_local_class_used_as_a_type_annotation_by_a_sibling_also_gets_a_real_occurrence() {
+        // Exact shape from the user's own repro file: local classes
+        // inside a wrapping lambda, one referencing the other as both a
+        // ctor param's own type and a method's return type.
+        let result = resolve_src(
+            "fun run(block: () -> Unit) { block() }\nrun {\n    class Test {\n    }\n    class Test2(val t: Test) {\n        fun get(): Test = t\n    }\n}\n",
+        );
+        // "Test" (the local declaration) starts at column 11 on line 3.
+        let decl = result.table.symbol_at(3, 11).expect("Test's own local declaration should resolve");
+        assert_eq!(decl.kind, SymbolKind::Class);
+        // The ctor param's own annotation "Test" starts at column 24 on line 5.
+        let ctor_param_use = result.table.symbol_at(5, 24).expect("the ctor param's own type annotation should resolve");
+        assert!(std::ptr::eq(decl, ctor_param_use));
+        // The method's own return-type annotation "Test" starts at column 20 on line 6.
+        let return_type_use = result.table.symbol_at(6, 20).expect("the method's own return-type annotation should resolve");
+        assert!(std::ptr::eq(decl, return_type_use));
     }
 }

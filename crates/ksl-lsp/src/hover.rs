@@ -556,6 +556,30 @@ mod tests {
         assert!(md.contains("*extension function*"), "{md}");
     }
 
+    #[test]
+    fn hover_on_a_type_annotation_naming_a_class_shows_its_declaration() {
+        // Same "no extra hover code" story — `resolver.rs`'s
+        // `diagnose_unknown_names` now records a real `occurrences` entry
+        // for a type-annotation `Named` leaf resolving to a same-file
+        // class (local or top-level).
+        let text = "class Point(val x: Int)\nfun f(p: Point) {}\n";
+        // "fun f(p: " is 9 chars, so "Point" starts at column 10.
+        let h = hover_at(text, 2, 10).expect("the type annotation's own use should hover");
+        let md = markdown_value(&h);
+        assert!(md.contains("class Point"), "{md}");
+        assert!(md.contains("*class*"), "{md}");
+    }
+
+    #[test]
+    fn hover_on_a_local_classs_type_annotation_shows_its_local_declaration() {
+        let text = "fun run(block: () -> Unit) { block() }\nrun {\n    class Test {\n    }\n    class Test2(val t: Test) {\n    }\n}\n";
+        // The ctor param's own annotation "Test" starts at column 24 on line 5.
+        let h = hover_at(text, 5, 24).expect("the local class's type annotation should hover");
+        let md = markdown_value(&h);
+        assert!(md.contains("class Test"), "{md}");
+        assert!(md.contains("*class*"), "{md}");
+    }
+
     /// Cross-file counterpart of `hover_on_a_promoted_field_use_shows_its_ctor_params_declaration`
     /// — a `class` declared in one file, its field used from another via
     /// `@file:Import`, must still describe the real declaration (see
