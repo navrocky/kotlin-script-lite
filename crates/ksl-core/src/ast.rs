@@ -307,6 +307,23 @@ pub struct Param {
     pub default: Option<Expr>,
 }
 
+/// `private`/`public` access-control modifier — on a top-level `fun`/`class`
+/// (gates whether `package_index`/`importer` export it across a file
+/// boundary), or on a class member (property, promoted ctor param, method —
+/// gates whether it's reachable from outside the declaring class's own
+/// body; see `resolver::Resolver::check_member_visibility`). No `protected`
+/// variant: the language has no class inheritance/subclassing yet (see
+/// `docs/roadmap.md`'s "Phase 7 — Inheritance"), so "visible to subclasses"
+/// has nothing to attach to — left for that future phase. `Public` is the
+/// default (today's existing, fully-open behavior) whenever no modifier is
+/// written at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    #[default]
+    Public,
+    Private,
+}
+
 /// One entry of a class's own constructor parameter list — reuses `Param`
 /// as-is for the name/type/default, adding only whether (and how) this
 /// parameter also becomes a field.
@@ -317,6 +334,11 @@ pub struct ClassParam {
     /// immutable field), `Some(true)` for `var` (mutable field), `None` for
     /// a plain constructor-only parameter that never becomes a field.
     pub field: Option<bool>,
+    /// Only meaningful when `field.is_some()` — a plain, non-promoted ctor
+    /// param never gets a real modifier from the parser (see
+    /// `Parser::parse_class_ctor_params`), so this stays `Visibility::
+    /// Public` (harmlessly unused) for those.
+    pub visibility: Visibility,
 }
 
 /// One member of a class body — a property, an `init` block, or a method.
@@ -339,6 +361,7 @@ pub enum ClassMember {
         /// Raw text of an immediately-preceding `/** ... */` doc comment,
         /// if any — see `StmtKind::ValDecl::doc_comment`.
         doc_comment: Option<String>,
+        visibility: Visibility,
     },
     /// An `init { ... }` block — run, in source order relative to the
     /// property initializers around it, as part of constructing an
@@ -390,6 +413,12 @@ pub enum StmtKind {
         /// if any (see `parser::parse_with_docs`) — resolved into a
         /// `doc_comment::ParsedDoc` by the resolver, not here.
         doc_comment: Option<String>,
+        /// `private`/`public` — see `Visibility`'s own doc comment. Only
+        /// meaningful for a genuinely top-level `val`/`var` (gates cross-
+        /// file export the same way `FunDecl`/`ClassDecl`'s own field
+        /// does); inert (but harmless) on a local `val`/`var`, which
+        /// shares this exact same node.
+        visibility: Visibility,
     },
     Assign {
         name: String,
@@ -416,6 +445,13 @@ pub enum StmtKind {
         /// Raw text of an immediately-preceding `/** ... */` doc comment,
         /// if any — see `ValDecl::doc_comment`.
         doc_comment: Option<String>,
+        /// `private`/`public` — same node covers both a top-level `fun` and
+        /// (via `ClassMember::Method`) a class method, so this one field
+        /// serves both; see `Visibility`'s own doc comment. Syntactically
+        /// accepted but a documented no-op on an extension function
+        /// (`receiver.is_some()`) for now — extension functions aren't
+        /// cross-file exported at all yet, regardless of this modifier.
+        visibility: Visibility,
     },
     While {
         cond: Expr,
@@ -452,6 +488,11 @@ pub enum StmtKind {
         /// Raw text of an immediately-preceding `/** ... */` doc comment,
         /// if any — see `ValDecl::doc_comment`.
         doc_comment: Option<String>,
+        /// `private`/`public` — see `Visibility`'s own doc comment. A local
+        /// (non-top-level) class can carry this syntactically too, but it's
+        /// inert there — only a genuinely top-level class is ever gated by
+        /// `package_index`/`importer`.
+        visibility: Visibility,
     },
     /// `receiver.field = value` (or `+=`/`-=`/etc.) — the dot-assignment
     /// counterpart of `Assign`'s bare-name form. Only ever produced for a
@@ -477,6 +518,13 @@ pub enum StmtKind {
         /// Span of just the alias name, used for hover/goto-definition.
         name_span: Span,
         target: TypeAnnotation,
+        /// `private`/`public` — see `Visibility`'s own doc comment. Same-
+        /// file visibility (whether a type annotation elsewhere in this
+        /// file can reference this alias) is unaffected either way —
+        /// `known_type_aliases`/`known_classes` never consult this; this
+        /// only gates whether the alias's own `Symbol` is exported cross-
+        /// file (via `SymbolTable::top_level_symbols()`).
+        visibility: Visibility,
     },
 }
 

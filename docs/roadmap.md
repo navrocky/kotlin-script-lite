@@ -177,9 +177,9 @@ Based on Kotlin's [keyword and operator reference](https://kotlinlang.org/docs/k
 | `operator` | No | Operator overload |
 | `out` | No | Covariant parameter |
 | `override` | No | Override member |
-| `private` | No | Private visibility |
+| `private` | Yes | Private visibility |
 | `protected` | No | Protected visibility |
-| `public` | No | Public visibility |
+| `public` | Yes | Public visibility |
 | `reified` | No | Runtime type parameter |
 | `sealed` | No | Sealed hierarchy |
 | `suspend` | No | Suspending declaration |

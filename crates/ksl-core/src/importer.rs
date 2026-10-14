@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::ast::{ImportDecl, Program, Stmt};
+use crate::ast::{ImportDecl, Program, Stmt, Visibility};
 use crate::environment::Env;
 use crate::error::{Flow, InterpError, RuntimeError, Span};
 use crate::interpreter::Interpreter;
@@ -102,7 +102,7 @@ impl Importer {
         }
         interp.current_resolved = Rc::new(resolved.resolved_calls);
 
-        run_program(interp, &program)
+        run_program(interp, &program, &self.packages)
     }
 
     fn run_imports(
@@ -188,7 +188,7 @@ impl Importer {
             add_module_to_index(&mut self.packages, &program, &resolved, &canonical);
             interp.current_file = Arc::from(canonical.as_path());
             interp.current_resolved = Rc::new(resolved.resolved_calls);
-            run_program(interp, &program).map_err(|e| wrap(&canonical, e))
+            run_program(interp, &program, &self.packages).map_err(|e| wrap(&canonical, e))
         })();
         interp.current_file = caller_file;
         interp.current_resolved = caller_resolved;
@@ -212,13 +212,16 @@ fn add_module_to_index(packages: &mut PackageIndex, program: &Program, resolved:
     match &program.package {
         Some(pkg) => {
             let package_name = pkg.path.join(".");
-            for symbol in resolved.table.top_level_symbols() {
+            // A `private` top-level declaration is never indexed — see
+            // `package_index::index_program`'s identical filter (this is
+            // the runtime-path mirror of that same static/LSP-path gate).
+            for symbol in resolved.table.top_level_symbols().filter(|s| s.visibility == Visibility::Public) {
                 let class_members = crate::package_index::class_members_of(resolved, symbol);
                 packages.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()), class_members);
             }
         }
         None => {
-            for symbol in resolved.table.top_level_symbols() {
+            for symbol in resolved.table.top_level_symbols().filter(|s| s.visibility == Visibility::Public) {
                 let class_members = crate::package_index::class_members_of(resolved, symbol);
                 packages.add_flat_member(symbol.clone(), Some(file.to_path_buf()), class_members);
             }
@@ -232,7 +235,22 @@ fn add_module_to_index(packages: &mut PackageIndex, program: &Program, resolved:
 /// Called for both the entry script and every `@file:Import`ed file, after
 /// all of *that* program's own `@file:Import`s have already run (so any
 /// package an `import` here draws from is guaranteed populated).
-fn run_program(interp: &mut Interpreter, program: &Program) -> Result<(), InterpError> {
+///
+/// `packages` is the same, already-`private`-filtered `PackageIndex` the
+/// static resolver just checked this same `program` against (see
+/// `index_program`'s/`add_module_to_index`'s own `Visibility::Public`
+/// filter) — consulted here too, purely to decide *which* runtime bindings
+/// this loop is allowed to materialize. This is the actual enforcement
+/// point for top-level `private` at execution time: `Interpreter::
+/// resolve_qualified`/`resolve_package_members` read straight off `Interpreter
+/// ::packages`, a genuinely flat runtime `Env` per package with no
+/// visibility concept of its own at all (every top-level declaration binds
+/// there unconditionally the moment its own file's top-level statements
+/// run, regardless of any modifier) — without this check, a `private`
+/// symbol would still be reachable via `import` from another file the
+/// moment *any* script in the same run had already executed its declaring
+/// file, defeating the whole point of the resolver-side filter.
+fn run_program(interp: &mut Interpreter, program: &Program, packages: &PackageIndex) -> Result<(), InterpError> {
     let target_env = match &program.package {
         Some(pkg) => interp.package_env(&pkg.path.join(".")),
         None => interp.globals.clone(),
@@ -240,18 +258,45 @@ fn run_program(interp: &mut Interpreter, program: &Program) -> Result<(), Interp
 
     for use_ in &program.imports_use {
         if use_.wildcard {
+            let package_name = use_.path.join(".");
+            let public_names: HashSet<&str> =
+                packages.members_of(&package_name).iter().map(|m| m.symbol.name.as_str()).collect();
             let members = interp
                 .resolve_package_members(&use_.path, use_.span)
                 .map_err(InterpError::Runtime)?;
             for (name, value) in members {
-                target_env.define(&name, value, false, crate::types::Type::Unknown);
+                if public_names.contains(name.as_str()) {
+                    target_env.define(&name, value, false, crate::types::Type::Unknown);
+                }
             }
         } else {
+            // Checked by the parser (`parse_import_use`): at least 2 segments.
+            let (package_segments, member) = use_.path.split_at(use_.path.len() - 1);
+            let member_name = &member[0];
+            let package_name = package_segments.join(".");
+            // Mirrors `Interpreter::resolve_qualified`'s own two error
+            // messages exactly (a genuinely unknown package vs. a known
+            // package with no such — or a `private` — member), just
+            // checked against the static, already-filtered index instead
+            // of the runtime one, so a `private` member reports the same
+            // "undefined name" a truly nonexistent one would, not a
+            // different message that would leak whether it exists at all.
+            if packages.has_package(&package_name) {
+                if packages.find(&package_name, member_name).is_none() {
+                    return Err(InterpError::Runtime(RuntimeError::new(
+                        format!("undefined name '{}'", use_.path.join(".")),
+                        use_.span,
+                    )));
+                }
+            } else {
+                return Err(InterpError::Runtime(RuntimeError::new(
+                    format!("unknown package '{package_name}'"),
+                    use_.span,
+                )));
+            }
             let value = interp
                 .resolve_qualified(&use_.path, use_.span)
                 .map_err(InterpError::Runtime)?;
-            // Checked by the parser (`parse_import_use`): at least 2 segments.
-            let member_name = use_.path.last().expect("import path has a member segment");
             target_env.define(member_name, value, false, crate::types::Type::Unknown);
         }
     }
@@ -797,5 +842,108 @@ mod tests {
 
         let err = run_in(&dir, "main.ksl").unwrap_err();
         assert!(err.contains("cannot assign String to var 'count' of type Int"), "{err}");
+    }
+
+    /// A `private` top-level `fun`, imported by explicit name from another
+    /// file, fails the same way any genuinely undefined name would — the
+    /// resolver's own static check produces a non-fatal `diagnostics`
+    /// entry (see `resolve_with_imports`'s doc comment on why an
+    /// unresolved import is lenient there), so this must be caught at
+    /// runtime, in `run_program`'s own `imports_use` handling, or the
+    /// symbol would still be reachable via `Interpreter::resolve_qualified`
+    /// once `pkg.ksl` has actually run its own top-level statements.
+    #[test]
+    fn importing_a_private_top_level_fun_by_explicit_name_fails_like_any_undefined_name() {
+        let dir = TempDir::new("private_named_import");
+        dir.write("pkg.ksl", "package mylib\nprivate fun secret(): Int = 42\nfun exposed(): Int = secret()\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport mylib.secret\nprintln(secret())\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("undefined name 'mylib.secret'"), "{err}");
+    }
+
+    /// The public sibling in the same file imports and runs normally —
+    /// regression guard alongside the previous test.
+    #[test]
+    fn importing_a_public_top_level_fun_by_explicit_name_still_works() {
+        let dir = TempDir::new("public_named_import");
+        dir.write("pkg.ksl", "package mylib\nprivate fun secret(): Int = 42\nfun exposed(): Int = secret()\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport mylib.exposed\nprintln(exposed())\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "42\n");
+    }
+
+    /// A wildcard import of a file mixing `public`/`private` top-level
+    /// declarations only brings in the public ones — the private one stays
+    /// unreachable even though its declaring file has definitely already
+    /// run (and so definitely already bound it into the runtime package
+    /// env `Interpreter::resolve_package_members` reads from).
+    #[test]
+    fn wildcard_importing_a_mix_of_public_and_private_declarations_brings_in_only_the_public_ones() {
+        let dir = TempDir::new("wildcard_mixed_visibility");
+        dir.write("pkg.ksl", "package mylib\nprivate fun secret(): Int = 42\nfun exposed(): Int = secret()\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport mylib.*\nprintln(exposed())\nprintln(secret())\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("undefined name 'secret'"), "{err}");
+    }
+
+    /// Cross-file class-member visibility: a `private` field is unreachable
+    /// from the *importing* file even though the class itself is public and
+    /// successfully constructed there — but a public method of that same
+    /// class (declared in the same file the class is, so it's genuinely
+    /// "inside the class") can still read the private field internally.
+    #[test]
+    fn a_private_field_on_a_cross_file_class_is_rejected_but_its_own_public_method_still_works() {
+        let dir = TempDir::new("cross_file_private_field");
+        dir.write(
+            "pkg.ksl",
+            "class Foo(private val secret: Int) {\n    fun reveal(): Int = secret\n}\n",
+        );
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nval f = Foo(7)\nprintln(f.reveal())\nprintln(f.secret)\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("'secret' is private in class 'Foo'"), "{err}");
+    }
+
+    /// Same shape as `importing_a_private_top_level_fun_by_explicit_name_
+    /// fails_like_any_undefined_name`, for a top-level `val` instead of a
+    /// `fun` — regression coverage for the bug where `private`/`public`
+    /// wasn't even parseable in front of `val`/`var` at all.
+    #[test]
+    fn importing_a_private_top_level_val_by_explicit_name_fails_like_any_undefined_name() {
+        let dir = TempDir::new("private_named_val_import");
+        dir.write("pkg.ksl", "package mylib\nprivate val secret = 42\nval exposed = 7\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport mylib.secret\nprintln(secret)\n",
+        );
+
+        let err = run_in(&dir, "main.ksl").unwrap_err();
+        assert!(err.contains("undefined name 'mylib.secret'"), "{err}");
+    }
+
+    #[test]
+    fn importing_a_public_top_level_val_by_explicit_name_still_works() {
+        let dir = TempDir::new("public_named_val_import");
+        dir.write("pkg.ksl", "package mylib\nprivate val secret = 42\nval exposed = 7\n");
+        dir.write(
+            "main.ksl",
+            "@file:Import(\"pkg.ksl\")\nimport mylib.exposed\nprintln(exposed)\n",
+        );
+
+        assert_eq!(run_in(&dir, "main.ksl").unwrap(), "7\n");
     }
 }

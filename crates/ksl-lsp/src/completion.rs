@@ -316,6 +316,25 @@ pub fn completion_with_trigger(
         }
     }
 
+    // `private`/`public` — contextual soft keywords (see `Parser::
+    // parse_visibility_modifier`'s own doc comment on why they're
+    // deliberately NOT real `token::KEYWORDS` entries: an ordinary script
+    // using either as a plain identifier must keep working), so the loop
+    // above never sees them. Offered here unconditionally instead — the
+    // same "not yet position-gated" treatment several other keywords in
+    // that same loop already get (`class`/`this`/`try`/`catch`/`finally`/
+    // `typealias` — see `keyword_allowed`'s own doc comment), since there's
+    // no `inside_a_class_member_at`-style fact to gate on yet either. Real
+    // grammatical legality (immediately before `val`/`var`/`fun`/`class`/
+    // `typealias`) is enforced by the parser itself, not completion.
+    for kw in ["private", "public"] {
+        items.push(CompletionItem {
+            label: kw.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            ..Default::default()
+        });
+    }
+
     items
 }
 
@@ -1132,6 +1151,22 @@ mod tests {
         assert!(names.contains(&"outer".to_string()));
         assert!(names.contains(&"println".to_string()));
         assert!(names.contains(&"fun".to_string()));
+    }
+
+    #[test]
+    fn private_and_public_are_offered_at_a_top_level_statement_position() {
+        let names = labels("", Position::new(0, 0));
+        assert!(names.contains(&"private".to_string()), "{names:?}");
+        assert!(names.contains(&"public".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn private_and_public_are_offered_at_a_class_member_position() {
+        let text = "class C {\n    \n}\n";
+        // The blank line inside the class body (0-based line 1).
+        let names = labels(text, Position::new(1, 4));
+        assert!(names.contains(&"private".to_string()), "{names:?}");
+        assert!(names.contains(&"public".to_string()), "{names:?}");
     }
 
     /// Regression test: `completion.rs`'s own keyword list used to be a

@@ -1,0 +1,61 @@
+fun run(block: () -> Unit) { block() }
+
+run {
+    // Bug 1 (fixed): не работает инициализация поля в секции init
+    class TestClass1 {
+        val field: String // тут ломается не видит инициализацию поля в init{}
+        init {
+            field = ""
+        }
+    }
+}
+
+run {
+    // Bug 2: Вызов функции до её объявления
+    fun useTest() {
+        test() // Сейчас LSP не видит функцию (hint, переход)
+    }
+
+    fun test() {}
+}
+
+run {
+    /*
+    // Bug 3 (fixed)
+    fun test() {
+        10 // Без return не должно давать функии тип Int
+    }
+    // Не должно компилиться
+    val i: Int = test()
+    */
+}
+
+run {
+    // Bug 4 (fixed)
+    class Foods {
+        val foods: List = listOf()
+
+        fun addFood(pos: Int): Unit {
+            foods.add(pos) // Error: Unknown package foods
+        }
+    }
+    
+}
+
+run {
+    // Bug 5 (fixed)
+    // в классах не подсвечиваются ошибки, если у метода прописан тип возврата, но метод ничего не возвращает
+    /*class Test {
+        fun get(): Int {}
+    }*/
+}
+
+run {
+    // Bug 6: Test2 не видит класс Test
+    class Test {
+    }
+
+    class Test2(val t: Test) { // Здесь LSP не видит тип поля Test
+        fun get(test: Test): Test = Test() // Здесь LSP не видит тип параметра и тип возврата Test
+    }
+}

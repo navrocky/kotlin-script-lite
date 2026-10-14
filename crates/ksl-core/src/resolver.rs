@@ -129,6 +129,15 @@ pub struct Symbol {
     /// comment. `None` whenever there's nothing worth showing (no comment,
     /// or a `doc_comment::ParsedDoc` that turned out entirely empty).
     pub doc: Option<String>,
+    /// `private`/`public` — see `ast::Visibility`'s own doc comment.
+    /// `Visibility::Public` for every kind of symbol this doesn't apply to
+    /// (locals, params, loop vars, ...); only a top-level `fun`/`class` or
+    /// a class member (field/method) ever carries a real `Private` here —
+    /// set by patching this field right after the relevant `define`/
+    /// `define_class_member` call returns, rather than threading it through
+    /// every one of `define`'s ~14 call sites as a positional parameter
+    /// (most of which have no visibility concept at all).
+    pub visibility: Visibility,
 }
 
 /// A callee's checkable signature, as used by `walk_call_args`/
@@ -222,6 +231,10 @@ struct ClassFieldInfo {
     /// every possible execution path" — `if (x) { field = a }` counts as
     /// assigned even when `x` could be `false` at runtime.
     assigned: bool,
+    /// `private`/`public` — see `ast::Visibility`'s own doc comment.
+    /// Consulted by `class_field_visibility` for `check_member_visibility`'s
+    /// enforcement at an external `obj.field` access site.
+    visibility: Visibility,
 }
 
 struct ClassMethodInfo {
@@ -237,6 +250,9 @@ struct ClassMethodInfo {
     /// (`define_class_member`) — see `ClassFieldInfo::symbol_idx`'s
     /// identical rationale.
     symbol_idx: usize,
+    /// `private`/`public` — see `ClassFieldInfo::visibility`'s identical
+    /// rationale, consulted by `class_method_visibility` instead.
+    visibility: Visibility,
 }
 
 /// A `following` hint (see `Resolver::walk_stmt`) meaning "there's no
@@ -1329,6 +1345,7 @@ impl<'a> Resolver<'a> {
             param_docs,
             param_has_default,
             doc,
+            visibility: Visibility::Public,
         });
         self.table.scopes[scope].names.entry(name.to_string()).or_default().push(idx);
         self.table.occurrences.push((def_span, idx));
@@ -1819,7 +1836,7 @@ impl<'a> Resolver<'a> {
         self.touch(scope, stmt.span);
         match &stmt.kind {
             StmtKind::ExprStmt(e) => self.walk_expr(e, scope, following),
-            StmtKind::ValDecl { name, name_span, init, mutable, type_annotation, doc_comment } => {
+            StmtKind::ValDecl { name, name_span, init, mutable, type_annotation, doc_comment, visibility } => {
                 let kind = if *mutable { SymbolKind::Var } else { SymbolKind::Val };
                 let keyword = if *mutable { "var" } else { "val" };
                 let declared_ty = self.resolve_type_annotation_here(type_annotation.as_ref());
@@ -1878,6 +1895,7 @@ impl<'a> Resolver<'a> {
                     scope, name, kind, *name_span, *mutable, sig, ty.clone(), Type::Unknown,
                     Vec::new(), Vec::new(), Vec::new(), Vec::new(), doc,
                 );
+                self.table.symbols[idx].visibility = *visibility;
                 // Boolean-alias narrowing: `val ateFood = eatenIndex !=
                 // null` records the same `(pos, neg)` facts a direct
                 // `if (eatenIndex != null)` would establish, keyed by
@@ -2023,7 +2041,7 @@ impl<'a> Resolver<'a> {
                 }
                 Type::Unit
             }
-            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body, doc_comment } => {
+            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body, doc_comment, visibility } => {
                 // Parsed once, up front: `fun_doc` (the function's own
                 // hover doc, summary + an optional `**Returns:**` line) is
                 // consumed right here at `define()`; `parsed_doc` itself
@@ -2142,6 +2160,13 @@ impl<'a> Resolver<'a> {
                         fun_doc,
                     ),
                 };
+                // Only meaningful for the `receiver: None` (plain top-level
+                // `fun`) case — an extension function's own `Symbol` is
+                // never registered into `scope.names` at all (see
+                // `define_extension_function`'s own doc comment), so this
+                // harmlessly re-patches an already-`Public` extension-fun
+                // `Symbol` when `receiver.is_some()`.
+                self.table.symbols[idx].visibility = *visibility;
                 let fn_scope = self.open_scope(scope, stmt.span, following, ScopeKind::FunctionBoundary);
                 if let Some((_, rspan)) = receiver {
                     // Same shape `walk_class_method` already uses to bind a
@@ -2380,8 +2405,18 @@ impl<'a> Resolver<'a> {
                 Type::Nothing
             }
             StmtKind::Break | StmtKind::Continue => Type::Nothing,
-            StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment } => {
-                self.walk_class_decl(name, *name_span, ctor_params, members, doc_comment.as_deref(), scope, following, stmt.span);
+            StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment, visibility } => {
+                self.walk_class_decl(
+                    name,
+                    *name_span,
+                    ctor_params,
+                    members,
+                    doc_comment.as_deref(),
+                    *visibility,
+                    scope,
+                    following,
+                    stmt.span,
+                );
                 Type::Unit
             }
             StmtKind::FieldAssign { receiver, field, field_span, op, value } => {
@@ -2400,6 +2435,15 @@ impl<'a> Resolver<'a> {
                             // assignment relaxation — only this instance's
                             // own construction can grant it.
                             self.check_val_reassignment(field, mutable, matches!(&receiver.kind, ExprKind::This), *field_span);
+                            // Independent from the definite-assignment check
+                            // just above — this is about visibility
+                            // (class-body-scoped, via `current_class`), not
+                            // about first-assignment tracking (receiver-
+                            // spelling-based); both can legitimately fire at
+                            // the same assignment site.
+                            if let Some(vis) = self.class_field_visibility(&recv_ty, field) {
+                                self.check_member_visibility(&recv_ty.name(), vis, "field", field, *field_span);
+                            }
                             if *op == AssignOp::Set
                                 && field_ty != Type::Unknown
                                 && value_ty != Type::Unknown
@@ -2432,10 +2476,10 @@ impl<'a> Resolver<'a> {
             // alias_is_unknown`, below in this module's own tests) the
             // predpass's order-sensitive resolution exists to produce.
             // This arm only registers a `Symbol` for hover/goto-definition.
-            StmtKind::TypeAlias { name, name_span, target: _ } => {
+            StmtKind::TypeAlias { name, name_span, target: _, visibility } => {
                 let ty = self.known_type_aliases.get(name.as_str()).cloned().unwrap_or(Type::Unknown);
                 let sig = format!("typealias {name} = {}", ty.name());
-                self.define(
+                let idx = self.define(
                     scope,
                     name,
                     SymbolKind::TypeAlias,
@@ -2450,6 +2494,7 @@ impl<'a> Resolver<'a> {
                     Vec::new(),
                     None,
                 );
+                self.table.symbols[idx].visibility = *visibility;
                 Type::Unit
             }
         }
@@ -2539,6 +2584,7 @@ impl<'a> Resolver<'a> {
             param_docs,
             param_has_default,
             doc,
+            visibility: Visibility::Public,
         });
         self.table.occurrences.push((def_span, idx));
         idx
@@ -2594,6 +2640,13 @@ impl<'a> Resolver<'a> {
             param_docs,
             param_has_default,
             doc,
+            // An extension function isn't cross-file exported at all today
+            // (never registered into `scope.names`, so `top_level_symbols`
+            // never sees it) — a `private`/`public` modifier here has no
+            // observable effect either way yet, so this is left hardcoded
+            // rather than threaded through as a real parameter. Revisit
+            // once extension functions gain real cross-file export.
+            visibility: Visibility::Public,
         });
         self.table.occurrences.push((def_span, idx));
         self.extension_functions.entry(key).or_default().push(idx);
@@ -2622,6 +2675,7 @@ impl<'a> Resolver<'a> {
         ctor_params: &[ClassParam],
         members: &[ClassMember],
         doc_comment: Option<&str>,
+        visibility: Visibility,
         scope: usize,
         following: Span,
         own_span: Span,
@@ -2661,6 +2715,7 @@ impl<'a> Resolver<'a> {
             Vec::new(),
             doc,
         );
+        self.table.symbols[class_idx].visibility = visibility;
         // `known_classes` only ever gets a *top-level* predpass
         // (`resolve_with_imports`'s own construction) — a locally-scoped
         // class (`class Foo { ... }` inside a function/lambda body) is
@@ -2692,11 +2747,18 @@ impl<'a> Resolver<'a> {
                 // the ctor param's own real `Symbol` is defined into
                 // `ctor_scope` (Phase 2 defines it; Phase 1 only computes
                 // signatures).
-                fields.push(ClassFieldInfo { name: cp.param.name.clone(), ty, mutable, symbol_idx: 0, assigned: true });
+                fields.push(ClassFieldInfo {
+                    name: cp.param.name.clone(),
+                    ty,
+                    mutable,
+                    symbol_idx: 0,
+                    assigned: true,
+                    visibility: cp.visibility,
+                });
             }
         }
         for m in members {
-            if let ClassMember::Property { name: fname, type_annotation, mutable, .. } = m {
+            if let ClassMember::Property { name: fname, type_annotation, mutable, visibility, .. } = m {
                 let ty = type_annotation
                     .as_ref()
                     .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
@@ -2708,13 +2770,20 @@ impl<'a> Resolver<'a> {
                 // initializer, in declaration order (see `ClassFieldInfo::
                 // assigned`'s own doc comment for why this can't be seeded
                 // `true` up front here).
-                fields.push(ClassFieldInfo { name: fname.clone(), ty, mutable: *mutable, symbol_idx: 0, assigned: false });
+                fields.push(ClassFieldInfo {
+                    name: fname.clone(),
+                    ty,
+                    mutable: *mutable,
+                    symbol_idx: 0,
+                    assigned: false,
+                    visibility: *visibility,
+                });
             }
         }
         let mut methods = Vec::new();
         for m in members {
             if let ClassMember::Method(method_stmt) = m {
-                if let StmtKind::FunDecl { name: mname, return_type, params, .. } = &method_stmt.kind {
+                if let StmtKind::FunDecl { name: mname, return_type, params, visibility, .. } = &method_stmt.kind {
                     let ret_ty = return_type
                         .as_ref()
                         .map(|a| types::resolve_type_annotation(a, &self.generic_params, &self.known_classes, &self.known_type_aliases))
@@ -2740,6 +2809,7 @@ impl<'a> Resolver<'a> {
                         // Patched in `walk_class_method`, once its real
                         // `define_class_member` call returns a real index.
                         symbol_idx: 0,
+                        visibility: *visibility,
                     });
                 }
             }
@@ -2823,6 +2893,7 @@ impl<'a> Resolver<'a> {
             // back at the ctor param's real symbol directly (see
             // `ClassFieldInfo::symbol_idx`'s doc comment).
             if cp.field.is_some() {
+                self.table.symbols[param_idx].visibility = cp.visibility;
                 if let Some(info) = self.class_info.get_mut(name) {
                     if let Some(f) = info.fields.iter_mut().find(|f| f.name == cp.param.name) {
                         f.symbol_idx = param_idx;
@@ -2848,7 +2919,7 @@ impl<'a> Resolver<'a> {
         let outer_in_constructor = std::mem::replace(&mut self.in_constructor, true);
         for m in members {
             match m {
-                ClassMember::Property { name: fname, name_span: fspan, type_annotation, mutable, init, doc_comment } => {
+                ClassMember::Property { name: fname, name_span: fspan, type_annotation, mutable, init, doc_comment, visibility } => {
                     let expected = type_annotation.as_ref().map(|a| self.resolve_type_annotation_here(Some(a)));
                     let field_ty = match init {
                         Some(init_expr) => {
@@ -2925,6 +2996,7 @@ impl<'a> Resolver<'a> {
                         Vec::new(),
                         member_doc,
                     );
+                    self.table.symbols[field_idx].visibility = *visibility;
                     if let Some(info) = self.class_info.get_mut(name) {
                         if let Some(f) = info.fields.iter_mut().find(|f| f.name == *fname) {
                             f.symbol_idx = field_idx;
@@ -2971,7 +3043,9 @@ impl<'a> Resolver<'a> {
     /// once known, mirroring `FunDecl`'s identical patch of its own
     /// symbol.
     fn walk_class_method(&mut self, stmt: &Stmt, class_name: &str, scope: usize, following: Span) {
-        let StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment, receiver: _ } = &stmt.kind else {
+        let StmtKind::FunDecl { name, name_span, params, return_type, body, doc_comment, visibility, receiver: _ } =
+            &stmt.kind
+        else {
             return;
         };
         let parsed_doc = doc_comment.as_deref().map(crate::doc_comment::parse);
@@ -3024,6 +3098,7 @@ impl<'a> Resolver<'a> {
             param_has_default,
             fun_doc,
         );
+        self.table.symbols[method_idx].visibility = *visibility;
         if let Some(info) = self.class_info.get_mut(class_name) {
             if let Some(m) = info.methods.iter_mut().find(|m| m.name == *name) {
                 m.symbol_idx = method_idx;
@@ -3203,6 +3278,28 @@ impl<'a> Resolver<'a> {
         builtin_method_signature_as_call_signature(&name, method)
     }
 
+    /// `t.method`'s own `private`/`public` modifier, mirroring
+    /// `class_method_signature`'s identical two-tier lookup (same-file
+    /// `class_info` first, then an imported class's own shape via
+    /// `self.packages.find_class`) — deliberately a separate, sibling
+    /// helper rather than a third element folded into `class_method_
+    /// signature`'s own `CallSignature` return, since that return type has
+    /// other, purely-type-checking consumers that don't need this. `None`
+    /// when `method` doesn't exist on `t` at all (a builtin/`Any` method,
+    /// or an already-reported "has no method" case) — callers treat that as
+    /// `Visibility::Public`, since there's nothing to restrict.
+    fn class_method_visibility(&self, t: &Type, method: &str) -> Option<Visibility> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        if let Some(info) = self.class_info.get(name.as_str()) {
+            return info.methods.iter().find(|m| m.name == method).map(|m| m.visibility);
+        }
+        self.packages.find_class(&name)?.class_members.as_ref()?.iter().find(|m| m.name == method).map(|m| m.visibility)
+    }
+
     /// `t`'s own ancestor chain by name (own type first), mirroring
     /// `class::lookup_method`'s runtime walk: `stdlib::builtin_type_chain`
     /// for a real builtin receiver, or `[name, "Any"]` for a user/imported
@@ -3320,6 +3417,28 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Enforces a `private` class member's own visibility: legal only while
+    /// `self.current_class` is lexically inside *that same class's* own
+    /// body (any method, property initializer, or `init` block — see
+    /// `current_class`'s own doc comment) — deliberately class-body-scoped,
+    /// not receiver-spelled, matching real Kotlin: `other.x` from a
+    /// different method of the SAME class is legal even though `other`
+    /// isn't `this`; `foo.x` from anywhere else — another class, top-level
+    /// code, or a different file entirely — is not. Pushed into `self.
+    /// type_errors` (fatal, blocks execution — see `importer.rs`'s
+    /// pre-run check), not `self.diagnostics` (advisory-only): this is
+    /// genuinely new information nothing else in the resolver would
+    /// otherwise catch, so a `diagnostics`-only report would make this
+    /// entire check a silent no-op at runtime.
+    fn check_member_visibility(&mut self, owner: &str, vis: Visibility, kind: &str, name: &str, span: Span) {
+        if vis == Visibility::Private && self.current_class.as_deref() != Some(owner) {
+            self.type_errors.push(RuntimeError::new(
+                format!("'{name}' is private in class '{owner}'; {kind} can only be accessed from within '{owner}' itself"),
+                span,
+            ));
+        }
+    }
+
     /// `(field's type, mutable)` for `t.field`/`t.field = ...` — same-file
     /// `class_info` first, then an imported class's own shape via
     /// `self.packages.find_class` (see `class_method_signature`'s
@@ -3353,6 +3472,24 @@ impl<'a> Resolver<'a> {
             .iter()
             .find(|f| f.name == field)
             .map(|f| (f.ty.clone(), f.mutable))
+    }
+
+    /// `t.field`'s own `private`/`public` modifier — see `class_method_
+    /// visibility`'s identical rationale/two-tier lookup (same-file
+    /// `class_info` first, then an imported class's own shape). `None`
+    /// when `field` doesn't exist on `t` at all (including the synthetic
+    /// `Exception.message` case above, which has no real `ClassFieldInfo`
+    /// entry to consult) — callers treat that as `Visibility::Public`.
+    fn class_field_visibility(&self, t: &Type, field: &str) -> Option<Visibility> {
+        let t = match t {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let name = t.name();
+        if let Some(info) = self.class_info.get(name.as_str()) {
+            return info.fields.iter().find(|f| f.name == field).map(|f| f.visibility);
+        }
+        self.packages.find_class(&name)?.class_members.as_ref()?.iter().find(|f| f.name == field).map(|f| f.visibility)
     }
 
     /// The cross-file `CrossFileRef` for `t.field`, when `field` is only
@@ -3663,6 +3800,7 @@ impl<'a> Resolver<'a> {
                                 param_docs: Vec::new(),
                                 param_has_default: Vec::new(),
                                 doc,
+                                visibility: Visibility::Public,
                             },
                         ));
                     }
@@ -4149,6 +4287,9 @@ impl<'a> Resolver<'a> {
                                 self.cross_file_refs.insert(*field_span, cross_ref);
                             }
                             self.check_read_before_assignment(field, matches!(&receiver.kind, ExprKind::This), *field_span);
+                            if let Some(vis) = self.class_field_visibility(&recv_ty, field) {
+                                self.check_member_visibility(&recv_ty.name(), vis, "field", field, *field_span);
+                            }
                             self.class_field_type(&recv_ty, field).map(|(ty, _)| ty).unwrap_or(Type::Unknown)
                         } else if recv_ty == Type::Unknown {
                             Type::Unknown
@@ -4161,6 +4302,9 @@ impl<'a> Resolver<'a> {
                                         self.cross_file_refs.insert(*field_span, cross_ref);
                                     }
                                     self.check_read_before_assignment(field, matches!(&receiver.kind, ExprKind::This), *field_span);
+                                    if let Some(vis) = self.class_field_visibility(&recv_ty, field) {
+                                        self.check_member_visibility(&recv_ty.name(), vis, "field", field, *field_span);
+                                    }
                                     ty
                                 }
                                 None => {
@@ -4264,6 +4408,19 @@ impl<'a> Resolver<'a> {
                 // method call).
                 let class_method_signature: Option<CallSignature> =
                     recv_ty.as_ref().and_then(|t| self.class_method_signature(t, method));
+                // Visibility check, only when a real class/builtin method
+                // was actually found via `recv_ty` above — guarded on
+                // `.is_some()` so a miss here (which falls through to the
+                // extension-function fallback right below) never produces a
+                // spurious "is private" diagnostic for a method that isn't
+                // a class member at all.
+                if class_method_signature.is_some() {
+                    if let Some(t) = &recv_ty {
+                        if let Some(vis) = self.class_method_visibility(t, method) {
+                            self.check_member_visibility(&t.name(), vis, "method", method, *method_span);
+                        }
+                    }
+                }
                 // Extension-function fallback — tried *only* when no real
                 // class/builtin method matched (the entire "member always
                 // wins" rule, enforced purely by this ordering, no separate
@@ -5209,6 +5366,7 @@ mod tests {
                 param_docs: Vec::new(),
                 param_has_default: vec![false],
                 doc: None,
+                visibility: Visibility::Public,
             },
             None,
             None,
@@ -5378,6 +5536,7 @@ mod tests {
                 param_docs: Vec::new(),
                 param_has_default: vec![false],
                 doc: None,
+                visibility: Visibility::Public,
             },
             None,
             None,
@@ -7650,5 +7809,225 @@ mod tests {
         // The method's own return-type annotation "Test" starts at column 20 on line 6.
         let return_type_use = result.table.symbol_at(6, 20).expect("the method's own return-type annotation should resolve");
         assert!(std::ptr::eq(decl, return_type_use));
+    }
+
+    // ---- `private`/`public` visibility modifiers ----
+
+    #[test]
+    fn a_private_field_is_accessible_from_inside_its_own_class_via_this_and_bare_name() {
+        let result =
+            resolve_src("class Foo {\n    private val x: Int = 1\n    fun get1(): Int = this.x\n    fun get2(): Int = x\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_field_is_accessible_from_another_instance_of_the_same_class() {
+        // Class-body-scoped, not receiver-spelled: `other.x` from a
+        // *different* method of the SAME class must stay legal even
+        // though `other` isn't `this`.
+        let result = resolve_src("class Foo(private val x: Int) {\n    fun same(other: Foo): Int = other.x\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_field_is_rejected_from_outside_the_class() {
+        let result = resolve_src("class Foo(private val x: Int) {\n}\nval f = Foo(1)\nval y = f.x\n");
+        assert_eq!(result.type_errors.len(), 1, "{:?}", result.type_errors);
+        assert!(result.type_errors[0].message.contains("'x' is private in class 'Foo'"), "{}", result.type_errors[0].message);
+    }
+
+    #[test]
+    fn a_private_body_property_is_rejected_from_outside_the_class() {
+        let result = resolve_src("class Foo {\n    private val x: Int = 1\n}\nval f = Foo()\nval y = f.x\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("'x' is private in class 'Foo'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_method_is_rejected_from_outside_the_class() {
+        let result = resolve_src("class Foo {\n    private fun secret(): Int = 1\n}\nval f = Foo()\nval y = f.secret()\n");
+        assert!(
+            result.type_errors.iter().any(|e| e.message.contains("'secret' is private in class 'Foo'")),
+            "{:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn a_private_method_is_accessible_from_inside_its_own_class_via_implicit_this() {
+        let result = resolve_src("class Foo {\n    private fun secret(): Int = 1\n    fun reveal(): Int = secret()\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_field_assignment_is_rejected_from_outside_the_class() {
+        let result = resolve_src("class Foo {\n    private var x: Int = 1\n}\nval f = Foo()\nf.x = 2\n");
+        assert!(result.type_errors.iter().any(|e| e.message.contains("'x' is private in class 'Foo'")), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_field_assignment_from_inside_the_class_is_fine() {
+        let result = resolve_src("class Foo {\n    private var x: Int = 1\n    fun bump() { x = x + 1 }\n}\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_public_class_member_behaves_exactly_as_before_no_modifier_written() {
+        let result = resolve_src(
+            "class Foo(val x: Int) {\n    fun get(): Int = x\n}\nval f = Foo(1)\nprintln(f.x)\nprintln(f.get())\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn an_explicit_public_class_member_behaves_exactly_as_before() {
+        let result = resolve_src(
+            "class Foo(public val x: Int) {\n    public fun get(): Int = x\n}\nval f = Foo(1)\nprintln(f.x)\nprintln(f.get())\n",
+        );
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_top_level_fun_is_still_visible_everywhere_within_its_own_file() {
+        let result = resolve_src("private fun helper(): Int = 1\nval x = helper()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_private_top_level_class_is_still_visible_everywhere_within_its_own_file() {
+        let result = resolve_src("private class Foo\nval f = Foo()\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_top_level_val_is_still_visible_everywhere_within_its_own_file() {
+        let result = resolve_src("private val x = 1\nprintln(x)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_private_top_level_var_is_still_visible_everywhere_within_its_own_file() {
+        let result = resolve_src("private var x = 1\nx = 2\nprintln(x)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn an_explicit_public_top_level_val_behaves_exactly_as_before() {
+        let result = resolve_src("public val x = 1\nprintln(x)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn a_private_typealias_is_still_usable_as_a_type_within_its_own_file() {
+        let result = resolve_src("private typealias MyInt = Int\nval x: MyInt = 5\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn an_explicit_public_typealias_behaves_exactly_as_before() {
+        let result = resolve_src("public typealias MyInt = Int\nval x: MyInt = 5\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn private_immediately_before_val_is_recognized_as_the_visibility_modifier_not_a_name() {
+        // `private` is only ever consumed as a modifier when the token
+        // right after it is one of val/var/fun/class/typealias — confirm
+        // that boundary case (val) actually takes the modifier path, not
+        // the "private" == bare-name fallback that caused this whole bug.
+        let result = resolve_src("private val x = 1\n");
+        assert!(result.diagnostics.iter().all(|e| !e.message.contains("undefined name 'private'")), "{:?}", result.diagnostics);
+    }
+
+    // Soft-keyword non-breakage: `private`/`public` are only special
+    // immediately before `val`/`var`/`fun`/`class` — everywhere else they
+    // remain perfectly ordinary identifiers, exactly like `init`.
+
+    #[test]
+    fn private_as_an_ordinary_variable_name_still_works() {
+        let result = resolve_src("val private = 5\nprintln(private)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn public_as_an_ordinary_function_name_still_works() {
+        let result = resolve_src("fun public(): Int = 1\nprintln(public())\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn private_as_a_ctor_param_name_with_no_val_var_is_a_plain_non_promoted_param() {
+        // No `val`/`var` right after `private` — the modifier lookahead
+        // doesn't consume it, so it's parsed as the parameter's own bare
+        // name instead (matching real Kotlin: a visibility modifier is
+        // illegal on a non-property ctor param). Just needs to parse and
+        // resolve cleanly; a non-promoted param is never visible from a
+        // method body (pre-existing, unrelated scoping rule), so this only
+        // asserts the constructor call itself type-checks.
+        let result = resolve_src("class Foo(private: Int)\nval f = Foo(1)\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_forward_declared_overload_resolution_test_still_names_classes_correctly_alongside_visibility() {
+        // Regression guard: `Visibility` threading through `ClassDecl`/
+        // `FunDecl` must not disturb the unrelated forward-declared-
+        // overload machinery from earlier this session.
+        let result = resolve_src("fun useTest() {\n    test(5)\n}\nfun test(x: Int): Int = x\n");
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn a_private_field_on_a_cross_file_imported_class_is_rejected_from_the_importing_file() {
+        // Hand-built `PackageIndex` (see `package_index_with_util_math`'s
+        // identical technique) — a real cross-file class whose one field
+        // is `Private`, with no backing file needed. Exercises the "cross-
+        // file enforcement is automatic" claim: `self.current_class` is
+        // only ever set while walking *this file's own* `ClassDecl`, so an
+        // imported class's `self.current_class == owner` comparison can
+        // never accidentally succeed from outside its own file.
+        let mut packages = crate::package_index::PackageIndex::new();
+        let class_symbol = Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Class,
+            def_span: Span::default(),
+            mutable: false,
+            signature: "class Foo(x: Int)".to_string(),
+            ty: Type::Unknown,
+            return_type: Type::Unknown,
+            param_types: vec![Type::Int],
+            param_names: vec!["x".to_string()],
+            param_docs: vec![None],
+            param_has_default: vec![false],
+            doc: None,
+            visibility: Visibility::Public,
+        };
+        let field_symbol = Symbol {
+            name: "x".to_string(),
+            kind: SymbolKind::Field,
+            def_span: Span::default(),
+            mutable: false,
+            signature: "val x: Int".to_string(),
+            ty: Type::Int,
+            return_type: Type::Unknown,
+            param_types: Vec::new(),
+            param_names: Vec::new(),
+            param_docs: Vec::new(),
+            param_has_default: Vec::new(),
+            doc: None,
+            visibility: Visibility::Private,
+        };
+        packages.add_member("util".to_string(), class_symbol, None, Some(vec![field_symbol]));
+        let tokens = lexer::tokenize("import util.Foo\nval f = Foo(1)\nval y = f.x\n").unwrap();
+        let program = parser::parse(&tokens).unwrap();
+        let result = resolve_with_imports(&program, &packages);
+        assert!(result.type_errors.iter().any(|e| e.message.contains("'x' is private in class 'Foo'")), "{:?}", result.type_errors);
     }
 }

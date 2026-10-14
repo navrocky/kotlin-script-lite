@@ -438,6 +438,30 @@ add(a = 1, b = 2)       // named arguments can be given in any order
 - Functions declared with `fun` inside another function's body are
   closures over that enclosing scope, and can be recursive.
 
+### Visibility
+
+```kotlin
+private fun helper(): Int = 42   // not importable from another file
+public fun exposed(): Int = helper()   // "public" is the default, explicit here
+```
+
+A top-level `fun`/`class`/`val`/`var`/`typealias` may be marked `private`
+or `public` (`public` is the default when neither is written — today's
+existing, fully-open behavior, unchanged). `private` means visible
+everywhere within its own file, but never importable — by name or
+wildcard — from another file via `import`/`@file:Import`. `private`/
+`public` aren't reserved words — like `init`, they're only recognized
+immediately before `fun`/`class`/`val`/`var`/`typealias` (or `val`/`var`/
+`fun` inside a class body); a script using `private`/`public` as an
+ordinary identifier elsewhere is unaffected.
+
+A `private typealias` is still just as usable as a type *within its own
+file* — same-file type-annotation resolution never consults visibility at
+all. (Using a `typealias` — public or private — as a type *across* a file
+boundary, e.g. `import pkg.MyInt; val x: MyInt = 5`, doesn't work yet
+regardless: cross-file type-annotation resolution isn't implemented, a
+separate, pre-existing gap unrelated to visibility.)
+
 ### Overloading
 
 ```kotlin
@@ -659,10 +683,13 @@ constructor parameter is either:
 
 - **promoted to a real field** by writing `val` or `var` in front of it
   (`val x: Int`) — readable (and, for `var`, writable) via `this.x`/
-  `obj.x` from anywhere the object is visible;
+  `obj.x` from anywhere the object is visible, unless marked `private`
+  (`private val x: Int`) — see **Member visibility** below;
 - a **plain constructor parameter** (no `val`/`var`) — only a real binding
   *inside the constructor itself* (property initializers and `init`
-  blocks), not a field; it doesn't exist on the object afterward.
+  blocks), not a field; it doesn't exist on the object afterward. A
+  `private`/`public` modifier only makes sense in front of `val`/`var`, so
+  it's illegal here, same as real Kotlin.
 
 A class body can contain, in any order, any number of:
 
@@ -714,9 +741,33 @@ mirroring Kotlin's default `==` behavior for a class with no
 `.hashCode()` explicitly (`5.toString()`, `"x".equals("x")`), with the
 expected structural (not identity) behavior for those.
 
+**Member visibility.** A property (promoted ctor param or body-declared)
+or method may be marked `private` or `public` — `public` is the default,
+unchanged when neither is written. `private` means accessible only from
+inside the declaring class's own body (any of its methods, property
+initializers, or `init` blocks) — not through an external receiver
+(`obj.field`) anywhere else, including a *different* instance's field
+accessed from top-level code or from another class, even in the same
+file. It's class-scoped, not receiver-scoped: `other.field` from a
+*different method of the same class* is still legal, even though `other`
+isn't `this`.
+
+```kotlin
+class Counter(private var count: Int) {
+    fun increment() { count = count + 1 }
+    fun value(): Int = count
+}
+val c = Counter(0)
+c.increment()
+println(c.value())   // 1
+println(c.count)      // compile-time error: 'count' is private in class 'Counter'
+```
+
 **Not supported yet**: `:` superclass syntax, `open`/`override`,
-`interface`, generic classes (`class Box<T>`), and collection indexing
-syntax (`obj[i]`) even on a user class — all separate, later phases.
+`interface`, generic classes (`class Box<T>`), collection indexing syntax
+(`obj[i]`) even on a user class, and `protected` visibility (which needs
+real subclassing to mean anything — deferred to the same later phase as
+`:` superclass syntax).
 
 ## Methods
 

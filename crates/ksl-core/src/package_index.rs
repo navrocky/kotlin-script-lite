@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::ast::Program;
+use crate::ast::{Program, Visibility};
 use crate::error::Span;
 use crate::resolver::{self, Symbol};
 use crate::types::Type;
@@ -180,6 +180,9 @@ fn builtin_symbol(sym: &crate::stdlib::BuiltinSymbol) -> Symbol {
         param_docs: Vec::new(),
         param_has_default: Vec::new(),
         doc: Some(sym.doc.to_string()),
+        // A stdlib member is always public — there's no modifier syntax to
+        // write on a builtin, and it's always meant to be importable.
+        visibility: Visibility::Public,
     }
 }
 
@@ -227,7 +230,14 @@ fn index_program(
             let package_name = pkg.path.join(".");
             if let Some(file) = own_file {
                 let resolved = resolver::resolve(program);
-                for symbol in resolved.table.top_level_symbols() {
+                // A `private` top-level declaration is never indexed at
+                // all — the exact enforcement mechanism for top-level
+                // visibility: it simply never becomes reachable through
+                // `import`/`@file:Import` from another file, same as if it
+                // didn't exist there. Still fully visible within its own
+                // file (this predpass never runs on the entry file's own
+                // top-level names — see the `!is_entry` guard below).
+                for symbol in resolved.table.top_level_symbols().filter(|s| s.visibility == Visibility::Public) {
                     let class_members = class_members_of(&resolved, symbol);
                     index.add_member(package_name.clone(), symbol.clone(), Some(file.to_path_buf()), class_members);
                 }
@@ -240,7 +250,7 @@ fn index_program(
         None if !is_entry => {
             if let Some(file) = own_file {
                 let resolved = resolver::resolve(program);
-                for symbol in resolved.table.top_level_symbols() {
+                for symbol in resolved.table.top_level_symbols().filter(|s| s.visibility == Visibility::Public) {
                     let class_members = class_members_of(&resolved, symbol);
                     index.add_flat_member(symbol.clone(), Some(file.to_path_buf()), class_members);
                 }
@@ -392,5 +402,85 @@ mod tests {
 
         let index = build(&dir, "main.ksl");
         assert_eq!(index.members_of("a.b").len(), 1);
+    }
+
+    #[test]
+    fn a_private_top_level_fun_is_excluded_from_the_package_index() {
+        let dir = TempDir::new("private_fun");
+        dir.write("pkg.ksl", "package util.math\nprivate fun square(x: Int): Int = x * x\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.math", "square").is_none());
+    }
+
+    #[test]
+    fn a_public_top_level_fun_is_still_indexed_explicit_modifier() {
+        let dir = TempDir::new("public_fun");
+        dir.write("pkg.ksl", "package util.math\npublic fun square(x: Int): Int = x * x\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.math", "square").is_some());
+    }
+
+    #[test]
+    fn a_private_top_level_class_is_excluded_from_the_package_index() {
+        let dir = TempDir::new("private_class");
+        dir.write("pkg.ksl", "package util.shapes\nprivate class Circle\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.shapes", "Circle").is_none());
+    }
+
+    #[test]
+    fn a_private_top_level_fun_is_excluded_from_a_package_less_flat_import() {
+        let dir = TempDir::new("private_flat");
+        dir.write("greeter.ksl", "private fun greet(name: String): String {\n    return \"Hello, $name!\"\n}\n");
+        dir.write("main.ksl", "@file:Import(\"greeter.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.flat_member("greet").is_none());
+    }
+
+    #[test]
+    fn a_private_top_level_val_is_excluded_from_the_package_index() {
+        let dir = TempDir::new("private_val");
+        dir.write("pkg.ksl", "package util.consts\nprivate val secret = 42\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.consts", "secret").is_none());
+    }
+
+    #[test]
+    fn a_public_top_level_val_is_still_indexed_explicit_modifier() {
+        let dir = TempDir::new("public_val");
+        dir.write("pkg.ksl", "package util.consts\npublic val exposed = 42\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.consts", "exposed").is_some());
+    }
+
+    #[test]
+    fn a_private_typealias_is_excluded_from_the_package_index() {
+        let dir = TempDir::new("private_typealias");
+        dir.write("pkg.ksl", "package util.types\nprivate typealias Hidden = Int\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.types", "Hidden").is_none());
+    }
+
+    #[test]
+    fn a_public_typealias_is_still_indexed_explicit_modifier() {
+        let dir = TempDir::new("public_typealias");
+        dir.write("pkg.ksl", "package util.types\npublic typealias Visible = Int\n");
+        dir.write("main.ksl", "@file:Import(\"pkg.ksl\")\nprintln(1)\n");
+
+        let index = build(&dir, "main.ksl");
+        assert!(index.find("util.types", "Visible").is_some());
     }
 }

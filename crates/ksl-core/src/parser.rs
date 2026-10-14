@@ -411,16 +411,60 @@ impl<'a> Parser<'a> {
     /// begins," which incorrectly swallowed the trailing gap (blank
     /// lines/whitespace) between this statement's closing `}` and that
     /// next one into *this* statement's own scope.
+    /// Optional leading `private`/`public` soft-keyword modifier — consumed
+    /// only when the token immediately after it is one of `starts`
+    /// (otherwise nothing is consumed at all, and the caller sees its own
+    /// first token exactly as if this were never called). Deliberately NOT
+    /// a real keyword (see `token.rs`'s `KEYWORDS` — no `private`/`public`
+    /// entry there at all): mirrors `parse_class_member`'s existing `init`
+    /// contextual-keyword lookahead, so any existing script using
+    /// `private`/`public` as an ordinary variable/function/parameter name
+    /// keeps working unchanged. Returns `Visibility::Public` (today's
+    /// default, unchanged when no modifier is written) whenever nothing is
+    /// consumed.
+    fn parse_visibility_modifier(&mut self, starts: &[TokenKind]) -> Visibility {
+        if let TokenKind::Ident(s) = self.peek_kind() {
+            if (s.as_str() == "private" || s.as_str() == "public") && starts.iter().any(|k| self.peek_at(1) == k) {
+                let vis = if s.as_str() == "private" { Visibility::Private } else { Visibility::Public };
+                self.advance();
+                return vis;
+            }
+        }
+        Visibility::Public
+    }
+
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         let start = self.span();
         let mut stmt = match self.peek_kind() {
-            TokenKind::Val | TokenKind::Var => self.parse_val_decl(),
-            TokenKind::Fun => self.parse_fun_decl(),
+            TokenKind::Val | TokenKind::Var => self.parse_val_decl(Visibility::Public),
+            TokenKind::Fun => self.parse_fun_decl(Visibility::Public),
             TokenKind::While => self.parse_while(),
             TokenKind::Do => self.parse_do_while(),
             TokenKind::For => self.parse_for(),
-            TokenKind::Class => self.parse_class_decl(),
-            TokenKind::Typealias => self.parse_type_alias_decl(),
+            TokenKind::Class => self.parse_class_decl(Visibility::Public),
+            TokenKind::Typealias => self.parse_type_alias_decl(Visibility::Public),
+            TokenKind::Ident(s)
+                if (s.as_str() == "private" || s.as_str() == "public")
+                    && matches!(
+                        self.peek_at(1),
+                        TokenKind::Fun | TokenKind::Class | TokenKind::Val | TokenKind::Var | TokenKind::Typealias
+                    ) =>
+            {
+                let vis = self.parse_visibility_modifier(&[
+                    TokenKind::Fun,
+                    TokenKind::Class,
+                    TokenKind::Val,
+                    TokenKind::Var,
+                    TokenKind::Typealias,
+                ]);
+                match self.peek_kind() {
+                    TokenKind::Fun => self.parse_fun_decl(vis),
+                    TokenKind::Class => self.parse_class_decl(vis),
+                    TokenKind::Val | TokenKind::Var => self.parse_val_decl(vis),
+                    TokenKind::Typealias => self.parse_type_alias_decl(vis),
+                    _ => unreachable!(),
+                }
+            }
             TokenKind::Return => {
                 self.advance();
                 let value = if matches!(
@@ -454,7 +498,7 @@ impl<'a> Parser<'a> {
         Ok(stmt)
     }
 
-    fn parse_val_decl(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_val_decl(&mut self, visibility: Visibility) -> Result<Stmt, ParseError> {
         let span = self.span();
         let doc_comment = self.doc_comments.remove(&span.line);
         let mutable = matches!(self.peek_kind(), TokenKind::Var);
@@ -472,6 +516,7 @@ impl<'a> Parser<'a> {
                 mutable,
                 init,
                 doc_comment,
+                visibility,
             },
             span,
         ))
@@ -516,7 +561,7 @@ impl<'a> Parser<'a> {
     /// this is the entire mechanism that makes `this` legal inside an
     /// extension function's body (and its own parameter defaults) with no
     /// change needed to `parse_primary`'s `TokenKind::This` arm at all.
-    fn parse_fun_decl(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_fun_decl(&mut self, visibility: Visibility) -> Result<Stmt, ParseError> {
         let span = self.span();
         let doc_comment = self.doc_comments.remove(&span.line);
         self.advance(); // fun
@@ -550,7 +595,7 @@ impl<'a> Parser<'a> {
             self.class_member_depth -= 1;
         }
         Ok(Stmt::new(
-            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body: body?, doc_comment },
+            StmtKind::FunDecl { name, name_span, receiver, params, return_type, body: body?, doc_comment, visibility },
             span,
         ))
     }
@@ -573,7 +618,7 @@ impl<'a> Parser<'a> {
 
     /// `class Name(ctor params) { members }` — the body is optional, same
     /// as real Kotlin (`class Foo(val x: Int)` needs no braces at all).
-    fn parse_class_decl(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_class_decl(&mut self, visibility: Visibility) -> Result<Stmt, ParseError> {
         let span = self.span();
         let doc_comment = self.doc_comments.remove(&span.line);
         self.advance(); // class
@@ -591,17 +636,17 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        Ok(Stmt::new(StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment }, span))
+        Ok(Stmt::new(StmtKind::ClassDecl { name, name_span, ctor_params, members, doc_comment, visibility }, span))
     }
 
     /// `typealias Name = TypeAnnotation` — see `StmtKind::TypeAlias`.
-    fn parse_type_alias_decl(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_type_alias_decl(&mut self, visibility: Visibility) -> Result<Stmt, ParseError> {
         let span = self.span();
         self.advance(); // typealias
         let (name, name_span) = self.expect_ident_spanned(IdentRole::NewBindingName)?;
         self.expect(TokenKind::Assign, "'='")?;
         let target = self.parse_type_annotation()?;
-        Ok(Stmt::new(StmtKind::TypeAlias { name, name_span, target }, span))
+        Ok(Stmt::new(StmtKind::TypeAlias { name, name_span, target, visibility }, span))
     }
 
     /// Same shape as `parse_params`, plus an optional leading `val`/`var`
@@ -610,6 +655,14 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         self.expect(TokenKind::LParen, "'('")?;
         while !matches!(self.peek_kind(), TokenKind::RParen) {
+            // Only consumed when immediately followed by `val`/`var` — a
+            // bare `private x: Int` (no promotion at all) leaves `private`
+            // unconsumed, so it falls through to `expect_ident_spanned`
+            // below as the parameter's own name, which then trips on the
+            // next token not being `:`/`,`/`)` — the same "visibility
+            // modifier illegal on a non-property ctor param" rule real
+            // Kotlin enforces, for free, with no separate validation here.
+            let visibility = self.parse_visibility_modifier(&[TokenKind::Val, TokenKind::Var]);
             let field = if self.matches(&TokenKind::Var) {
                 Some(true)
             } else if self.matches(&TokenKind::Val) {
@@ -621,7 +674,7 @@ impl<'a> Parser<'a> {
             let type_annotation =
                 if self.matches(&TokenKind::Colon) { Some(self.parse_type_annotation()?) } else { None };
             let default = if self.matches(&TokenKind::Assign) { Some(self.parse_expr()?) } else { None };
-            params.push(ClassParam { param: Param { name, name_span, type_annotation, default }, field });
+            params.push(ClassParam { param: Param { name, name_span, type_annotation, default }, field, visibility });
             if !self.matches(&TokenKind::Comma) {
                 break;
             }
@@ -643,6 +696,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_class_member(&mut self) -> Result<ClassMember, ParseError> {
+        // Consumed only when immediately followed by `val`/`var`/`fun` — so
+        // e.g. `private init { }` leaves `private` unconsumed (an `init`
+        // block never takes a visibility modifier, matching real Kotlin),
+        // falling through to the same `_ => Err(...)` a bogus leading
+        // identifier already hits today.
+        let visibility = self.parse_visibility_modifier(&[TokenKind::Val, TokenKind::Var, TokenKind::Fun]);
         match self.peek_kind() {
             TokenKind::Val | TokenKind::Var => {
                 let span = self.span();
@@ -660,9 +719,9 @@ impl<'a> Parser<'a> {
                 // to infer a type from), but that check belongs to the
                 // resolver, not here — the parser accepts either shape.
                 let init = if self.matches(&TokenKind::Assign) { Some(self.parse_expr()?) } else { None };
-                Ok(ClassMember::Property { name, name_span, type_annotation, mutable, init, doc_comment })
+                Ok(ClassMember::Property { name, name_span, type_annotation, mutable, init, doc_comment, visibility })
             }
-            TokenKind::Fun => Ok(ClassMember::Method(Box::new(self.parse_fun_decl()?))),
+            TokenKind::Fun => Ok(ClassMember::Method(Box::new(self.parse_fun_decl(visibility)?))),
             // `init` is a contextual (soft) keyword: a plain `Ident("init")`
             // immediately followed by `{` — anywhere else it's still a
             // perfectly ordinary name (a property/method/local called
